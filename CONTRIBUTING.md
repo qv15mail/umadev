@@ -36,7 +36,7 @@ crates/
 ├── umadev-spec/        # UMADEV_HOST_SPEC_V1 as Rust data
 ├── umadev-governance/  # rules / audit / context / compliance kernel
 ├── umadev-agent/       # 9-phase runner + gates + state + experts + coach
-├── umadev-host/        # subprocess drivers for 23 host CLIs (claude/codex/simple)
+├── umadev-host/        # subprocess drivers for the three first-class bases (claude-code/codex/opencode)
 └── umadev-runtime/     # Runtime trait + OfflineRuntime (deterministic fallback)
 
 spec/
@@ -79,9 +79,17 @@ Tests in `crates/umadev-spec/src/lib.rs` pin the clause-table
 structure; they will fail if you add a malformed ID. Add a unit test
 for the new rule alongside the implementation.
 
-## Adding a new host | 新增宿主
+## Adding a new base | 新增底座
 
-A "host" is a non-interactive AI coding CLI driven as a subprocess —
+> First-class support is deliberately limited to **exactly three** bases —
+> `claude-code` / `codex` / `opencode`. `umadev_host::BACKEND_IDS` is the
+> authoritative list and a test pins its length at 3; the steps below
+> document the mechanics, not an invitation to grow the list. Wider model
+> coverage belongs in the base's own config (route it to a third-party /
+> local model), not in a new driver. Before proposing a fourth base, open
+> an issue first.
+
+A "base" is a non-interactive AI coding CLI driven as a subprocess —
 **no plugin bundles, no install.rs, no Agent SDK required**. The driver
 lives entirely in `crates/umadev-host/`.
 

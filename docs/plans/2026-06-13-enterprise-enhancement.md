@@ -2,7 +2,8 @@
 
 > 日期: 2026-06-13
 > 状态: 阶段 1 已交付 / 阶段 2-4 路线已定
-> 约束: 纯 Rust · 三运行时(Anthropic/OpenAI/Antigravity)· fail-open 治理 · 离线单文件
+> 约束: 纯 Rust · 三底座(claude-code/codex/opencode 子进程驱动)· fail-open 治理 · 离线单文件
+> 注: 本文为 2026-06-13 历史设计稿，当时的"三 HTTP 运行时直调 Provider API"路线已废弃——UmaDev 不持有模型端点，一等支持收敛为驱动三个已登录底座 CLI（claude-code/codex/opencode）；更广模型覆盖是底座路由第三方/本地模型的事。
 
 ## 动机
 

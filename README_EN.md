@@ -4,9 +4,9 @@
 
 <img src="docs/assets/umadev-logo-en.png" alt="UmaDev" width="760">
 
-### Turn AI coding tools into a real project-director Agent
+### A governance rail around the AI coding base you already use
 
-**From one requirement to PRD, architecture, UI/UX, code, quality gate, and delivery pack.**
+**From one requirement to PRD, architecture, UI/UX, code, quality gate, and delivery pack — the base writes the code, UmaDev runs the process.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
@@ -29,17 +29,15 @@
 
 ## Introduction
 
-UmaDev is a local project-director Agent for AI coding. It does not replace Claude Code, Codex, or OpenCode, and it does not sell a model API. It works one level above them:
+UmaDev is a local, deterministic shell that wraps the **AI coding base you already logged into** (Claude Code / Codex / OpenCode) in a **governance rail**, turning "AI writes code" into an inspectable, resumable, auditable delivery process. It does not replace those bases and it does not sell a model API — **the brain always stays in the base**; UmaDev only owns the process, the rules, and the evidence.
 
 1. **It turns a requirement into a full delivery process**: clarify, research, PRD, architecture, UI/UX, frontend, backend, quality gate, delivery.
-2. **It drives the AI coding tool you already logged into**: Claude Code / Codex / OpenCode do the actual coding; UmaDev makes them follow the process.
+2. **It drives the AI coding tool you already logged into**: Claude Code / Codex / OpenCode do the actual coding; UmaDev makes them follow the process. First-class support is exactly these three bases — wider model coverage means routing the base to a third-party / local model, which is the base's job, not a new UmaDev driver.
 3. **It makes delivery inspectable, resumable, and auditable**: every phase writes artifacts, every important action leaves evidence, and the final run produces a quality report and proof pack.
 
-If an AI coding tool is a very capable engineer, UmaDev acts more like:
+If an AI coding tool is a very capable engineer, UmaDev is more like the ring of **process and review roles** around it — the checklists of a PM, architect, UI/UX reviewer, tech lead, QA, and delivery manager — not a fully autonomous director that replaces the engineer. The final judgment and the code still come from the base; UmaDev keeps the process on track and leaves an evidence trail.
 
-> Product manager + architect + UI/UX reviewer + tech lead + QA + delivery manager.
-
-You type one requirement. UmaDev turns "AI writes code" into a complete software delivery workflow.
+> Positioning & maturity: UmaDev is still **early-stage and governance-first**. It is best used to validate its process and gates on real projects. Its bet is the rail, not a claim of hands-off, fully autonomous delivery.
 
 ## Project Origin
 
@@ -47,12 +45,12 @@ UmaDev evolved from the original [shangyankeji/super-dev](https://github.com/sha
 
 Early `super-dev` was closer to an **AI coding governance tool**. It focused on what AI-generated code must not contain, such as emoji icons, hardcoded colors, and unsafe code patterns.
 
-UmaDev is now a full Agent:
+UmaDev has since grown that into a full governance rail:
 
-- **From governance tool to project-director Agent**: it no longer only checks code; it manages the full journey from requirement to delivery.
+- **From single-point governance to whole-pipeline governance**: it no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
 - **From loose scripts to a spec-driven system**: the source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md).
 - **Rewritten in Rust**: one binary, fast startup, low dependency surface, cross-platform distribution.
-- **From blocking bad output to guiding the base agent**: Claude Code / Codex / OpenCode are the brain and hands; UmaDev is the director and process engine.
+- **From blocking bad output to walking the base through the process**: Claude Code / Codex / OpenCode are the brain and hands; UmaDev is the process and governance rail wrapped around them.
 
 In short:
 
@@ -234,7 +232,7 @@ UmaDev has four conceptual layers:
 flowchart TB
     User["User<br/>Requirement / Review / Preview / Deploy"] --> UI["UmaDev TUI / CLI<br/>Chat + commands"]
 
-    UI --> Director["umadev-agent<br/>Director: phases, gates, state, quality"]
+    UI --> Director["umadev-agent<br/>Pipeline engine: phases, gates, state, quality"]
 
     Director --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1"]
     Director --> Knowledge["umadev-knowledge<br/>Local knowledge: BM25 + vector"]
@@ -282,13 +280,13 @@ UmaDev owns no model and connects to no third-party API — **the base uses its 
 
 Sources UmaDev reads: claude `~/.claude/settings.json` (`model` / `effortLevel`), codex `~/.codex/config.toml` (`model` / `model_reasoning_effort`), opencode `opencode.json` (`model`; reasoning is baked into the model variant).
 
-### Mode B: Offline Templates
+### Mode B: Offline Templates (internal fallback, not the product)
 
 ```text
 /offline
 ```
 
-Offline mode makes no model call and no network request. It is useful for demos, smoke tests, and understanding the file layout.
+Offline mode makes no model call and no network request. It is **not a product mode you pick** — the product is always "drive the base you logged into." Offline templates are just a deterministic fallback for when no base is reachable: useful for demos, smoke tests, and understanding the file layout. The output is templates with TODO placeholders, not real development; the first-run picker only lists the three bases, never offline.
 
 ## Pipeline Design
 
@@ -314,6 +312,8 @@ flowchart LR
     R --> D["docs"]
     D --> Rest["...remaining 7 normative phases"]
 ```
+
+> Small tasks have a lightweight path. The 9 phases target a *full commercial-grade delivery*; not every requirement runs the whole chain. Declare the task type with `/kind` (full-stack / frontend-only / backend-only / bugfix / refactor) and UmaDev trims the phases accordingly — a bugfix or small change is not forced through the full PRD / architecture / UIUX set.
 
 ### Phase Outputs
 
@@ -364,6 +364,8 @@ skip_checks = []
 ## Governance
 
 UmaDev started as a governance tool, and that remains a core capability.
+
+These rules are a **governance baseline, not absolute truth** — each one can be disabled, path-excluded, or tuned in `.umadev/rules.toml` (see below). They exist to backstop the base's output, not to make the final engineering call for you.
 
 The spec layer has 25 clauses. The implementation currently includes 112 governance checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards.
 
@@ -636,7 +638,7 @@ UmaDev is a 10-crate Rust workspace.
 | `umadev` | Main program | CLI, TUI entry, doctor, hook, CI, MCP/Skill/Knowledge management |
 | `umadev-spec` | Rule book | Rust data for `UMADEV_HOST_SPEC_V1` |
 | `umadev-governance` | Quality and red lines | 112 checks, audit, policy, compliance mapping |
-| `umadev-agent` | Project director | Runner, gates, state, quality, delivery pack |
+| `umadev-agent` | Pipeline engine | Runner, gates, state, quality, delivery pack |
 | `umadev-runtime` | Unified brain interface | Offline, HTTP runtime, Runtime trait |
 | `umadev-host` | CLI driver | Claude Code, Codex, OpenCode subprocess drivers |
 | `umadev-contract` | API reconciler | OpenAPI contract and frontend/backend path checks |

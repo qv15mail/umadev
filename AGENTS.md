@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Guidance for any AI coding agent (Codex CLI / Codex Desktop / Antigravity
-CLI / Claude Code / …) when operating inside this repository.
+Guidance for any AI coding agent (Claude Code / Codex / OpenCode / …)
+when operating inside this repository.
 
 ## What this repo is
 
@@ -28,7 +28,7 @@ See [README.md](README.md). Short version:
 - `crates/umadev-governance` — rules (113 clauses × 20 languages) + audit + compliance kernel + policy engine
 - `crates/umadev-agent` — 9-phase runner + gates + workflow state + scaffolding + coach prompts
 - `crates/umadev-runtime` — Runtime trait + OfflineRuntime + OpenAI/Anthropic HTTP runtime
-- `crates/umadev-host` — subprocess drivers for Claude Code / Codex (2 backends)
+- `crates/umadev-host` — subprocess drivers for the three first-class bases (Claude Code / Codex / OpenCode)
 - `crates/umadev-contract` — typed OpenAPI 3.1 contract layer
 - `crates/umadev-knowledge` — BM25 + optional vector (hybrid) knowledge retrieval
 - `crates/umadev-tui` — ratatui real-time terminal UI (dark/light adaptive theme)
@@ -41,10 +41,13 @@ See [README.md](README.md). Short version:
   be blocked by a bug in the governor.
 - **Spec is the source of truth.** When data and prose diverge, fix
   both.
-- **Subprocess-driver scope.** Hosts are driven as non-interactive
-  subprocesses (no API key, no SDK vendoring). The authoritative list is
-  `umadev_host::BACKEND_IDS` (23 as of 4.6.0). Adding a host means a
-  `SimpleHostDriver` factory + a `BackendArg` variant, not an HTTP client.
+- **Subprocess-driver scope.** Bases are driven as non-interactive
+  subprocesses (no API key, no SDK vendoring). First-class support is
+  **exactly three** bases — `claude-code` / `codex` / `opencode`; the
+  authoritative list is `umadev_host::BACKEND_IDS` (length 3, locked by
+  test). Wider model coverage is the base's job (route it to a third-party /
+  local model), not a new UmaDev driver. The offline runtime is a
+  deterministic CI / no-base fallback, not a base.
 
 ## Recommended sequence for new contributors
 

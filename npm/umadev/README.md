@@ -1,8 +1,9 @@
 # UmaDev
 
-> **AI 编码的项目总监 Agent** — drives the Claude Code / Codex you already
-> logged into through a 9-phase commercial delivery pipeline.
-> **No API key needed.**
+> **A governance rail around your AI coding base** — drives the Claude Code /
+> Codex / OpenCode you already logged into through a 9-phase commercial
+> delivery pipeline. The base writes the code; UmaDev runs the process.
+> **No API key needed.** Early-stage and governance-first.
 
 ## Install
 
@@ -32,8 +33,10 @@ umadev report                     # emit UD-EVID-004 compliance map
 ## Why this exists
 
 UmaDev is **not** an LLM client. It does not call any AI API.
-Instead it **drives** the host CLI you already use (`claude`, `codex`)
-through a deterministic 9-phase pipeline:
+Instead it **drives** one of the three first-class base CLIs you already
+use (`claude`, `codex`, `opencode`) through a deterministic 9-phase
+pipeline — the brain stays in the base. Wider model coverage is the base's
+job (route it to a third-party / local model), not a new UmaDev driver:
 
 ```
 research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_confirm → backend → quality → delivery
