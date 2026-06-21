@@ -10,7 +10,7 @@ last_updated: 2026-06-15
 ---
 # Editorial Clean
 
-> Magazine-like, serif-accent headings, photography-driven. Inspired by Medium, Substack, The Verge.
+> Magazine-like, serif-accent headings, photography-driven.
 
 ## When to use
 

@@ -10,7 +10,7 @@ last_updated: 2026-06-15
 ---
 # Soft Warm
 
-> Rounded, approachable, warm tones. Inspired by Notion, Headspace, Duolingo.
+> Rounded, approachable, warm tones.
 
 ## When to use
 

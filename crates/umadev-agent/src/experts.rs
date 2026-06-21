@@ -342,8 +342,10 @@ pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
          - # UI/UX — {slug}\n\
          - ## Visual direction — COMMIT to ONE named direction (editorial-clean / \
            modern-minimal / tech-utility / soft-warm / bold-geometric / brutalist-bold / \
-           glass-aurora / premium-luxury). Cite 1-3 REAL products as anchors with the \
-           SPECIFIC move to borrow (\"density like Linear, type like Stripe\"), name \
+           glass-aurora / premium-luxury). Pick 1-3 recognizable, real reference \
+           products IN THE TARGET'S OWN DOMAIN as anchors, and for each borrow ONE \
+           specific move (e.g. information density from one, type treatment from another, \
+           surface/depth from a third) — name the move, not just the product. Then name \
            THE ONE memorable thing a user will remember, and write one AVOID line \
            (which direction this product is NOT). Reference-based beats descriptive.\n\
          - ## Color palette — `:root` CSS block with: --color-bg, --color-surface, \

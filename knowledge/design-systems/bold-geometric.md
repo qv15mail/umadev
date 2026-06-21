@@ -10,7 +10,7 @@ last_updated: 2026-06-15
 ---
 # Bold Geometric
 
-> High contrast, oversized type, asymmetric layouts. Inspired by Figma marketing, Stripe keynotes, Apple product pages.
+> High contrast, oversized type, asymmetric layouts.
 
 ## When to use
 

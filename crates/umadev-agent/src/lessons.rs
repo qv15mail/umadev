@@ -126,7 +126,7 @@ pub struct PitfallEfficacy {
     /// absence of recurrence over later runs).
     #[serde(default)]
     pub proven_fix: bool,
-    /// Reflexion ledger: the recorded fixes that were ALREADY tried and still
+    /// Failed-fix ledger: the recorded fixes that were ALREADY tried and still
     /// let the pitfall recur. On the next injection these are surfaced verbatim
     /// as "已试过但无效的修法" so the base is steered AWAY from re-running a known
     /// failure toward a different approach — instead of just re-loading the same
@@ -527,9 +527,9 @@ pub fn capture_dev_errors(
                 if (eff.injected >= 1 || eff.proven_fix) && occ_now > eff.occ_at_injection {
                     eff.recurred_after_warning = true;
                     eff.proven_fix = false;
-                    // Reflexion: remember that THIS fix was already tried and
-                    // failed, so the next injection steers the base away from it
-                    // toward a different approach instead of re-loading it.
+                    // Remember that THIS fix was already tried and failed, so
+                    // the next injection steers the base away from it toward a
+                    // different approach instead of re-loading it.
                     remember_failed_fix(eff, &recorded_fix);
                 }
             }
@@ -586,8 +586,8 @@ const MAX_DEV_PITFALLS: usize = 300;
 /// Keep priority is tiered by fix lifecycle first — still-failing (`Recurring`)
 /// outranks unproven (`Active`), which outranks solved (`Validated`) — so a
 /// pitfall whose fix is still failing is NEVER evicted before a handled one.
-/// WITHIN a tier, eviction is by the Generative-Agents-style decay score
-/// (`recency · importance`) rather than a hard LRU: an old, low-importance lesson
+/// WITHIN a tier, eviction is by the recency·importance decay score
+/// rather than a hard LRU: an old, low-importance lesson
 /// is dropped before a recent or frequently-hit one even if their raw timestamps
 /// would order them the other way. (Relevance has no query at prune time, so it
 /// is the constant floor and drops out of the WITHIN-tier comparison.)
@@ -684,11 +684,11 @@ fn merge_one_token(tokens: &mut Vec<String>, name: &str) {
     }
 }
 
-/// Max distinct failed-fix entries kept in a pitfall's Reflexion ledger.
+/// Max distinct failed-fix entries kept in a pitfall's failed-fix ledger.
 /// Small — we only need to tell the base what NOT to re-try, not keep a history.
 const MAX_FAILED_FIXES: usize = 3;
 
-/// Record a fix that was tried and let the pitfall recur, into the Reflexion
+/// Record a fix that was tried and let the pitfall recur, into the failed-fix
 /// ledger. Deduped (a fix already known-failed isn't re-added) and capped at
 /// [`MAX_FAILED_FIXES`] (oldest dropped). Empty/whitespace fixes are ignored.
 fn remember_failed_fix(eff: &mut PitfallEfficacy, fix: &str) {
@@ -1326,7 +1326,7 @@ fn parse_iso_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
 }
 
 /// Intrinsic importance in `[0, 1]` — how much this lesson *matters* regardless
-/// of the current query or its age (the Generative-Agents "poignancy" axis).
+/// of the current query or its age (the importance axis of the composite score).
 ///
 /// Pitfalls whose recorded fix is still FAILING (`Recurring`) are the most
 /// important to keep surfacing; recognised (classified) pitfalls outrank generic
@@ -1352,8 +1352,8 @@ fn lesson_importance(l: &Lesson) -> f64 {
     imp.clamp(0.05, 1.0)
 }
 
-/// Generative-Agents-style composite retrieval score: `recency · importance ·
-/// relevance`, the product of the three normalised axes.
+/// Composite retrieval score: `recency · importance · relevance`, the product
+/// of the three normalised axes.
 ///
 /// - **relevance** comes from [`lesson_trigger_score`] (query + tech-stack
 ///   overlap), squashed to `(0, 1]` so a strong stack match dominates but never
@@ -1382,8 +1382,8 @@ fn lesson_decay_score(
 
 /// Retrieve prior lessons whose error signature matches `failure_detail` — the
 /// HIGHEST-precision retrieval trigger in the whole loop: it fires on a CONCRETE
-/// failure (FLARE / Self-RAG "retrieve when failing / uncertain"), so the match
-/// key is an exact error signature, not fuzzy prose.
+/// failure (retrieve only when failing / uncertain), so the match key is an
+/// exact error signature, not fuzzy prose.
 ///
 /// Used to inject "you have hit this exact pitfall N times before — here is what
 /// worked, and it keeps recurring" into the single auto-fix attempt, closing the
@@ -1392,7 +1392,7 @@ fn lesson_decay_score(
 /// **Fingerprint-gated + abstaining:** matches by error-signature family, never
 /// by fuzzy text, and returns an EMPTY string when the error is only a generic
 /// fallback or there is no recorded match. This is the deliberate defence
-/// against the "knowledge → noise" failure (CTIM-Rover): a similar-looking stack
+/// against the "knowledge → noise" failure mode: a similar-looking stack
 /// trace often hides a different root cause, so injecting nothing beats injecting
 /// a misleading prior fix.
 #[must_use]
@@ -1448,8 +1448,8 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         out.push_str(
             "  [!] 上次已警示但仍复发——之前的修法不够彻底。这次必须换一个根本性的不同方案，并在修完后自检确认。\n",
         );
-        // Reflexion: name the specific fixes that were ALREADY tried and failed,
-        // so the base is steered AWAY from re-running them, not just told "try
+        // Name the specific fixes that were ALREADY tried and failed, so the
+        // base is steered AWAY from re-running them, not just told "try
         // harder". This is the structured "失败修法 + 换思路" guidance.
         out.push_str(&render_failed_fixes(top));
     }
@@ -1460,7 +1460,7 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
     out
 }
 
-/// Render a pitfall's Reflexion ledger — the fixes already tried that still let
+/// Render a pitfall's failed-fix ledger — the fixes already tried that still let
 /// it recur — as a "do NOT re-run these, change approach" prompt block. Empty
 /// string when the ledger is empty (older pitfalls, or one that never recurred),
 /// so the prompt is unchanged in the common case.
@@ -1484,7 +1484,7 @@ fn render_failed_fixes(l: &Lesson) -> String {
 ///
 /// Triggering matches the pitfall against the project's real tech-stack
 /// fingerprint (see [`lesson_trigger_score`]), not just the requirement prose,
-/// then ranks by the Generative-Agents composite [`lesson_decay_score`]
+/// then ranks by the composite [`lesson_decay_score`]
 /// (`recency · importance · relevance`) so a fresh, important, on-stack lesson
 /// outranks an old high-frequency one. We don't call BM25 here to avoid a
 /// circular dependency between the agent and knowledge crates at prompt-assembly
@@ -1516,7 +1516,7 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
     // - `rel` (raw relevance i64) gates the Tier-1 (`> 0`) vs Tier-2 (`== 0`)
     //   split below — a lesson only counts as "matched right now" when its
     //   situation actually intersects the query/stack.
-    // - `decay` is the Generative-Agents composite (`recency · importance ·
+    // - `decay` is the composite (`recency · importance ·
     //   relevance`) that ORDERS lessons within each tier, so a newer + more
     //   important + more relevant lesson sorts first instead of a pure
     //   occurrences/mtime ordering. An old validated pitfall no longer crowds
@@ -1599,8 +1599,8 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
             };
             // Escalate a pitfall whose previous fix failed — tell the worker
             // the obvious fix didn't hold and to take a different, deeper tack.
-            // Reflexion: also list the SPECIFIC failed fixes so it changes
-            // approach instead of re-running a known-failure (see
+            // Also list the SPECIFIC failed fixes so it changes approach
+            // instead of re-running a known-failure (see
             // [`render_failed_fixes`]).
             let escalate = if lesson.pitfall_status() == PitfallStatus::Recurring {
                 format!(
@@ -1989,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn reflexion_records_failed_fix_and_steers_away_next_time() {
+    fn records_failed_fix_and_steers_away_next_time() {
         let tmp = TempDir::new().unwrap();
         let sig = "dependency/module-not-found/lodash";
         let err = vec!["Error: Cannot find module 'lodash'".to_string()];
@@ -2011,7 +2011,7 @@ mod tests {
         );
 
         // 2. It recurs DESPITE the warning → the recorded fix is logged as a
-        //    tried-and-failed approach in the Reflexion ledger.
+        //    tried-and-failed approach in the failed-fix ledger.
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
         let ff = failed_fix(tmp.path());
         assert_eq!(ff.len(), 1, "the failed fix must be remembered: {ff:?}");

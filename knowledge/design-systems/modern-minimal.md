@@ -10,7 +10,7 @@ last_updated: 2026-06-15
 ---
 # Modern Minimal
 
-> Precise, geometric, whitespace-first. Inspired by Linear, Vercel, Raycast.
+> Precise, geometric, whitespace-first.
 
 ## When to use
 

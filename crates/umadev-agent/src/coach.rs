@@ -739,8 +739,10 @@ fn render_docs(slug: &str, req: &str, design_inject: &str) -> String {
            - **Bold Geometric** — high contrast, oversized type, asymmetric grid. \
              Best for: creative agencies, portfolios, brand launches.\n\
            State which you chose and ONE sentence why it fits this product. \
-           Cite 1-3 REAL products as anchors with the SPECIFIC move to borrow \
-           (\"density like Linear, type like Stripe\"), name THE ONE memorable thing, \
+           Pick 1-3 recognizable, real reference products IN THE TARGET'S OWN DOMAIN \
+           as anchors, and for each borrow ONE specific move (e.g. information density \
+           from one, type treatment from another, surface/depth from a third) — name \
+           the move, not just the product. Name THE ONE memorable thing, \
            and write one AVOID line. Then define ALL tokens deterministically from \
            that choice — the frontend phase COPIES these tokens, it does not reinvent them.\n\
          - `## Color palette` — a `:root` CSS block with semantic tokens in a 3-layer \

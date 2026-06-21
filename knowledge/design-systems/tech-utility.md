@@ -10,7 +10,7 @@ last_updated: 2026-06-15
 ---
 # Tech Utility
 
-> Dense, monospace accents, dark-mode-native. Inspired by GitHub, Datadog, Grafana.
+> Dense, monospace accents, dark-mode-native.
 
 ## When to use
 
