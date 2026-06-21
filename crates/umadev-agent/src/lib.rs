@@ -49,10 +49,12 @@ pub mod lessons;
 pub mod manifest;
 pub mod phases;
 pub mod planner;
+pub mod review;
 pub mod run_lock;
 pub mod runner;
 pub mod runtime_proof;
 pub mod scaffolding;
+pub mod security;
 pub mod skills;
 pub mod state;
 pub mod tech_debt;
@@ -80,10 +82,18 @@ pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};
 pub use planner::{
     phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan, TaskKind,
 };
+pub use review::{
+    build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,
+    write_review_report, ReviewClaim, ReviewReport, Verdict,
+};
 pub use runner::{AgentRunner, RunOptions, RunReport};
 pub use runtime_proof::{
     run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,
     RuntimeProof, RuntimeStatus,
+};
+pub use security::{
+    run_security_scan, security_scan_rel_path, write_security_scan, ScanResult, ScanStatus,
+    SecurityScan,
 };
 pub use skills::{
     graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,

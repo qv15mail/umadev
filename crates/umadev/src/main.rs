@@ -410,6 +410,10 @@ enum Command {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Generate the PR-ready review report (`output/<slug>-review-report.md`)
+        /// from this run's evidence, and run the pre-PR security scan first.
+        #[arg(long)]
+        review: bool,
     },
     /// Self-test: binary integrity, workspace permissions, manifest.
     #[command(
@@ -715,7 +719,11 @@ async fn main() -> Result<()> {
             project_root,
             runtime,
         } => cmd_verify(project_root, runtime).await,
-        Command::Report { slug, project_root } => cmd_report(slug, project_root),
+        Command::Report {
+            slug,
+            project_root,
+            review,
+        } => cmd_report(slug, project_root, review),
         Command::Doctor { project_root } => cmd_doctor(project_root),
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
@@ -2954,6 +2962,39 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
         }
     }
 
+    // --- pre-PR security scan (UD-SEC-003) ---
+    println!("\n## Security scan");
+    let scan_path = project_root.join(umadev_agent::security_scan_rel_path());
+    match std::fs::read_to_string(&scan_path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<umadev_agent::SecurityScan>(&b).ok())
+    {
+        Some(scan) => {
+            println!("  {}", scan.summary_line());
+            for r in &scan.results {
+                println!(
+                    "    [{}] {} ({}) — {}",
+                    r.status.as_str(),
+                    r.tool,
+                    r.category,
+                    r.detail
+                );
+            }
+        }
+        None => println!("  <no security scan yet — runs at the `delivery` phase>"),
+    }
+
+    // --- review report (PR-ready checklist) ---
+    println!("\n## Review report");
+    let review_path = project_root.join(umadev_agent::review_report_rel_path(&infer_slug(
+        &project_root,
+    )));
+    if review_path.is_file() {
+        println!("  {} present", review_path.display());
+    } else {
+        println!("  <no review report yet — `umadev report --review` or the `delivery` phase>");
+    }
+
     // --- runtime proof (UD-EVID-005 runtime evidence) ---
     // Only when --runtime: boot the app, prove it answers, probe its routes,
     // and write `.umadev/audit/runtime-proof.json` (folded into the proof-pack).
@@ -3062,12 +3103,54 @@ fn latest_quality_report(root: &Path) -> Option<(PathBuf, bool, i64)> {
     Some((latest, passed, total))
 }
 
-fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>) -> Result<()> {
+fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let slug = match slug {
         Some(s) if !s.is_empty() => s,
         _ => infer_slug(&project_root),
     };
+    let lang = umadev_i18n::current();
+
+    // `--review`: run the pre-PR security scan, then assemble + write the
+    // PR-ready review report, and surface its verdict. Standalone path so a
+    // reviewer can regenerate the report without a full delivery run.
+    if review {
+        println!("{}", umadev_i18n::t(lang, "review.scanning"));
+        let scan = umadev_agent::run_security_scan(&project_root);
+        let _ = umadev_agent::write_security_scan(&project_root, &scan);
+        println!("  {}", scan.summary_line());
+        match umadev_agent::write_review_report(&project_root, &slug) {
+            Ok(path) => {
+                let report = umadev_agent::build_review_report(&project_root, &slug);
+                println!(
+                    "{}",
+                    umadev_i18n::tf(lang, "review.written", &[&path.display().to_string()])
+                );
+                for c in &report.claims {
+                    let mark = match c.verdict {
+                        umadev_agent::Verdict::Pass => "ok",
+                        umadev_agent::Verdict::Warn => "!!",
+                        umadev_agent::Verdict::Fail => "XX",
+                        umadev_agent::Verdict::Info => "i ",
+                    };
+                    println!("  [{mark}] {}", c.title);
+                }
+                println!(
+                    "{}",
+                    if report.mergeable() {
+                        umadev_i18n::t(lang, "review.mergeable")
+                    } else {
+                        umadev_i18n::t(lang, "review.blocked")
+                    }
+                );
+            }
+            Err(e) => println!(
+                "{}",
+                umadev_i18n::tf(lang, "review.write_failed", &[&e.to_string()])
+            ),
+        }
+        return Ok(());
+    }
 
     // 1. Compliance mapping (UD-EVID-004)
     match write_compliance_mapping(&project_root, &slug) {

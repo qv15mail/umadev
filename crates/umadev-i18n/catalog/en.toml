@@ -359,3 +359,10 @@
 "runtime.not_verified" = "Runtime not verified (fail-open): {}"
 "runtime.e2e_passed" = "e2e passed: {} ({}ms)"
 "runtime.e2e_failed" = "e2e failed: {} ({}ms)"
+
+# review report (PR-ready checklist + security scan)
+"review.scanning" = "Running pre-PR security scan (secrets + dependencies; installed tools only, fail-open)..."
+"review.written" = "Wrote PR review report: {} (folded into the proof-pack)"
+"review.write_failed" = "Review report write failed (fail-open, non-blocking): {}"
+"review.mergeable" = "No blocking issues from automated checks — ready for human review."
+"review.blocked" = "Blocking issue(s) detected — resolve the failing checks before merge."

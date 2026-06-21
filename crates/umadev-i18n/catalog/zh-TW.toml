@@ -359,3 +359,10 @@
 "runtime.not_verified" = "未驗證執行階段(fail-open):{}"
 "runtime.e2e_passed" = "e2e 通過:{}({}ms)"
 "runtime.e2e_failed" = "e2e 失敗:{}({}ms)"
+
+# review report (PR-ready 評審清單 + 安全掃描)
+"review.scanning" = "正在執行 Pre-PR 安全掃描(密鑰 + 相依套件,僅呼叫已安裝工具,fail-open)……"
+"review.written" = "已產生 PR 評審報告:{}(已併入 proof-pack)"
+"review.write_failed" = "評審報告寫入失敗(fail-open,不阻斷):{}"
+"review.mergeable" = "自動檢查未發現阻斷項 — 可進入人工評審。"
+"review.blocked" = "存在阻斷項 — 合併前需先解決標紅的檢查。"

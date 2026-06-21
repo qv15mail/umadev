@@ -359,3 +359,10 @@
 "runtime.not_verified" = "未验证运行时(fail-open):{}"
 "runtime.e2e_passed" = "e2e 通过:{}({}ms)"
 "runtime.e2e_failed" = "e2e 失败:{}({}ms)"
+
+# review report (PR-ready 评审清单 + 安全扫描)
+"review.scanning" = "正在运行 Pre-PR 安全扫描(密钥 + 依赖,仅调用已安装工具,fail-open)……"
+"review.written" = "已生成 PR 评审报告:{}(已并入 proof-pack)"
+"review.write_failed" = "评审报告写入失败(fail-open,不阻断):{}"
+"review.mergeable" = "自动检查未发现阻断项 — 可进入人工评审。"
+"review.blocked" = "存在阻断项 — 合并前需先解决标红的检查。"

@@ -1413,6 +1413,15 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         },
     });
 
+    // Pre-PR security scan surface (UD-SEC-003). The heavy scan itself runs at
+    // the delivery phase and persists `.umadev/audit/security-scan.json`; here we
+    // simply SURFACE its verdict in the gate when present. Absent → an advisory
+    // "not yet scanned" that never sinks the gate (it runs later). Findings →
+    // a warning the reviewer/quality reader sees; the scan stays fail-open.
+    if let Some(scan_check) = security_scan_check(&opts.project_root) {
+        checks.push(scan_check);
+    }
+
     // Allow user-specified check skips.
     let project_config = crate::config::load_project_config(&opts.project_root);
     let skip = &project_config.quality.skip_checks;
@@ -1609,6 +1618,35 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
     })
 }
 
+/// Surface the persisted pre-PR security scan (`.umadev/audit/security-scan.json`)
+/// as a quality-gate row. `None` when no scan has run yet (it runs at delivery),
+/// so the quality phase never penalizes a not-yet-scanned workspace. Findings →
+/// `warning` (advisory, the gate stays fail-open); a clean run that actually
+/// exercised at least one scanner → `passed`; all-skipped (no scanners on the
+/// box) → a neutral `warning` nudge to install one.
+fn security_scan_check(project_root: &Path) -> Option<QualityCheck> {
+    let path = project_root.join(crate::security::security_scan_rel_path());
+    let body = fs::read_to_string(&path).ok()?;
+    let scan: crate::security::SecurityScan = serde_json::from_str(&body).ok()?;
+    let (status, score) = if scan.has_findings() {
+        ("warning", 60)
+    } else if scan.any_ran() {
+        ("passed", 100)
+    } else {
+        ("warning", 70)
+    };
+    Some(QualityCheck {
+        name: "Pre-PR security scan".to_string(),
+        category: "compliance".to_string(),
+        description: "UD-SEC-003 — leaked-secret + dependency advisory scan via installed tools"
+            .to_string(),
+        status: status.to_string(),
+        score,
+        weight: 1.5,
+        details: scan.summary_line(),
+    })
+}
+
 fn avg_score(checks: &[QualityCheck]) -> i32 {
     if checks.is_empty() {
         return 0;
@@ -1794,7 +1832,37 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
         artifacts.push(delivery_notes);
     }
 
-    // 4. Proof pack zip
+    // 4. Pre-PR security scan (fail-open): shell out to whatever scanners are
+    //    already installed (gitleaks / npm|cargo|pip audit), record the verdict
+    //    to `.umadev/audit/security-scan.json`. A machine with no scanners just
+    //    yields an all-skipped report — never a block, never a crash.
+    let security_scan = crate::security::run_security_scan(&opts.project_root);
+    if let Ok(path) = crate::security::write_security_scan(&opts.project_root, &security_scan) {
+        audit(
+            opts,
+            "umadev/agent.delivery",
+            &path,
+            "UD-SEC-003",
+            "pre-PR security scan written",
+        );
+        artifacts.push(path);
+    }
+
+    // 5. PR-ready review report — assemble the run's own evidence (CI integrity,
+    //    contract, acceptance, coverage, quality/governance, security, runtime,
+    //    rollback) into the single artifact a reviewer reads first.
+    if let Ok(path) = crate::review::write_review_report(&opts.project_root, &slug) {
+        audit(
+            opts,
+            "umadev/agent.delivery",
+            &path,
+            "UD-EVID-005",
+            "PR review report written",
+        );
+        artifacts.push(path);
+    }
+
+    // 6. Proof pack zip
     let release_dir = opts.project_root.join("release");
     fs::create_dir_all(&release_dir)?;
     let run_id = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -1975,10 +2043,17 @@ fn build_and_zip_proof_pack(
         format!("output/{slug}-backend-notes.md"),
         format!("output/{slug}-quality-gate.json"),
         format!("output/{slug}-quality-gate.md"),
+        // PR-ready review report — the reviewer's entry point: every claim cites
+        // a concrete file/number from this run's evidence.
+        crate::review::review_report_rel_path(slug),
         format!("output/{slug}-compliance-mapping.json"),
         format!("output/knowledge-cache/{slug}-knowledge-bundle.json"),
         ".umadev/audit/frontend-api-calls.jsonl".to_string(),
         ".umadev/audit/tool-calls.jsonl".to_string(),
+        // Pre-PR security scan verdict (secrets + dependency advisories) from the
+        // customer's own installed scanners. Fail-open: an all-skipped report
+        // still ships so the reviewer sees what was (and wasn't) checked.
+        crate::security::security_scan_rel_path().to_string(),
         // Runtime evidence — proof the app actually BOOTS + answers, not just
         // that it compiles. Written by `verify --runtime`; absent (skipped)
         // when no runtime check ran, in which case the pack simply omits it.
@@ -2021,7 +2096,9 @@ fn build_and_zip_proof_pack(
          | `output/{slug}-backend-notes.md` | Backend implementation checklist |\n\
          | `output/{slug}-quality-gate.json` | Quality gate scores (per-check) |\n\
          | `output/{slug}-quality-gate.md` | Human-readable quality report |\n\
+         | `output/{slug}-review-report.md` | PR-ready review checklist (CI/contract/acceptance/security/runtime/rollback) |\n\
          | `output/{slug}-compliance-mapping.json` | SOC2/ISO27001/EU-AI-Act mapping |\n\
+         | `.umadev/audit/security-scan.json` | Pre-PR security scan: leaked-secret + dependency advisories |\n\
          | `.umadev/audit/runtime-proof.json` | Runtime evidence: dev server booted + routes answered |\n\
          | `.umadev/audit/tool-calls.jsonl` | Audit trail |\n\
          | `knowledge/design-systems/*.md` | Design system definitions |\n\
