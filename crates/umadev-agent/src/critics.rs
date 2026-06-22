@@ -340,11 +340,232 @@ impl RoleCritic for SecurityCritic {
     }
 }
 
+/// UI/UX critic — reviews the docs (and, at the preview gate, the delivered
+/// frontend) from the senior product-designer seat. The deterministic governance
+/// floor already blocks the obvious mechanical AI-slop tells (emoji-as-icon /
+/// hardcoded colors); this critic's job is the SEMANTIC design-quality layer a
+/// static rule can't make: is there a real design SYSTEM (a defined token scale —
+/// color / type / spacing — not ad-hoc values), is the information architecture
+/// and visual hierarchy coherent, are the core component states specified, is the
+/// usability sound, and — the taste call — does the UI read as a deliberate
+/// commercial product rather than a generic AI-generated template (purple/pink
+/// gradient shell, emoji as functional icons, default-font-only, decorative hero
+/// over real task flow). Only flag REAL design gaps; ignore wording nits.
+pub struct UiuxCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for UiuxCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "uiux-designer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior product designer doing a cross-review of a \
+             COMMERCIAL product's UI/UX before / as the team builds it. From the design seat, \
+             judge: (1) is there a real DESIGN SYSTEM — a defined token scale for color, \
+             typography and spacing, plus a declared icon library — rather than ad-hoc \
+             values; (2) is the information architecture + visual hierarchy coherent and \
+             usable; (3) are the core component states specified (default / hover / focus / \
+             active / disabled / loading / error); (4) the TASTE call a detector can't make: \
+             does it read as a deliberate, on-brand commercial product rather than a generic \
+             AI-generated template. BLOCK on: no design-token system, emoji used as \
+             functional icons / placeholders, default-system-font-only, a purple/pink-gradient \
+             AI-template shell, or a decorative hero standing in for a real task flow. Only \
+             flag REAL design gaps; ignore wording nits. JSON shape: \
+             {\"accepts\": <true|false>, \"blocking\": [\"<must-fix design gap>\", …], \
+             \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
+        // Read the UIUX doc as the primary surface; at the preview gate the runner
+        // also fills `code`, so the same critic can review the delivered frontend.
+        let code_block = if artifacts.code.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n## Delivered frontend (preview)\n{}",
+                crate::experts::excerpt(artifacts.code, 12_000)
+            )
+        };
+        let user = format!(
+            "## Requirement\n{}\n\n## UI/UX spec\n{}\n\n## PRD (context)\n{}{code_block}",
+            crate::experts::excerpt(artifacts.requirement, 1200),
+            crate::experts::excerpt_sections(artifacts.uiux, 5000),
+            crate::experts::excerpt_sections(artifacts.prd, 1500),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
+/// Frontend-engineering critic — reviews the DELIVERED frontend at the preview
+/// gate from the senior front-end engineer seat. The deterministic governance
+/// floor already catches emoji / hardcoded-color tells; this critic's job is the
+/// SEMANTIC implementation-quality layer: are the interactive component states
+/// actually implemented (default / hover / focus / active / disabled / loading /
+/// error — not just the resting state), is the UI accessible (semantic markup,
+/// labels, keyboard focus, contrast), is it responsive across breakpoints, and —
+/// the cross-cutting one — do the frontend `fetch` / `axios` URLs line up exactly
+/// with the architecture's API contract (no drifted path / verb). Only flag REAL
+/// implementation gaps that would ship a broken or inaccessible UI; ignore style.
+pub struct FrontendCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for FrontendCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "frontend-engineer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior front-end engineer doing a pre-backend review \
+             of a COMMERCIAL product's DELIVERED frontend at the preview gate. From the \
+             front-end seat, judge the IMPLEMENTATION (not the spec): (1) are the interactive \
+             component STATES actually implemented — default / hover / focus / active / \
+             disabled / loading / error — not just the resting state; (2) ACCESSIBILITY — \
+             semantic markup, form labels, keyboard focus, sufficient contrast; (3) \
+             RESPONSIVE layout across breakpoints; (4) FRONTEND↔BACKEND ALIGNMENT — every \
+             fetch / axios call hits a path + verb the architecture's API contract actually \
+             defines (no drifted or invented endpoint); (5) no hardcoded colors / magic \
+             values where a token should be used. Only flag REAL gaps that would ship a \
+             broken, inaccessible, or contract-mismatched UI; ignore style. JSON shape: \
+             {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<file/why>\", …]}";
+        let user = format!(
+            "## Requirement\n{}\n\n## UI/UX spec (intent)\n{}\n\n## Architecture API contract (context)\n{}\n\n## Delivered frontend code\n{}",
+            crate::experts::excerpt(artifacts.requirement, 1000),
+            crate::experts::excerpt_sections(artifacts.uiux, 2000),
+            crate::experts::excerpt_sections(artifacts.architecture, 2000),
+            crate::experts::excerpt(artifacts.code, 14_000),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
+/// Backend-engineering critic — reviews the DELIVERED backend in the quality
+/// stage from the senior back-end engineer seat, alongside the QA + security
+/// critics. The deterministic QA / contract floor already flags requirement +
+/// API-contract gaps (handed in as `qa_floor`); this critic's job is the
+/// SEMANTIC server-side engineering layer a deterministic check can't see: is
+/// the code properly LAYERED (route / service / data separated, not a monolith
+/// in one handler), do the implemented endpoints + data shapes match the
+/// architecture's contract, is ERROR HANDLING real (validated input, mapped
+/// failures, no swallowed errors), is the security BASELINE present (no obvious
+/// injection / missing-auth on a mutating route), and are there glaring
+/// ANTI-PATTERNS (N+1 / unbounded query / business logic in the controller).
+/// Only flag REAL backend defects; ignore style. Advisory only (invariant 2).
+pub struct BackendCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for BackendCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "backend-engineer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior back-end engineer doing a pre-release review of \
+             a COMMERCIAL product's DELIVERED server-side code. A deterministic floor already \
+             checked requirement coverage / API-contract gaps (listed below if any). From the \
+             back-end seat, judge the SEMANTIC layer it can't see: (1) LAYERING — route / \
+             service / data concerns separated, not all stuffed in one handler; (2) CONTRACT \
+             FIDELITY — implemented endpoints + request/response shapes match the \
+             architecture's API table; (3) ERROR HANDLING — input is validated, failures are \
+             mapped to real status codes, nothing is silently swallowed; (4) a SECURITY \
+             BASELINE — no obvious injection surface, every mutating route is authorized; \
+             (5) no glaring ANTI-PATTERN (N+1 query, unbounded fetch, business logic in the \
+             controller). Name the file/function. Only flag REAL defects; ignore style. \
+             JSON shape: {\"accepts\": <true|false>, \"blocking\": [\"<must-fix defect>\", …], \
+             \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/why>\", …]}";
+        let floor = if artifacts.qa_floor.trim().is_empty() {
+            "(deterministic contract / coverage floor: no gaps found)".to_string()
+        } else {
+            format!(
+                "Deterministic contract / coverage floor ALREADY flagged (do not just repeat these):\n{}",
+                crate::experts::excerpt(artifacts.qa_floor, 1500)
+            )
+        };
+        let user = format!(
+            "## Requirement\n{}\n\n## {floor}\n\n## Architecture API contract (context)\n{}\n\n## Delivered backend code\n{}",
+            crate::experts::excerpt(artifacts.requirement, 1000),
+            crate::experts::excerpt_sections(artifacts.architecture, 2500),
+            crate::experts::excerpt(artifacts.code, 14_000),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
+/// DevOps / release critic — reviews the DELIVERED build in the quality stage
+/// from the senior DevOps / SRE seat, alongside the QA and security critics. The
+/// deterministic quality gate already ran the project's real build / test / lint
+/// (its findings are handed in as `qa_floor`); this critic's job is the SEMANTIC
+/// DEPLOYABILITY layer: whether the build / CI actually passes cleanly (no
+/// skipped or red step), whether there is RUNTIME EVIDENCE that the app boots and
+/// its routes answer (not just that it compiles), whether the deploy TARGET is
+/// identifiable (a build script, a start command, and where relevant a container
+/// or platform descriptor), whether ENV and SECRETS are externalised (no
+/// hardcoded credential or endpoint baked into source — config comes from the
+/// environment), and whether the thing is actually release-ready. Only flag REAL
+/// ship-blockers; ignore style. Advisory only.
+pub struct DevOpsCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for DevOpsCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "devops-engineer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior DevOps / release engineer doing a pre-ship \
+             review of a COMMERCIAL product's DELIVERED build. A deterministic quality gate \
+             already ran the project's real build / test / lint (its findings are listed \
+             below if any). From the release seat, judge DEPLOYABILITY: (1) does the build / \
+             CI pass cleanly — no skipped, missing, or red step; (2) is there RUNTIME \
+             EVIDENCE the app boots and its routes answer, not merely that it compiles; \
+             (3) is the deploy TARGET identifiable — a build script + start command and, \
+             where relevant, a container / platform descriptor; (4) are ENV / SECRETS \
+             externalised — no hardcoded credential, token, or environment-specific endpoint \
+             baked into source (config comes from the environment); (5) is it actually \
+             release-ready. Name the file / step. Only flag REAL ship-blockers; ignore style. \
+             JSON shape: {\"accepts\": <true|false>, \"blocking\": [\"<must-fix blocker>\", …], \
+             \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/step/why>\", …]}";
+        let floor = if artifacts.qa_floor.trim().is_empty() {
+            "(deterministic build / quality floor: no failures recorded)".to_string()
+        } else {
+            format!(
+                "Deterministic build / quality floor ALREADY recorded (do not just repeat these):\n{}",
+                crate::experts::excerpt(artifacts.qa_floor, 1500)
+            )
+        };
+        let user = format!(
+            "## Requirement\n{}\n\n## {floor}\n\n## Delivered code (build config + app)\n{}",
+            crate::experts::excerpt(artifacts.requirement, 1000),
+            crate::experts::excerpt(artifacts.code, 14_000),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
 /// The docs-stage cross-review team, scaled to the task. A lean task gets NO
 /// critic team (the deterministic floor + the existing single judge are enough);
-/// a heavyweight greenfield / full build gets the PM + architect cross-review.
-/// This reuses the planner's complexity tiering (invariant: never MORE ceremony
-/// than the task warrants) so a one-line tweak never pays for a review team.
+/// a heavyweight greenfield / full build gets the PM + architect + designer
+/// cross-review. This reuses the planner's complexity tiering (invariant: never
+/// MORE ceremony than the task warrants) so a one-line tweak never pays for a
+/// review team.
 #[must_use]
 pub fn docs_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCritic>> {
     use crate::planner::TaskKind;
@@ -352,22 +573,55 @@ pub fn docs_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCri
         // Lean / trivial paths: no cross-review team. The deterministic floor
         // (coverage / contract) plus the existing tech-lead assessment stand.
         TaskKind::Light | TaskKind::Bugfix | TaskKind::Refactor => Vec::new(),
-        // Everything that produces real docs gets the docs cross-review team.
-        TaskKind::Greenfield
-        | TaskKind::FrontendOnly
-        | TaskKind::BackendOnly
-        | TaskKind::DocsOnly => {
+        // A backend-only build produces no UI, so the UIUX seat has nothing to
+        // review — the docs team is just PM + architect there.
+        TaskKind::BackendOnly => {
             vec![Box::new(PmCritic), Box::new(ArchitectureCritic)]
+        }
+        // Everything that produces real docs WITH a UI surface gets the full docs
+        // cross-review team: PM + architect + UI/UX designer.
+        TaskKind::Greenfield | TaskKind::FrontendOnly | TaskKind::DocsOnly => {
+            vec![
+                Box::new(PmCritic),
+                Box::new(ArchitectureCritic),
+                Box::new(UiuxCritic),
+            ]
         }
     }
 }
 
+/// The preview-gate cross-review team, scaled to the task — the THIRD axis of the
+/// critic team (docs / preview / quality). After the frontend is built and before
+/// the user approves the preview gate, the UI/UX designer + front-end engineer
+/// each review the DELIVERED frontend from their own seat. Only the kinds that
+/// actually run a frontend phase + preview gate (`Greenfield` / `FrontendOnly`)
+/// get a team; everything else has no preview surface to review and gets none.
+/// Mirrors the docs / quality tiering so a one-line tweak never pays for a review
+/// team.
+#[must_use]
+pub fn preview_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCritic>> {
+    use crate::planner::TaskKind;
+    match kind {
+        // Only the kinds with a real frontend phase + preview gate get a team.
+        TaskKind::Greenfield | TaskKind::FrontendOnly => {
+            vec![Box::new(UiuxCritic), Box::new(FrontendCritic)]
+        }
+        // No preview gate (no frontend phase) → nothing for a preview team.
+        TaskKind::BackendOnly
+        | TaskKind::DocsOnly
+        | TaskKind::Bugfix
+        | TaskKind::Refactor
+        | TaskKind::Light => Vec::new(),
+    }
+}
+
 /// The quality-stage cross-review team, scaled to the task — the second axis of
-/// the critic team (the first being the docs stage). A lean task gets NO critic
-/// team (the deterministic quality floor + the existing single code review are
-/// enough); a real build gets the QA + security cross-review. Mirrors
-/// [`docs_team_for_kind`]'s tiering exactly so a one-line tweak never pays for a
-/// review team. A `DocsOnly` task produces no code, so it has nothing for a
+/// the critic team (docs / preview / quality). A lean task gets NO critic team
+/// (the deterministic quality floor + the existing single code review are
+/// enough); a real build gets the QA + security + DevOps cross-review, and a
+/// build with a backend surface also seats the back-end engineer. Mirrors
+/// [`docs_team_for_kind`]'s tiering so a one-line tweak never pays for a review
+/// team. A `DocsOnly` task produces no code, so it has nothing for a
 /// quality-stage team to review and gets none.
 #[must_use]
 pub fn quality_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCritic>> {
@@ -376,9 +630,24 @@ pub fn quality_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn Role
         // Lean / trivial / docs-only paths: no quality cross-review team. The
         // deterministic quality floor plus the existing single code review stand.
         TaskKind::Light | TaskKind::Bugfix | TaskKind::Refactor | TaskKind::DocsOnly => Vec::new(),
-        // Everything that delivers real code gets the quality cross-review team.
-        TaskKind::Greenfield | TaskKind::FrontendOnly | TaskKind::BackendOnly => {
-            vec![Box::new(QaCritic), Box::new(SecurityCritic)]
+        // A frontend-only build has no server layer, so the back-end seat has
+        // nothing to review — QA + security + DevOps cover it.
+        TaskKind::FrontendOnly => {
+            vec![
+                Box::new(QaCritic),
+                Box::new(SecurityCritic),
+                Box::new(DevOpsCritic),
+            ]
+        }
+        // Everything that delivers a backend gets the full quality cross-review
+        // team: QA + security + back-end engineer + DevOps.
+        TaskKind::Greenfield | TaskKind::BackendOnly => {
+            vec![
+                Box::new(QaCritic),
+                Box::new(SecurityCritic),
+                Box::new(BackendCritic),
+                Box::new(DevOpsCritic),
+            ]
         }
     }
 }
@@ -479,12 +748,40 @@ mod tests {
         assert!(docs_team_for_kind(TaskKind::Light).is_empty());
         assert!(docs_team_for_kind(TaskKind::Bugfix).is_empty());
         assert!(docs_team_for_kind(TaskKind::Refactor).is_empty());
-        // Greenfield / real-doc tasks → PM + architect cross-review team.
+        // Greenfield / UI-bearing doc tasks → PM + architect + UI/UX designer.
         let team = docs_team_for_kind(TaskKind::Greenfield);
-        assert_eq!(team.len(), 2);
+        assert_eq!(team.len(), 3);
         let roles: Vec<&str> = team.iter().map(|c| c.role()).collect();
         assert!(roles.contains(&"product-manager"));
         assert!(roles.contains(&"architect"));
+        assert!(roles.contains(&"uiux-designer"));
+        // Frontend-only + docs-only also have a UI surface → designer seated.
+        assert_eq!(docs_team_for_kind(TaskKind::FrontendOnly).len(), 3);
+        assert_eq!(docs_team_for_kind(TaskKind::DocsOnly).len(), 3);
+        // Backend-only produces no UI → designer NOT seated (PM + architect only).
+        let be = docs_team_for_kind(TaskKind::BackendOnly);
+        assert_eq!(be.len(), 2);
+        let be_roles: Vec<&str> = be.iter().map(|c| c.role()).collect();
+        assert!(!be_roles.contains(&"uiux-designer"));
+    }
+
+    #[test]
+    fn preview_team_scales_with_task_kind() {
+        use crate::planner::TaskKind;
+        // Kinds with a real frontend phase + preview gate → UIUX + frontend.
+        for k in [TaskKind::Greenfield, TaskKind::FrontendOnly] {
+            let team = preview_team_for_kind(k);
+            assert_eq!(team.len(), 2, "{k:?} seats the preview team");
+            let roles: Vec<&str> = team.iter().map(|c| c.role()).collect();
+            assert!(roles.contains(&"uiux-designer"));
+            assert!(roles.contains(&"frontend-engineer"));
+        }
+        // No frontend phase / preview gate → no preview team.
+        assert!(preview_team_for_kind(TaskKind::BackendOnly).is_empty());
+        assert!(preview_team_for_kind(TaskKind::DocsOnly).is_empty());
+        assert!(preview_team_for_kind(TaskKind::Bugfix).is_empty());
+        assert!(preview_team_for_kind(TaskKind::Refactor).is_empty());
+        assert!(preview_team_for_kind(TaskKind::Light).is_empty());
     }
 
     /// A stub consult that returns a fixed verdict — proves a critic's review()
@@ -529,15 +826,23 @@ mod tests {
             quality_team_for_kind(TaskKind::DocsOnly).is_empty(),
             "docs-only delivers no code → nothing for a quality team to review"
         );
-        // Real-code tasks → QA + security cross-review team.
+        // Greenfield ships a full stack → QA + security + backend + DevOps.
         let team = quality_team_for_kind(TaskKind::Greenfield);
-        assert_eq!(team.len(), 2);
+        assert_eq!(team.len(), 4);
         let roles: Vec<&str> = team.iter().map(|c| c.role()).collect();
         assert!(roles.contains(&"qa-engineer"));
         assert!(roles.contains(&"security-engineer"));
-        // Frontend-only / backend-only also ship code → also get the team.
-        assert_eq!(quality_team_for_kind(TaskKind::FrontendOnly).len(), 2);
-        assert_eq!(quality_team_for_kind(TaskKind::BackendOnly).len(), 2);
+        assert!(roles.contains(&"backend-engineer"));
+        assert!(roles.contains(&"devops-engineer"));
+        // Backend-only also ships a server → same full team.
+        assert_eq!(quality_team_for_kind(TaskKind::BackendOnly).len(), 4);
+        // Frontend-only has no server layer → backend seat dropped (QA + security
+        // + DevOps).
+        let fe = quality_team_for_kind(TaskKind::FrontendOnly);
+        assert_eq!(fe.len(), 3);
+        let fe_roles: Vec<&str> = fe.iter().map(|c| c.role()).collect();
+        assert!(!fe_roles.contains(&"backend-engineer"));
+        assert!(fe_roles.contains(&"devops-engineer"));
     }
 
     #[tokio::test]
@@ -585,5 +890,142 @@ mod tests {
             v.blocking,
             vec!["DELETE /api/todos/:id 无鉴权(IDOR)".to_string()]
         );
+    }
+
+    // ---- The four newer seats: name + an ACCEPT case + a blocking case. The
+    // StubConsult returns whatever verdict it was built with (tagged with the
+    // critic's role on normalize), so an accepting stub exercises the ACCEPT path
+    // and a blocking stub exercises the must-fix path — both prove the critic
+    // builds its prompt and threads the verdict through without a real runtime. ----
+
+    #[tokio::test]
+    async fn uiux_critic_name_accept_and_block() {
+        assert_eq!(UiuxCritic.role(), "uiux-designer");
+        let arts = CriticArtifacts {
+            requirement: "做一个 SaaS 仪表盘",
+            uiux: "# UIUX\n## Design tokens\n- color/type/spacing scale\n## Component states",
+            prd: "# PRD\n仪表盘",
+            ..Default::default()
+        };
+        // ACCEPT case: a clean design system → accepts, no blocking.
+        let ok = StubConsult(RoleVerdict {
+            accepts: true,
+            ..Default::default()
+        });
+        let v = UiuxCritic.review(&ok, arts).await;
+        assert_eq!(v.role, "uiux-designer");
+        assert!(v.accepts && v.blocking.is_empty());
+        // BLOCKING case: AI-slop / no token system → blocks.
+        let bad = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec!["无设计令牌系统,用 emoji 当功能图标(AI 模板感)".into()],
+            evidence: vec!["uiux".into()],
+            ..Default::default()
+        });
+        let v = UiuxCritic.review(&bad, arts).await;
+        assert_eq!(v.role, "uiux-designer");
+        assert!(!v.accepts);
+        assert_eq!(
+            v.blocking,
+            vec!["无设计令牌系统,用 emoji 当功能图标(AI 模板感)".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn frontend_critic_name_accept_and_block() {
+        assert_eq!(FrontendCritic.role(), "frontend-engineer");
+        let arts = CriticArtifacts {
+            requirement: "做一个登录页",
+            uiux: "# UIUX\n登录表单",
+            architecture: "## API\n| POST | /api/login |",
+            code: "// LoginForm.tsx\nfetch('/api/login')",
+            ..Default::default()
+        };
+        // ACCEPT case.
+        let ok = StubConsult(RoleVerdict {
+            accepts: true,
+            ..Default::default()
+        });
+        let v = FrontendCritic.review(&ok, arts).await;
+        assert_eq!(v.role, "frontend-engineer");
+        assert!(v.accepts && v.blocking.is_empty());
+        // BLOCKING case: missing states + contract drift.
+        let bad = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec![
+                "按钮无 disabled/loading 态;fetch('/api/signin') 与契约 /api/login 不一致".into(),
+            ],
+            evidence: vec!["LoginForm.tsx".into()],
+            ..Default::default()
+        });
+        let v = FrontendCritic.review(&bad, arts).await;
+        assert_eq!(v.role, "frontend-engineer");
+        assert!(!v.accepts);
+        assert_eq!(v.blocking.len(), 1);
+        assert!(v.blocking[0].contains("disabled/loading"));
+    }
+
+    #[tokio::test]
+    async fn backend_critic_name_accept_and_block() {
+        assert_eq!(BackendCritic.role(), "backend-engineer");
+        let arts = CriticArtifacts {
+            requirement: "做一个待办后端",
+            architecture: "## API\n| GET | /api/todos |",
+            code: "// todos.ts\nrouter.get('/api/todos', svc.list)",
+            qa_floor: "",
+            ..Default::default()
+        };
+        // ACCEPT case (clean floor → designer-style accepting verdict).
+        let ok = StubConsult(RoleVerdict {
+            accepts: true,
+            ..Default::default()
+        });
+        let v = BackendCritic.review(&ok, arts).await;
+        assert_eq!(v.role, "backend-engineer");
+        assert!(v.accepts && v.blocking.is_empty());
+        // BLOCKING case: layering + error-handling defect.
+        let bad = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec!["业务逻辑写在 controller,无输入校验/错误映射".into()],
+            evidence: vec!["todos.ts".into()],
+            ..Default::default()
+        });
+        let v = BackendCritic.review(&bad, arts).await;
+        assert_eq!(v.role, "backend-engineer");
+        assert!(!v.accepts);
+        assert_eq!(
+            v.blocking,
+            vec!["业务逻辑写在 controller,无输入校验/错误映射".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn devops_critic_name_accept_and_block() {
+        assert_eq!(DevOpsCritic.role(), "devops-engineer");
+        let arts = CriticArtifacts {
+            requirement: "上线一个 web 服务",
+            code: "// server.ts\nconst PORT = process.env.PORT",
+            qa_floor: "build: ok\ntest: ok",
+            ..Default::default()
+        };
+        // ACCEPT case: build green, env externalised.
+        let ok = StubConsult(RoleVerdict {
+            accepts: true,
+            ..Default::default()
+        });
+        let v = DevOpsCritic.review(&ok, arts).await;
+        assert_eq!(v.role, "devops-engineer");
+        assert!(v.accepts && v.blocking.is_empty());
+        // BLOCKING case: hardcoded secret + no runtime proof.
+        let bad = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec!["源码中硬编码数据库密钥;无运行时启动证据".into()],
+            evidence: vec!["server.ts".into()],
+            ..Default::default()
+        });
+        let v = DevOpsCritic.review(&bad, arts).await;
+        assert_eq!(v.role, "devops-engineer");
+        assert!(!v.accepts);
+        assert!(v.blocking[0].contains("硬编码"));
     }
 }

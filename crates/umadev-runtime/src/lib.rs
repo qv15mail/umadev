@@ -318,3 +318,142 @@ impl Runtime for OfflineRuntime {
         })
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Continuous-session driving (the long-session model — see
+// docs/CONTINUOUS_SESSION_ARCHITECTURE.md). This is ADDITIVE and lives
+// ALONGSIDE the single-shot `Runtime` trait above; it does not replace it.
+// Where `Runtime::complete` is "prompt in → one text blob out" (a fresh,
+// stateless base process per call), `BaseSession` is "one long-lived base
+// session, inject a directive per phase, observe a stream of tool-call /
+// text / done events". The base keeps context across phases and runs its own
+// agentic tool loop (it WRITES files), instead of narrating a paragraph and
+// asking "shall I continue?".
+// ───────────────────────────────────────────────────────────────────────────
+
+/// How a turn ended — the authoritative "this phase is done" signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStatus {
+    /// The base finished the turn cleanly (e.g. claude `result.success` with
+    /// `stop_reason == "end_turn"`).
+    Completed,
+    /// The base hit a turn/budget ceiling mid-work (e.g. claude
+    /// `error_max_turns`) — partial work may exist; not a clean finish.
+    Truncated,
+    /// The turn was interrupted (ESC / abort / a parent-initiated stop).
+    Interrupted,
+    /// The turn failed (base error, an unparseable stream, or the session
+    /// process died mid-turn). Carries a human-readable reason. **Fail-open:
+    /// the session surfaces a failure as this status, never a panic.**
+    Failed(String),
+}
+
+/// A single event observed from a live [`BaseSession`] turn.
+///
+/// `ToolCall` (and the file system it mutates) is the SOURCE OF TRUTH for what
+/// the base actually did — `TextDelta` is only what it *said*. Governance
+/// auditing, the "real code produced" hard gate, and the TUI tool rows all key
+/// off `ToolCall`, not `TextDelta`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionEvent {
+    /// A chunk of assistant text (concatenate for the full message).
+    TextDelta(String),
+    /// The base invoked a tool — `name` is the tool id (`Write`/`Edit`/`Bash`/
+    /// `Read`/…), `input` the raw tool input (e.g. `{"file_path": "..."}`).
+    /// This is where a real file write shows up.
+    ToolCall {
+        /// Tool id (`Write`, `Edit`, `Bash`, `Read`, …).
+        name: String,
+        /// Raw tool input as the base reported it.
+        input: serde_json::Value,
+    },
+    /// A tool returned. `ok` = success/failure, `summary` a truncated preview.
+    ToolResult {
+        /// Whether the tool call succeeded.
+        ok: bool,
+        /// Truncated result preview.
+        summary: String,
+    },
+    /// The base is asking permission for a (potentially dangerous) action —
+    /// the orchestrator must answer via [`BaseSession::respond`]. Maps to
+    /// claude `can_use_tool` / codex `requestApproval` / opencode
+    /// `permission.asked`. This is the wiring point for the confirm gates.
+    NeedApproval {
+        /// Correlates with the [`BaseSession::respond`] reply.
+        req_id: String,
+        /// What it wants to do (tool id / action class).
+        action: String,
+        /// The target (file path / command / resource).
+        target: String,
+    },
+    /// The current turn ended — see [`TurnStatus`]. After this the orchestrator
+    /// either sends the next phase's directive (same session, context retained)
+    /// or stops at a gate.
+    TurnDone {
+        /// How the turn ended.
+        status: TurnStatus,
+    },
+}
+
+/// A decision handed back to the base for a [`SessionEvent::NeedApproval`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Allow the action.
+    Allow,
+    /// Deny the action (the base gets an error result and continues / stops).
+    Deny,
+}
+
+/// Errors a continuous session can surface.
+#[derive(Debug, Error)]
+pub enum SessionError {
+    /// Failed to start the base session process / server.
+    #[error("session start: {0}")]
+    Start(String),
+    /// Failed to write a directive / control message to the live session
+    /// (e.g. the base process already exited).
+    #[error("session send: {0}")]
+    Send(String),
+    /// The session has ended (process exited / EOF) and can take no more turns.
+    #[error("session closed")]
+    Closed,
+}
+
+/// A long-lived base session that the 9-phase runner drives one phase at a
+/// time. ONE session spans an entire run; context flows research → docs →
+/// code without re-priming. See `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
+///
+/// Contract:
+/// - [`send_turn`](Self::send_turn) injects a phase directive (imperative).
+/// - [`next_event`](Self::next_event) is then polled until it yields a
+///   [`SessionEvent::TurnDone`]; that marks the phase complete. `None` means
+///   the session itself ended (process dead) — treat as a failed turn.
+/// - [`respond`](Self::respond) answers a [`SessionEvent::NeedApproval`].
+/// - [`interrupt`](Self::interrupt) aborts the in-flight turn (ESC / timeout).
+/// - [`end`](Self::end) closes the session.
+///
+/// **Fail-open by contract:** a dead/garbled session surfaces a
+/// [`TurnStatus::Failed`] (or `next_event` → `None`), never a panic — a driver
+/// bug must never crash the host.
+#[async_trait]
+pub trait BaseSession: Send {
+    /// Inject one phase directive into the live session, starting a turn.
+    async fn send_turn(&mut self, directive: String) -> Result<(), SessionError>;
+
+    /// Pull the next event of the in-flight turn. Yields events until a
+    /// [`SessionEvent::TurnDone`]; `None` once the underlying session ends.
+    async fn next_event(&mut self) -> Option<SessionEvent>;
+
+    /// Answer a [`SessionEvent::NeedApproval`] (governance / gate decision).
+    async fn respond(
+        &mut self,
+        req_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<(), SessionError>;
+
+    /// Abort the in-flight turn (ESC / abort / timeout).
+    async fn interrupt(&mut self) -> Result<(), SessionError>;
+
+    /// Close the session and release the underlying process / server.
+    async fn end(&mut self) -> Result<(), SessionError>;
+}

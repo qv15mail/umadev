@@ -34,8 +34,19 @@
 )]
 
 pub mod claude;
+/// Continuous-session driver for `claude` (stream-json), alongside the
+/// single-shot `claude` module — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
+pub mod claude_session;
 pub mod codex;
+/// Continuous-session driver for `codex` (`codex app-server` JSON-RPC over
+/// stdio), alongside the single-shot `codex` module — see
+/// `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
+pub mod codex_session;
 pub mod opencode;
+/// Continuous-session driver for `opencode` (`opencode serve` HTTP + SSE),
+/// alongside the single-shot `opencode` module — see
+/// `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
+pub mod opencode_session;
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -47,8 +58,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub use claude::ClaudeCodeDriver;
+pub use claude_session::ClaudeSession;
 pub use codex::CodexDriver;
 pub use opencode::OpenCodeDriver;
+pub use opencode_session::OpenCodeSession;
 
 /// Outcome of probing a host CLI for availability.
 #[derive(Debug, Clone, Eq, PartialEq)]

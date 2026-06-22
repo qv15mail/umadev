@@ -3180,6 +3180,7 @@ version = "1.0.7"
 dependencies = [
  "async-trait",
  "futures",
+ "reqwest",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

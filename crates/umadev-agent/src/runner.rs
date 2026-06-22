@@ -3385,6 +3385,88 @@ impl<R: Runtime> AgentRunner<R> {
         blocking
     }
 
+    /// Run the preview-gate role-critic TEAM — the THIRD axis of the explicit
+    /// cross-review (docs / preview / quality). After the frontend is built +
+    /// build-verified and BEFORE the user approves the preview gate (and after the
+    /// deterministic governance catch-up + the single tech-lead preview
+    /// assessment), the UI/UX designer + front-end engineer each review the
+    /// DELIVERED frontend from their own seat on an ISOLATED forked session and
+    /// return a [`RoleVerdict`]. The UIUX doc + architecture API contract are
+    /// handed in as context so the designer can judge design fidelity and the
+    /// front-end critic can check fetch↔contract alignment. Every verdict is
+    /// recorded to the team ledger. The union of their advisory blocking is
+    /// returned so the caller can surface it before the gate — ADVISORY only: the
+    /// user still gates the preview, and an LLM verdict NEVER controls the loop
+    /// (invariant 2).
+    ///
+    /// Team size scales with the task ([`crate::critics::preview_team_for_kind`]):
+    /// only the kinds with a real frontend phase + preview gate (`Greenfield` /
+    /// `FrontendOnly`) get a team. Fully fail-open: offline / fork-unavailable /
+    /// parse-fail → empty verdicts → no blocking.
+    async fn run_preview_critic_team(&self, slug: &str) -> Vec<String> {
+        // No borrowed brain → no team (the deterministic floor + gate stand).
+        if self.runtime.is_offline() {
+            return Vec::new();
+        }
+        // Scale the team to the task — reuse the planner's complexity tiering.
+        let kind = crate::planner::classify(&self.merged_requirement());
+        let team = crate::critics::preview_team_for_kind(kind);
+        if team.is_empty() {
+            return Vec::new();
+        }
+        // Nothing built to review → skip (no false alarm; the gate still stands).
+        let code = crate::acceptance::code_digest(&self.options.project_root, 18_000);
+        if code.trim().is_empty() {
+            return Vec::new();
+        }
+        let read = |name: &str| {
+            std::fs::read_to_string(
+                self.options
+                    .project_root
+                    .join(format!("output/{slug}-{name}.md")),
+            )
+            .unwrap_or_default()
+        };
+        let (uiux, arch) = (read("uiux"), read("architecture"));
+        let requirement = self.options.requirement.clone();
+        let arts = crate::critics::CriticArtifacts {
+            requirement: &requirement,
+            uiux: &uiux,
+            architecture: &arch,
+            code: &code,
+            ..Default::default()
+        };
+
+        self.emit(EngineEvent::Note(format!(
+            "[team] 预览门角色团队交叉评审(只读,并行,确认前):{} 名 critic 各从本职审一遍前端预览…",
+            team.len()
+        )));
+        // Run the critics CONCURRENTLY (each on its own isolated read-only fork) —
+        // same primitive as the docs team. Fail-open: a broken/empty critic yields
+        // an accepting empty verdict and never blocks.
+        let verdicts = self.run_critics_concurrently(&team, arts).await;
+        let mut blocking: Vec<String> = Vec::new();
+        for verdict in verdicts {
+            crate::critics::append_team_ledger(&self.options.project_root, "preview", 1, &verdict);
+            let seat = verdict.role.clone();
+            if verdict.accepts && verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!("[team] {seat}:通过,无阻塞项。")));
+            } else if !verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!(
+                    "[team] {seat}:提出 {} 个阻塞项(建议在确认前补强)。",
+                    verdict.blocking.len()
+                )));
+                for b in verdict.blocking {
+                    let item = format!("[{seat}] {}", b.trim());
+                    if item.len() > 6 && !blocking.contains(&item) {
+                        blocking.push(item);
+                    }
+                }
+            }
+        }
+        blocking
+    }
+
     /// Run a critic team CONCURRENTLY, each critic on its own isolated read-only
     /// fork, and return the verdicts in the SAME order as `team` (so downstream
     /// ledger writes + Notes stay deterministic regardless of completion order).
@@ -4402,8 +4484,38 @@ impl<R: Runtime> AgentRunner<R> {
             if use_runtime {
                 self.run_governance_catchup(Phase::Frontend).await;
                 self.run_design_review(&self.options.effective_slug()).await;
-                self.surface_preview_assessment(&self.options.effective_slug())
+                let slug = self.options.effective_slug();
+                self.surface_preview_assessment(&slug).await;
+                // Preview-gate role-critic TEAM cross-review (explicit, scaled to
+                // the task, run CONCURRENTLY): the UI/UX designer + front-end
+                // engineer review the delivered frontend, record every verdict to
+                // the team ledger, and surface their advisory blocking before the
+                // user gates. ADVISORY only — the user still confirms the preview;
+                // the deterministic governance catch-up above is the hard signal.
+                // Bounded by the frontend phase budget on top of each consult's own
+                // advisory timeout; on overrun → empty (fail-open).
+                let (advisory_opt, _timed_out) = self
+                    .with_phase_budget(
+                        Phase::Frontend,
+                        self.with_heartbeat_opts(
+                            "预览门角色团队交叉评审(UIUX + 前端,并行)",
+                            false,
+                            self.run_preview_critic_team(&slug),
+                        ),
+                    )
                     .await;
+                let advisory = advisory_opt.unwrap_or_default();
+                if !advisory.is_empty() {
+                    let list = advisory
+                        .iter()
+                        .take(10)
+                        .map(|s| format!("  · {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.emit(EngineEvent::Note(format!(
+                        "[team] 预览门团队建议(advisory,确认前可据此描述修改重做前端):\n{list}"
+                    )));
+                }
             }
         } else {
             self.emit(EngineEvent::Note(format!(
@@ -7996,12 +8108,14 @@ error TS2304: Cannot find name 'Foo'
         assert!(blocking
             .iter()
             .any(|b| b.contains("验收标准未覆盖核心功能")));
-        // Each verdict was recorded to the team ledger (2 critics → 2 rows).
+        // Each verdict was recorded to the team ledger (greenfield docs team =
+        // PM + architect + UI/UX designer → 3 rows).
         let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
         let rows = ledger.lines().count();
-        assert_eq!(rows, 2, "PM + architect verdicts both recorded");
+        assert_eq!(rows, 3, "PM + architect + designer verdicts all recorded");
         assert!(ledger.contains("\"role\":\"product-manager\""));
         assert!(ledger.contains("\"role\":\"architect\""));
+        assert!(ledger.contains("\"role\":\"uiux-designer\""));
         // The team-review note announced the cross-review.
         let notes: String = sink
             .events()
@@ -8086,11 +8200,17 @@ error TS2304: Cannot find name 'Foo'
             "the quality team must surface its advisory items"
         );
         // Each verdict was recorded to the team ledger under the quality phase
-        // (2 critics → 2 rows: qa-engineer + security-engineer).
+        // (greenfield quality team = QA + security + backend + DevOps → 4 rows).
         let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
-        assert_eq!(ledger.lines().count(), 2, "QA + security verdicts recorded");
+        assert_eq!(
+            ledger.lines().count(),
+            4,
+            "QA + security + backend + DevOps verdicts recorded"
+        );
         assert!(ledger.contains("\"role\":\"qa-engineer\""));
         assert!(ledger.contains("\"role\":\"security-engineer\""));
+        assert!(ledger.contains("\"role\":\"backend-engineer\""));
+        assert!(ledger.contains("\"role\":\"devops-engineer\""));
         assert!(
             ledger.contains("\"phase\":\"quality\""),
             "ledger rows are tagged with the quality phase"
@@ -8160,6 +8280,87 @@ error TS2304: Cannot find name 'Foo'
         assert!(
             advisory.is_empty(),
             "no delivered code → quality team skips (no false alarm)"
+        );
+        assert!(!tmp.path().join(".umadev/team-ledger.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn preview_critic_team_advises_and_ledgers_for_frontend() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        set_retry_base_ms_for_tests(1);
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // Some delivered frontend so the digest is non-empty (the team has
+        // something to review).
+        std::fs::write(
+            tmp.path().join("src/App.tsx"),
+            "export const App = () => <div>hi</div>;\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("output/demo-uiux.md"), "# UIUX\n令牌系统").unwrap();
+        // A greenfield requirement → the preview critic TEAM runs (UIUX + frontend).
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into(); // a brain is present (not offline)
+        o.requirement = "做一个全新的登录系统产品".into();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntimeRoleCritic, o).with_event_sink(Arc::new(sink.clone()));
+        let advisory = runner.run_preview_critic_team("demo").await;
+        // The team surfaced advisory blocking (the fake brain returns blocking).
+        assert!(
+            !advisory.is_empty(),
+            "the preview team must surface its advisory items"
+        );
+        // Each verdict was recorded to the team ledger under the preview phase
+        // (2 critics → 2 rows: uiux-designer + frontend-engineer).
+        let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
+        assert_eq!(
+            ledger.lines().count(),
+            2,
+            "UIUX + frontend verdicts recorded"
+        );
+        assert!(ledger.contains("\"role\":\"uiux-designer\""));
+        assert!(ledger.contains("\"role\":\"frontend-engineer\""));
+        assert!(
+            ledger.contains("\"phase\":\"preview\""),
+            "ledger rows are tagged with the preview phase"
+        );
+        // The cross-review note announced the preview-gate team.
+        let notes: String = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(notes.contains("[team] 预览门角色团队交叉评审"));
+    }
+
+    #[tokio::test]
+    async fn preview_critic_team_is_fail_open_offline_and_skips_lean() {
+        // Offline (no brain) → no team, no panic, empty advisory (fail-open).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/App.tsx"), "export const A=()=><i/>;").unwrap();
+        let off = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            opts(tmp.path()),
+        );
+        assert!(
+            off.run_preview_critic_team("demo").await.is_empty(),
+            "offline → fail-open → no advisory"
+        );
+        // Lean task with a brain → no preview team (no frontend phase / gate).
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        o.requirement = "修复登录页的一个小 bug".into();
+        let lean = AgentRunner::new(FakeRuntimeRoleCritic, o);
+        assert!(
+            lean.run_preview_critic_team("demo").await.is_empty(),
+            "lean task → no preview team"
         );
         assert!(!tmp.path().join(".umadev/team-ledger.jsonl").exists());
     }

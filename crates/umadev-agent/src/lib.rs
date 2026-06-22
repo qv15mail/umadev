@@ -68,8 +68,9 @@ pub use adopt::{
     DetectedCommand,
 };
 pub use critics::{
-    append_team_ledger, docs_team_for_kind, ArchitectureCritic, CriticArtifacts, CriticConsult,
-    PmCritic, RoleCritic, RoleVerdict,
+    append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
+    ArchitectureCritic, BackendCritic, CriticArtifacts, CriticConsult, DevOpsCritic,
+    FrontendCritic, PmCritic, QaCritic, RoleCritic, RoleVerdict, SecurityCritic, UiuxCritic,
 };
 pub use deploy::{
     deploy_proof_rel_path, detect_deploy_target, run_deploy, write_deploy_proof, DeployProof,

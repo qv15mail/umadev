@@ -18,6 +18,13 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# HTTP + SSE transport for the continuous-session opencode driver
+# (`opencode serve` is an HTTP/SSE server — see `opencode_session.rs`). The host
+# crate is on the BINARY's dependency chain, which already links reqwest via the
+# runtime/knowledge crates, so this adds zero marginal weight to the shipped
+# binary. The CLAUDE.md "lib-light deps" guidance is about the dependency-light
+# governance libs (spec/governance/contract), not this host driver layer.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
