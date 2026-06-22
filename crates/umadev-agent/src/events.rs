@@ -111,6 +111,15 @@ pub enum EngineEvent {
     },
     /// A human-readable progress note (free-form).
     Note(String),
+    /// A **transient, in-place status line** — NOT a transcript entry. Used by
+    /// the long-phase heartbeat for its periodic "still working (mm:ss)" beats:
+    /// a UI overwrites a single status field with `Some(text)` and clears it on
+    /// `None`, so a multi-second wait shows ONE live-updating line in the status
+    /// bar instead of stacking a new transcript row every few seconds. Purely
+    /// cosmetic and fully fail-open — a sink that drops it loses nothing but the
+    /// in-place reassurance (the rotating spinner + phase timer already prove
+    /// motion). The CLI/headless paths ignore it entirely.
+    TransientStatus(Option<String>),
     /// A sub-task within a phase has started. Emitted when a phase fans out
     /// into parallel work (e.g. backend implementation running concurrently
     /// with a source-scan quality check). `task_id` groups start/completed pairs.

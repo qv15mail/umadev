@@ -493,19 +493,26 @@ impl<R: Runtime> AgentRunner<R> {
         self.events.emit(event);
     }
 
-    /// Drive a long-blocking future while keeping the UI **alive**: emit a
-    /// `[wait] 正在<label>…` Note up front, then a periodic "仍在进行(已 mm:ss)"
-    /// heartbeat — first beat at ~3s, then every ~7s — until the future
-    /// resolves. Returns the future's output unchanged.
+    /// Drive a long-blocking future while keeping the UI **alive**: emit ONE
+    /// `[wait] 正在<label>…` Note up front (a single transcript line so the user
+    /// knows a slow phase began), then a periodic "仍在进行(已 mm:ss)" heartbeat —
+    /// first beat at ~3s, then every ~7s — until the future resolves. Returns
+    /// the future's output unchanged.
     ///
     /// This is the P0 "alive-feel" fix for the operations that do NOT stream
     /// through `try_generate_on` (knowledge/vector build, the docs/quality
     /// critic teams, design/code review). Before this, those ran in total
     /// silence for tens of seconds and the screen read as frozen even though the
-    /// base / embedder / scanner was working. Fully fail-open: the heartbeat
-    /// only EMITS Notes (a no-op on the null sink), never affects the wrapped
-    /// result, and adds no failure path — a panic in the future still
-    /// propagates, the timing channel is pure cosmetics.
+    /// base / embedder / scanner was working.
+    ///
+    /// The periodic beats are emitted as [`EngineEvent::TransientStatus`], NOT
+    /// `Note`: a UI overwrites a single in-place status line each beat instead of
+    /// appending a fresh transcript row every few seconds (which flooded the
+    /// screen). When the future resolves the transient line is cleared with
+    /// `TransientStatus(None)`. Fully fail-open: the heartbeat only EMITS events
+    /// (a no-op on the null sink), never affects the wrapped result, and adds no
+    /// failure path — a panic in the future still propagates, the timing channel
+    /// is pure cosmetics.
     async fn with_heartbeat<F>(&self, label: &str, fut: F) -> F::Output
     where
         F: std::future::Future,
@@ -536,14 +543,24 @@ impl<R: Runtime> AgentRunner<R> {
         );
         loop {
             tokio::select! {
-                out = &mut fut => return out,
+                out = &mut fut => {
+                    // Slow phase done — drop the in-place "still working" line so
+                    // the status bar stops showing a stale timer. Fail-open: a
+                    // no-op on the null sink.
+                    self.emit(EngineEvent::TransientStatus(None));
+                    return out;
+                }
                 _ = beat.tick() => {
                     let s = started.elapsed().as_secs();
-                    self.emit(EngineEvent::Note(format!(
-                        "… {label} 仍在进行(已 {}:{:02})— 底座在后台干活,请稍候",
+                    // In-place status (overwrites, never appends) — this is what
+                    // stops the periodic beat from stacking a new transcript row
+                    // every ~7s. The first-beat `[wait]` Note above is the ONLY
+                    // transcript line the heartbeat ever adds.
+                    self.emit(EngineEvent::TransientStatus(Some(format!(
+                        "{label} 仍在进行(已 {}:{:02})— 底座在后台干活,请稍候",
                         s / 60,
                         s % 60
-                    )));
+                    ))));
                 }
             }
         }
@@ -2223,18 +2240,29 @@ impl<R: Runtime> AgentRunner<R> {
             );
             let outcome = loop {
                 tokio::select! {
-                    r = &mut fut => break r,
+                    r = &mut fut => {
+                        // Generation done — drop the in-place "still working"
+                        // line so a stale timer doesn't linger. Fail-open no-op
+                        // on the null sink.
+                        self.emit(EngineEvent::TransientStatus(None));
+                        break r;
+                    }
                     _ = heartbeat.tick() => {
                         // No events since the last tick → non-streaming base;
                         // reassure the user it's still working (with elapsed).
+                        // This is an IN-PLACE TransientStatus (overwritten each
+                        // beat), NOT a transcript Note — a 3-minute non-streaming
+                        // docs/quality call used to stack a new row every ~6s and
+                        // flood the screen. The bottom status line now shows ONE
+                        // live-updating timer instead.
                         if !active.swap(false, std::sync::atomic::Ordering::Relaxed) {
                             let s = call_started.elapsed().as_secs();
-                            self.emit(EngineEvent::Note(format!(
-                                "… {} 仍在进行(已 {}:{:02})— 底座在后台干活,请稍候",
+                            self.emit(EngineEvent::TransientStatus(Some(format!(
+                                "{} 仍在进行(已 {}:{:02})— 底座在后台干活,请稍候",
                                 phase_progress_hint(phase),
                                 s / 60,
                                 s % 60
-                            )));
+                            ))));
                         }
                     }
                 }
@@ -6191,12 +6219,13 @@ error TS2304: Cannot find name 'Foo'
 
     #[tokio::test]
     async fn with_heartbeat_emits_upfront_wait_then_periodic_beats() {
-        // The P0 "alive-feel" wrapper must: (1) emit a `[wait] 正在<label>…`
-        // Note up front, and (2) emit periodic "仍在进行" beats while a long
-        // operation runs — so a multi-second blocking op never reads as frozen.
-        // The first beat fires at ~3s, so a ~3.4s wrapped op captures the header
-        // + the first beat (a real but short sleep keeps the test self-contained
-        // without the tokio `test-util` virtual-clock feature).
+        // The P0 "alive-feel" wrapper must: (1) emit EXACTLY ONE `[wait] 正在…`
+        // Note up front (a single transcript line), and (2) emit periodic
+        // "仍在进行" beats as **TransientStatus** (in-place, NOT transcript) while
+        // a long op runs — so a multi-second wait never floods the screen with a
+        // new row every ~7s. The first beat fires at ~3s, so a ~3.4s wrapped op
+        // captures the header + the first beat (a real but short sleep keeps the
+        // test self-contained without the tokio `test-util` virtual clock).
         use crate::events::{EngineEvent, RecordingSink};
         use std::sync::Arc;
         let tmp = TempDir::new().unwrap();
@@ -6211,26 +6240,162 @@ error TS2304: Cannot find name 'Foo'
         let out = runner.with_heartbeat("做一件耗时的事", slow).await;
         assert_eq!(out, 42, "the wrapped future's output must pass through");
 
-        let notes: Vec<String> = sink
-            .events()
+        let events = sink.events();
+        let notes: Vec<String> = events
             .iter()
             .filter_map(|e| match e {
                 EngineEvent::Note(n) => Some(n.clone()),
                 _ => None,
             })
             .collect();
-        // (1) an upfront [wait] header carrying the label.
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.starts_with("[wait]") && n.contains("做一件耗时的事")),
-            "must emit an upfront [wait] note: {notes:?}"
+        // (1) EXACTLY ONE upfront [wait] header carrying the label — and the
+        // periodic "仍在进行" beat must NEVER be a Note (that's the flood bug).
+        assert_eq!(
+            notes.len(),
+            1,
+            "heartbeat must add exactly ONE transcript Note (the [wait] header), got {notes:?}"
         );
-        // (2) at least one periodic "仍在进行" beat (the ~3s first beat fired).
-        let beats = notes.iter().filter(|n| n.contains("仍在进行")).count();
+        assert!(
+            notes[0].starts_with("[wait]") && notes[0].contains("做一件耗时的事"),
+            "the single Note must be the upfront [wait] header: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("仍在进行")),
+            "periodic beats must NOT be transcript Notes (would flood): {notes:?}"
+        );
+        // (2) at least one periodic beat, carried as an in-place TransientStatus
+        // (the ~3s first beat fired).
+        let beats = events
+            .iter()
+            .filter(
+                |e| matches!(e, EngineEvent::TransientStatus(Some(s)) if s.contains("仍在进行")),
+            )
+            .count();
         assert!(
             beats >= 1,
-            "must emit a periodic heartbeat beat during a long op, got {beats}: {notes:?}"
+            "must emit a periodic heartbeat beat as TransientStatus, got {beats}: {events:?}"
+        );
+        // (3) the final event clears the in-place line when the op finishes.
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TransientStatus(None))),
+            "heartbeat must clear the transient line on completion: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_heartbeat_uses_transient_status_not_transcript_notes() {
+        // The PER-PHASE generation heartbeat (inside `try_generate_on`, for
+        // non-streaming bases) is the path that flooded the docs phase with
+        // "已 0:39 → 0:45 → 0:51…" rows. Its periodic beat must now be an in-place
+        // TransientStatus, NOT a transcript Note. A ~3.6s non-streaming call fires
+        // the ~3s first beat without waiting on the real 30s SlowRuntime.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+
+        struct ShortSilentRuntime;
+        #[async_trait]
+        impl Runtime for ShortSilentRuntime {
+            fn kind(&self) -> RuntimeKind {
+                RuntimeKind::Anthropic
+            }
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, RuntimeError> {
+                // No stream events + a >3s block → the non-streaming heartbeat
+                // path fires at least one beat.
+                tokio::time::sleep(std::time::Duration::from_millis(3600)).await;
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    id: "x".into(),
+                    model: "x".into(),
+                    usage: Usage::default(),
+                })
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(ShortSilentRuntime, opts(tmp.path()))
+            .with_event_sink(Arc::new(sink.clone()));
+        let prompt = Prompt {
+            system: "s".into(),
+            user: "u".into(),
+        };
+        let out = runner
+            .try_generate_on(&ShortSilentRuntime, Phase::Docs, prompt)
+            .await;
+        assert_eq!(out.as_deref(), Some("done"), "generation must pass through");
+
+        let events = sink.events();
+        // The periodic "仍在进行" beat must NEVER be a transcript Note.
+        let flooding_notes = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Note(n) if n.contains("仍在进行")))
+            .count();
+        assert_eq!(
+            flooding_notes, 0,
+            "generation beat must not be a transcript Note (flood bug): {events:?}"
+        );
+        // It IS an in-place TransientStatus, and the line is cleared when the
+        // call finishes.
+        let beats = events
+            .iter()
+            .filter(
+                |e| matches!(e, EngineEvent::TransientStatus(Some(s)) if s.contains("仍在进行")),
+            )
+            .count();
+        assert!(
+            beats >= 1,
+            "generation heartbeat must emit ≥1 in-place beat: {events:?}"
+        );
+        // The in-place line is cleared when the call resolves (a `None` arrives
+        // before any of the real-output events that follow it).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TransientStatus(None))),
+            "generation heartbeat must clear the line on completion: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_heartbeat_periodic_beats_never_grow_transcript() {
+        // Regression for the flood bug: a LONG slow op (multiple beats) must add
+        // at most ONE transcript Note total — every subsequent beat is an
+        // in-place TransientStatus, so transcript-bound Notes do NOT grow with
+        // wall-clock time. ~10.5s spans the 3s first beat + the 7s second beat.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10_500)).await;
+            1_u32
+        };
+        runner.with_heartbeat("长耗时阶段", slow).await;
+
+        let events = sink.events();
+        let note_count = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Note(_)))
+            .count();
+        assert_eq!(
+            note_count, 1,
+            "≥2 beats must still add only ONE transcript Note: {events:?}"
+        );
+        // And ≥2 in-place beats fired (proving the heartbeat stayed alive without
+        // adding rows).
+        let beats = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::TransientStatus(Some(_))))
+            .count();
+        assert!(
+            beats >= 2,
+            "expected ≥2 in-place heartbeat beats over ~10.5s, got {beats}: {events:?}"
         );
     }
 
