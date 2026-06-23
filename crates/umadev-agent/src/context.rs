@@ -15,7 +15,7 @@
 //! small pitfall-memory digest) — then hands it to the base through the
 //! continuous session's system-prompt face.
 //!
-//! ## The four layers (priority high → low)
+//! ## The five layers (priority high → low)
 //!
 //! 1. **Identity** — always-on, short: the director + the role the route's
 //!    work needs. [`crate::experts::agentic_team_identity`] + a route-derived
@@ -23,11 +23,20 @@
 //! 2. **心法 / anti-slop** — the team's craft law
 //!    ([`crate::experts::agentic_engineering_rules`]); surfaced for work-class
 //!    turns, skipped for pure chat.
-//! 3. **Pitfall memory (JIT)** — high-signal recorded pitfalls that match the
+//! 3. **Repo-map slice (JIT, brownfield-aware)** — a token-budgeted,
+//!    scope-personalised signature outline of the user's OWN code via
+//!    [`umadev_knowledge::repo_map`], so the base understands the existing
+//!    codebase ("explain this code", "fix the bug in checkout", "add a field"
+//!    all become repo-aware). Injected only when the project is non-empty (a
+//!    greenfield/blank repo emits nothing — no scan, no tokens) and the turn
+//!    is work-class (anything but pure chat). Higher priority than the curated
+//!    knowledge digest: on a brownfield repo, the user's real structure is a
+//!    sharper signal than a generic standard.
+//! 4. **Pitfall memory (JIT)** — high-signal recorded pitfalls that match the
 //!    project's tech-stack fingerprint + the requirement, via
 //!    [`crate::lessons::relevant_lessons_for_prompt`] (a small digest, not the
 //!    ledger). Work-class only.
-//! 4. **Knowledge (JIT)** — the few most-relevant curated knowledge chunks for
+//! 5. **Knowledge (JIT)** — the few most-relevant curated knowledge chunks for
 //!    the requirement, via [`crate::phases::agentic_knowledge_digest`] (a small
 //!    top-K, not the whole corpus). Work-class only.
 //!
@@ -42,10 +51,10 @@
 //! ## Fail-open by contract (mirrors the governance kernel + the router)
 //!
 //! Every retrieval is best-effort: a missing `knowledge/` dir, a disabled KB, an
-//! empty index, no matching lesson — each yields an empty layer, never an error.
-//! In the limit (everything fails) the result is just the always-on identity,
-//! which is exactly the pre-Wave-2 behaviour. This function NEVER returns an
-//! error and NEVER blocks the base.
+//! empty index, no matching lesson, an empty/unreadable repo (no repo-map) — each
+//! yields an empty layer, never an error. In the limit (everything fails) the
+//! result is just the always-on identity, which is exactly the pre-Wave-2
+//! behaviour. This function NEVER returns an error and NEVER blocks the base.
 
 use std::path::Path;
 
@@ -65,12 +74,24 @@ use crate::router::{RouteClass, RoutePlan};
 /// filled in priority order until this is hit (see [`compose_firmware`]).
 pub const FIRMWARE_BUDGET: usize = 10_000;
 
-/// The character budget the JIT tail (pitfall memory + knowledge digests) may
-/// add ON TOP of the always-on head (identity + 心法). Bounding the tail keeps a
-/// single huge lesson/knowledge digest from ever dominating the prompt and
-/// crowding the identity + craft law that MUST always lead a work turn. The
-/// always-on head is pushed first and kept whole; only this tail is throttled.
-const ALWAYS_ON_RESERVE: usize = 4_000;
+/// The character budget the JIT tail (repo-map + pitfall memory + knowledge
+/// digests) may add ON TOP of the always-on head (identity + 心法). Bounding the
+/// tail keeps a single huge digest from ever dominating the prompt and crowding
+/// the identity + craft law that MUST always lead a work turn. The always-on head
+/// is pushed first and kept whole; only this tail is throttled.
+///
+/// This is sized to hold the repo-map slice ([`REPO_MAP_BUDGET`]) plus the
+/// memory + knowledge digests together — so a brownfield turn carries its code
+/// outline AND its learned/curated knowledge, while the head still always leads.
+const ALWAYS_ON_RESERVE: usize = 6_800;
+
+/// The character budget the brownfield repo-map slice (the signature outline of
+/// the user's OWN code) may take inside the JIT tail. ~2.8K chars ≈ a compact
+/// outline of the most-relevant files — enough to anchor the base in the real
+/// codebase without the whole symbol graph crowding out the learned/curated
+/// digests that share the tail. Greenfield repos contribute nothing (the slice
+/// is empty), so this budget is spent only when there is real code to map.
+const REPO_MAP_BUDGET: usize = 2_800;
 
 /// How much firmware a route warrants — the JIT dial. Pure chat is the lightest
 /// (identity only, no retrieval); a deliberate build is the fullest (every
@@ -118,6 +139,16 @@ impl FirmwareTier {
     }
 }
 
+/// Whether a route should carry the brownfield repo-map slice. Anything but pure
+/// [`RouteClass::Chat`] benefits: an `Explain` ("explain this code") wants the
+/// outline even though it injects no craft/knowledge; a `QuickEdit` / `Debug` /
+/// `Build` all act on the existing code. Pure chat stays repo-map-free (fast +
+/// no scan). The greenfield (empty-repo) skip is enforced separately by the slice
+/// itself returning empty.
+fn route_wants_repo_map(route: &RoutePlan) -> bool {
+    route.class != RouteClass::Chat
+}
+
 /// Compose the firmware system prompt for ONE turn — the layered, budgeted,
 /// route-tiered overlay the host injects over the base's system-prompt face.
 ///
@@ -156,12 +187,28 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
 
     // The always-on head (identity + craft) is now fully in `buf` and can no longer
     // be evicted (later blocks only get truncated, never the ones already pushed).
-    // Cap the JIT tail so the memory + knowledge digests below add at most
+    // Cap the JIT tail so the repo-map + memory + knowledge digests below add at most
     // ALWAYS_ON_RESERVE chars on top of the head — a giant digest can never dominate
     // the prompt, and the head always leads.
     fw.reserve_jit_tail(ALWAYS_ON_RESERVE);
 
-    // ── Layer 3: pitfall memory (JIT, work-class only) ───────────────────────
+    // ── Layer 3: repo-map slice (JIT, brownfield-aware) ──────────────────────
+    // A scope-personalised signature outline of the user's OWN code, so the base
+    // understands the existing codebase before it touches it. Pushed FIRST in the
+    // JIT tail (ahead of memory + knowledge): on a brownfield repo, the user's real
+    // structure is the sharper signal. Injected only when the route is work-class
+    // (anything but pure chat) AND the repo is non-empty — a greenfield repo yields
+    // an empty slice (no scan past the cached index, no tokens spent). The slice is
+    // personalised by `route.scope` (the path hints the router surfaced) so the
+    // files the turn is about rank first. Fail-open: empty/unreadable repo → skip.
+    if route_wants_repo_map(route) {
+        let repo_map = repo_map_layer(root, &route.scope);
+        if !repo_map.trim().is_empty() {
+            fw.push_block(&repo_map);
+        }
+    }
+
+    // ── Layer 4: pitfall memory (JIT, work-class only) ───────────────────────
     // Recorded pitfalls matching this project's tech-stack fingerprint + the
     // requirement. Higher priority than fresh knowledge: "what bit us here" is a
     // sharper signal than "a relevant standard". Fail-open: empty digest → skip.
@@ -172,7 +219,7 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         }
     }
 
-    // ── Layer 4: JIT knowledge (lowest priority, work-class only) ────────────
+    // ── Layer 5: JIT knowledge (lowest priority, work-class only) ────────────
     // A small top-K of the most-relevant curated knowledge for the requirement —
     // a digest, never the whole corpus. Fail-open: empty digest → skip.
     if tier.wants_jit() {
@@ -219,6 +266,46 @@ fn memory_layer(root: &Path, requirement: &str) -> String {
 /// disabled KB, or no match → empty string.
 fn knowledge_layer(root: &Path, requirement: &str) -> String {
     crate::phases::agentic_knowledge_digest(root, requirement, JIT_KNOWLEDGE_CHUNKS)
+}
+
+/// The brownfield repo-map layer — the [`project_context`] slice as a firmware
+/// block. Thin wrapper so [`compose_firmware`] and any other path share ONE
+/// auto-adopt primitive.
+fn repo_map_layer(root: &Path, scope: &[String]) -> String {
+    project_context(root, scope, REPO_MAP_BUDGET)
+}
+
+/// **Auto-adopt the project's code context** — a token-budgeted, `scope`-
+/// personalised signature outline of the user's OWN repository, ready to inject
+/// over the base's system-prompt face so the base understands the existing code
+/// before it touches it. This is the brownfield-awareness primitive: it needs NO
+/// manual `umadev adopt` step — the first call builds + mtime-caches the symbol
+/// index ([`umadev_knowledge::symbol_index`]), and later calls are incremental
+/// (re-scanning only changed files), so every path that conditions a base session
+/// can be repo-aware for the cost of one cached scan.
+///
+/// `scope` is the router's path hints (substring-matched against file paths): the
+/// files the turn is about rank first in the outline. `budget_chars` caps the
+/// slice (typically [`REPO_MAP_BUDGET`]). The result is wrapped in a labelled
+/// `# YOUR CODEBASE` block so the base reads it as the existing structure to
+/// navigate/edit, not new code to write. Symbols are keyed `path:line`.
+///
+/// **Greenfield / fail-open:** an empty, blank, or unreadable repo yields an empty
+/// `String` (no header, no tokens spent, no slowdown — the cached scan finds
+/// nothing fast). This function never errors and never blocks the base. Shared by
+/// [`compose_firmware`] (via [`repo_map_layer`]) and available to any other path
+/// that wants the same outline.
+#[must_use]
+pub fn project_context(root: &Path, scope: &[String], budget_chars: usize) -> String {
+    let outline = umadev_knowledge::repo_map(root, scope, budget_chars);
+    if outline.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "# YOUR CODEBASE — existing code structure (signature outline)\n\nThis is the \
+         user's EXISTING repository. Read + edit these files; do NOT recreate what \
+         already exists. Symbols are keyed `path:line`.\n\n{outline}"
+    )
 }
 
 /// How many curated-knowledge chunks the firmware's JIT layer may carry — a small
@@ -425,6 +512,177 @@ mod tests {
         // No retrieval blocks (nothing on disk to retrieve).
         assert!(!fw.contains("Lessons from prior runs"));
         assert!(!fw.contains("YOUR TEAM'S EXPERIENCE"));
+    }
+
+    /// Seed a small but real source tree so [`umadev_knowledge::repo_map`] finds
+    /// symbols (a non-empty / brownfield repo). Uses distinct exported symbols so
+    /// the signature outline is non-trivial.
+    fn seed_brownfield(root: &std::path::Path) {
+        std::fs::write(
+            root.join("checkout.ts"),
+            "export function computeCartTotal(items) { return 0; }\n\
+             export class CheckoutService { pay() {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("auth.ts"),
+            "export function loginUser(email) { return true; }\n\
+             export function logoutUser() {}\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn brownfield_repo_injects_the_repo_map_slice() {
+        // A work-class turn on a NON-EMPTY repo carries the repo-map slice so the
+        // base understands the existing code before it edits it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "在结算流程里修一个 bug").await;
+        assert!(
+            fw.contains("YOUR CODEBASE"),
+            "brownfield firmware must carry the repo-map slice header: {fw}"
+        );
+        // The outline names real symbols/files from the seeded tree.
+        assert!(
+            fw.contains("checkout.ts") || fw.contains("computeCartTotal"),
+            "repo-map names real code from the repo: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn greenfield_repo_injects_no_repo_map_slice() {
+        // A blank/greenfield repo (no source files) must NOT carry a repo-map slice
+        // — no header, no wasted tokens, no slowdown over the pre-Wave-3 firmware.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个全新的待办事项产品").await;
+        assert!(
+            !fw.contains("YOUR CODEBASE"),
+            "greenfield firmware must NOT carry a repo-map slice: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_chat_skips_the_repo_map_even_on_a_brownfield_repo() {
+        // Pure chat stays light: even with real code on disk, a chat turn carries no
+        // repo-map (no scan, fast day-to-day conversation).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "你好,在吗?").await;
+        assert!(
+            !fw.contains("YOUR CODEBASE"),
+            "chat must not carry the repo-map slice: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_on_a_brownfield_repo_gets_repo_map_even_though_light_tier() {
+        // "explain this code" routes to Explain (Light tier — no craft/knowledge) but
+        // STILL needs the repo-map: understanding the existing code is the whole task.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let r = route(RouteClass::Explain, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "解释一下这段代码是做什么的").await;
+        assert!(
+            fw.contains("YOUR CODEBASE"),
+            "explain on a brownfield repo carries the repo-map slice: {fw}"
+        );
+        // Light tier still holds: no craft law / anti-slop on an explain turn.
+        assert!(!fw.contains("HOW YOUR TEAM BUILDS"), "explain stays Light");
+    }
+
+    #[tokio::test]
+    async fn repo_map_scope_personalises_file_order() {
+        // The router's `scope` hints rank matching files first in the slice — a turn
+        // about checkout surfaces checkout.ts ahead of auth.ts.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let mut r = route(
+            RouteClass::Debug,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        r.scope = vec!["checkout".to_string()];
+        let fw = compose_firmware(tmp.path(), &r, "结算有问题").await;
+        let map_start = fw.find("YOUR CODEBASE").expect("repo-map present");
+        let slice = &fw[map_start..];
+        let checkout_at = slice.find("checkout.ts");
+        let auth_at = slice.find("auth.ts");
+        // checkout must be present and, when both appear, ordered before auth.
+        assert!(checkout_at.is_some(), "scoped file present: {slice}");
+        if let (Some(c), Some(a)) = (checkout_at, auth_at) {
+            assert!(
+                c < a,
+                "scope hint ranks checkout.ts before auth.ts: {slice}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_map_layer_is_fail_open_on_an_unreadable_root() {
+        // A root that doesn't exist (or can't be scanned) yields an empty slice — the
+        // firmware degrades to the head-only behaviour, never an error.
+        let missing = std::path::Path::new("/nonexistent/umadev/repo/path/xyz");
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(missing, &r, "build something").await;
+        assert!(!fw.is_empty(), "firmware still composed");
+        assert!(
+            !fw.contains("YOUR CODEBASE"),
+            "no repo-map from an unreadable root"
+        );
+    }
+
+    #[test]
+    fn project_context_greenfield_is_empty() {
+        // Auto-adopt on a blank repo yields nothing — no header, no tokens.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = project_context(tmp.path(), &[], REPO_MAP_BUDGET);
+        assert!(ctx.is_empty(), "greenfield project_context is empty: {ctx}");
+    }
+
+    #[test]
+    fn project_context_brownfield_yields_a_labelled_outline() {
+        // Auto-adopt on a real repo yields the labelled # YOUR CODEBASE outline,
+        // naming real symbols — and needs NO manual adopt marker.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let ctx = project_context(tmp.path(), &[], REPO_MAP_BUDGET);
+        assert!(ctx.contains("YOUR CODEBASE"), "labelled block: {ctx}");
+        assert!(
+            ctx.contains("checkout.ts") || ctx.contains("auth.ts"),
+            "names real files: {ctx}"
+        );
+        assert!(
+            ctx.chars().count() <= REPO_MAP_BUDGET + 400,
+            "respects budget"
+        );
+    }
+
+    #[test]
+    fn project_context_is_stable_across_repeated_calls_incremental_cache() {
+        // The second call reuses the mtime-cached symbol index (no rescan needed) and
+        // returns the same outline — the incremental auto-adopt contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_brownfield(tmp.path());
+        let first = project_context(tmp.path(), &[], REPO_MAP_BUDGET);
+        let second = project_context(tmp.path(), &[], REPO_MAP_BUDGET);
+        assert_eq!(first, second, "cached re-derivation is stable");
+        assert!(!first.is_empty());
     }
 
     #[tokio::test]

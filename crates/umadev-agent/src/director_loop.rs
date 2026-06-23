@@ -411,7 +411,14 @@ async fn drive_director_loop_with_idle(
         //    inspecting reality over the borrowed brain. When a route is in hand, the
         //    review team is sized from the ROUTE's seats (deliverable 3 on the
         //    single-turn path too); else the kind-derived team (the legacy entry).
-        let qc = run_auto_qc(session, options, events, route.map(|r| r.team.as_slice())).await;
+        let qc = run_auto_qc(
+            session,
+            options,
+            events,
+            route.map(|r| r.team.as_slice()),
+            Some(turn.text.as_str()),
+        )
+        .await;
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
@@ -576,7 +583,7 @@ async fn drive_plan_steps(
     // does not re-drive here (each step was already verified); it folds any residual
     // finding into ONE last fix turn, bounded, then settles. This guarantees a
     // step-driven build is never held to a WEAKER bar than the single-turn build.
-    let final_reply = run_final_gate(session, options, events, route).await;
+    let final_reply = run_final_gate(session, options, events, route, &last_reply).await;
     if !final_reply.is_empty() {
         last_reply = final_reply;
     }
@@ -807,11 +814,24 @@ async fn run_final_gate(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
+    seed_reply: &str,
 ) -> String {
     let mut last_reply = String::new();
+    // The incremental-verify signal seeds from the LAST step's reply (the steps just
+    // ran the build/test); each fix round below then carries its own turn's reply.
+    let mut verify_signal = seed_reply.to_string();
     for round in 0..MAX_QC_ROUNDS {
-        // The final gate sizes its review team from the ROUTE (deliverable 3).
-        let qc = run_auto_qc(session, options, events, Some(&route.team)).await;
+        // The final gate sizes its review team from the ROUTE (deliverable 3). Pass
+        // the freshest reply so the build/test read is skipped when the base already
+        // ran it green (Wave 3 incremental verify).
+        let qc = run_auto_qc(
+            session,
+            options,
+            events,
+            Some(&route.team),
+            Some(verify_signal.as_str()),
+        )
+        .await;
         if qc.is_clean() {
             return last_reply;
         }
@@ -824,7 +844,10 @@ async fn run_final_gate(
         }
         // Fold the residual findings into ONE fix turn on the main session.
         match drive_one_turn(session, options, events, qc.fix_directive(), idle_timeout()).await {
-            Ok(t) => last_reply = t.text,
+            Ok(t) => {
+                verify_signal = t.text.clone();
+                last_reply = t.text;
+            }
             Err(_) => return last_reply, // a dead/hung session → settle (fail-open)
         }
     }
@@ -1186,6 +1209,7 @@ async fn run_auto_qc(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route_team: Option<&[crate::critics::Seat]>,
+    last_turn_text: Option<&str>,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
     let mut blocking: Vec<String> = Vec::new();
@@ -1265,9 +1289,31 @@ async fn run_auto_qc(
     // 2. Build/test FACT read (optional, when a manifest is present). UmaDev reads
     //    the objective result; the FIX is the base's job (the fix directive tells it
     //    to run its own build/test). A skipped check is neutral (fail-open).
-    let bt = director::verify(options, events, VerifyKind::BuildTest).await;
-    if let Some(line) = build_test_blocking(&bt) {
-        blocking.push(line);
+    //
+    // INCREMENTAL VERIFY (Wave 3): the base's body holds the build/test tools and,
+    // inside its turn, usually already ran them. When its reply explicitly reports a
+    // PASSED build/test (and shows NO failure signal — `base_ran_build_test_clean`,
+    // conservative by contract), re-running the project's FULL build/test here is a
+    // pure-overhead duplicate (an `npm install` + build can be minutes). So we read
+    // the base's own already-run result instead of re-running the whole suite. This
+    // skips ONLY the duplicate build/test read; the source-present hard floor + the
+    // content-governance scan above and the fork review below are UNCHANGED — the
+    // objective floor still governs. Fail-open + safe: any ambiguity or any failure
+    // whiff in the reply (or no reply at all) falls back to running our own read, so
+    // a real failure is never skipped over.
+    let base_already_verified = last_turn_text
+        .map(crate::gates::base_ran_build_test_clean)
+        .unwrap_or(false);
+    if base_already_verified {
+        events.emit(EngineEvent::Note(
+            "team · base already ran build/test green this turn — trusting its result, skipping the duplicate full build"
+                .to_string(),
+        ));
+    } else {
+        let bt = director::verify(options, events, VerifyKind::BuildTest).await;
+        if let Some(line) = build_test_blocking(&bt) {
+            blocking.push(line);
+        }
     }
 
     // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
@@ -1736,7 +1782,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
     }
 
@@ -1765,7 +1811,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = codex_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write by codex must be governed: {:?}",
@@ -1796,7 +1842,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = opts(tmp.path());
         o.backend = "claude-code".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write must be governed by QC even on claude: {:?}",
@@ -1824,7 +1870,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = codex_opts(tmp.path());
         o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(
             qc.is_clean(),
             "a clean static page must not be falsely flagged: {:?}",
@@ -1840,7 +1886,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(!qc.is_clean(), "no source → blocking");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -1870,7 +1916,7 @@ mod tests {
         let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
         let mut sess = FakeSession::new(vec![], true, reply);
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(
             qc.is_clean(),
             "a lean goal with source present is clean — the fork review is skipped: {:?}",
@@ -1887,12 +1933,75 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
         assert!(!qc.is_clean(), "a lean goal with no source still blocks");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
             "the hard-floor finding fires on the lean tier too: {:?}",
             qc.blocking
+        );
+    }
+
+    /// Did the sink record a Note whose text contains `needle`?
+    fn note_seen(rec: &RecordingSink, needle: &str) -> bool {
+        rec.events().iter().any(|e| match e {
+            EngineEvent::Note(n) => n.contains(needle),
+            _ => false,
+        })
+    }
+
+    #[tokio::test]
+    async fn incremental_verify_skips_the_duplicate_build_when_base_ran_it_green() {
+        // Wave 3 incremental verify: when the base's reply reports a PASSED build/test,
+        // UmaDev skips its OWN duplicate full build/test read — it emits the
+        // "trusting its result" note and does NOT emit the "verify build-test" note.
+        // The source-present floor + governance still ran (clean here), so QC is clean.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path()); // "做一个登录系统" — non-lean, so it reaches the build read
+        let reply = "Implemented the login system end to end. Ran the suite — all tests pass and the build succeeded.";
+        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply)).await;
+        assert!(
+            qc.is_clean(),
+            "clean source + trusted build → clean: {:?}",
+            qc.blocking
+        );
+        assert!(
+            note_seen(&rec, "base already ran build/test green"),
+            "the incremental-verify skip note must be emitted"
+        );
+        assert!(
+            !note_seen(&rec, "verify build-test"),
+            "the duplicate build/test read must be skipped (no verify note)"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_verify_runs_our_own_read_when_reply_is_ambiguous() {
+        // No reply / an ambiguous reply (no explicit passed-run) → UmaDev falls back to
+        // running its OWN build/test read (prior behaviour, no regression). With no
+        // manifest the read returns unavailable (neutral) fast, but the verify note
+        // proves UmaDev did NOT trust an unproven build.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        // Ambiguous "done" — no "tests pass"/"build succeeded" → must NOT skip.
+        let qc = run_auto_qc(&mut sess, &o, &events, None, Some("Done — implemented it.")).await;
+        assert!(
+            qc.is_clean(),
+            "no manifest → neutral build read, still clean"
+        );
+        assert!(
+            !note_seen(&rec, "base already ran build/test green"),
+            "an ambiguous reply must NOT trigger the skip"
+        );
+        assert!(
+            note_seen(&rec, "verify build-test"),
+            "UmaDev runs its own build/test read when the base's result is unproven"
         );
     }
 

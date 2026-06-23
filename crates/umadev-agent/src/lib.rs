@@ -73,7 +73,7 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
-pub use context::{compose_firmware, FIRMWARE_BUDGET};
+pub use context::{compose_firmware, project_context, FIRMWARE_BUDGET};
 pub use continuous::{
     continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
     ReviewKind, RunOutcome,

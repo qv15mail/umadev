@@ -152,6 +152,97 @@ pub fn claims_code_changes(text: &str) -> bool {
     ZH.iter().any(|k| text.contains(k))
 }
 
+/// Heuristic: does this base reply show it ALREADY ran the project's build/test
+/// THIS turn and it PASSED? Used by the director's auto-QC to skip UmaDev's own
+/// *duplicate* full build/test read (an `npm install` + build can be minutes) when
+/// the base's body — which holds the tools — already ran it green inside its turn.
+///
+/// **Conservative by contract (no correctness regression):** this returns `true`
+/// ONLY when the reply both (a) names a build/test/lint run AND (b) reports it
+/// passed, AND (c) shows NO failure signal. Anything ambiguous — no mention, a
+/// vague "done", or any whiff of a failure/error — returns `false`, so UmaDev
+/// falls back to running its OWN objective read (the prior behaviour). A false
+/// negative just re-runs a check we could have trusted (slower, still correct); we
+/// never skip on a false positive that hides a real failure. Bilingual; matched as
+/// lowercased substrings.
+#[must_use]
+pub fn base_ran_build_test_clean(text: &str) -> bool {
+    let t = text.to_lowercase();
+
+    // (c) Any failure signal vetoes the skip — if the base mentions a failing
+    // build/test anywhere in its reply, UmaDev must run its own read to see it.
+    const FAILURE: &[&str] = &[
+        "fail",
+        "failing",
+        "failed",
+        "error",
+        "errored",
+        "broke",
+        "broken",
+        "did not pass",
+        "didn't pass",
+        "does not pass",
+        "doesn't pass",
+        "not passing",
+        "red",
+        "exit code 1",
+        "exit 1",
+        "panic",
+        "测试失败",
+        "构建失败",
+        "编译失败",
+        "报错",
+        "未通过",
+        "没通过",
+        "不通过",
+    ];
+    if FAILURE.iter().any(|k| t.contains(k)) {
+        return false;
+    }
+
+    // (a) names a build/test/lint run AND (b) reports it passed/green. Require a
+    // PASS phrase that co-locates the run with a success word so a bare "looks good"
+    // (no actual run) does NOT qualify.
+    const PASS_EN: &[&str] = &[
+        "tests pass",
+        "tests passing",
+        "all tests pass",
+        "all tests passing",
+        "test suite passes",
+        "tests are passing",
+        "tests green",
+        "build passes",
+        "build passed",
+        "build succeeded",
+        "build succeeds",
+        "builds successfully",
+        "built successfully",
+        "compiles cleanly",
+        "compiled successfully",
+        "lint passes",
+        "lint passed",
+        "lint clean",
+        "checks pass",
+        "all checks pass",
+        "ci passes",
+        "test and build pass",
+        "build and test pass",
+    ];
+    const PASS_ZH: &[&str] = &[
+        "测试通过",
+        "测试全部通过",
+        "测试全绿",
+        "构建通过",
+        "构建成功",
+        "编译通过",
+        "编译成功",
+        "检查通过",
+        "全部通过",
+        "校验通过",
+    ];
+    PASS_EN.iter().any(|k| t.contains(k)) || PASS_ZH.iter().any(|k| text.contains(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +280,50 @@ mod tests {
         assert!(!claims_code_changes(
             "Let me first discuss the trade-offs of each option before touching anything."
         ));
+    }
+
+    #[test]
+    fn base_ran_build_test_clean_detects_a_passed_run_bilingually() {
+        for claim in [
+            "I implemented it and ran the tests — all tests pass.",
+            "Built the app; the build succeeded and lint passes.",
+            "Ran cargo test, the test suite passes cleanly.",
+            "构建成功,测试全部通过,可以交付了。",
+            "我跑了一遍,编译通过、测试通过。",
+        ] {
+            assert!(
+                base_ran_build_test_clean(claim),
+                "should read as a clean self-run: {claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_ran_build_test_clean_is_false_on_failure_or_ambiguity() {
+        // A failure signal ANYWHERE vetoes the skip — UmaDev must run its own read.
+        for txt in [
+            "Tests pass for the model layer but the integration test failed.",
+            "Build succeeded but lint is failing on two files.",
+            "构建成功,但有一个测试失败了。",
+            "编译通过,不过跑测试时报错了。",
+        ] {
+            assert!(
+                !base_ran_build_test_clean(txt),
+                "a failure signal must veto the skip: {txt}"
+            );
+        }
+        // Ambiguous "done" with no explicit passed-run → no skip (conservative).
+        for txt in [
+            "Done — implemented the login form and the route.",
+            "Looks good, the page renders.",
+            "实现完了,你看一下。",
+            "",
+        ] {
+            assert!(
+                !base_ran_build_test_clean(txt),
+                "ambiguous reply must NOT trigger the skip: {txt}"
+            );
+        }
     }
 
     #[test]
