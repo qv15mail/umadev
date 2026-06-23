@@ -157,6 +157,7 @@
 "gate.revision_received" = "Revision received: \"{}\". Re-running the current block…"
 "run.queued" = "[queued] Queued — it will be sent to the base as a revision at the next gap (gate / phase boundary). Press Esc to interrupt the current phase."
 "chat.queued" = "[queued] Queued — the base is still replying; this message will be sent the moment it finishes."
+"chat.interrupted" = " [interrupted] reply incomplete"
 "run.steer_applied" = "[steer] Applying your queued message — redoing the current phase with it…"
 "run.queued_unsent" = "[note] The pipeline finished before your queued message \"{}\" reached a gate, so it was not sent — just send it again."
 "run.classified_build" = "-> Classified as a build task · entering the 9-phase pipeline (/cancel to stop mid-way)"
@@ -275,7 +276,7 @@
 "setup.step.base" = "Choose a logged-in base CLI"
 "setup.progress" = "Step {} / 3"
 "setup.back_hint" = "Esc to go back"
-"setup.nav_hint" = "↑↓ select · Enter next · Esc back/quit"
+"setup.nav_hint" = "↑↓/jk select · 1-9 quick · Home/End ends · Enter next · Esc back/quit"
 "setup.more_above" = "↑ {} more above"
 "setup.more_below" = "↓ {} more below"
 

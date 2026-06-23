@@ -2311,6 +2311,9 @@ impl App {
                     // any chat turns parked behind it so the interrupt is clean;
                     // the in-flight route task is fire-and-forget (it only chats,
                     // no workspace mutation) so its late reply is simply ignored.
+                    // Seal any half-streamed reply first so the partial text is
+                    // marked incomplete, not read as the whole answer.
+                    self.seal_interrupted_stream();
                     self.thinking = false;
                     self.thinking_started = None;
                     self.queued_chat.clear();
@@ -2644,7 +2647,28 @@ impl App {
     /// Reset run state after `/cancel` aborts the in-flight pipeline task, and
     /// tell the user we're back at the prompt (workflow state on disk is intact,
     /// so a later run can resume from the last gate).
+    /// Seal an in-flight streamed reply on interrupt: if the base was mid-stream
+    /// into a Host bubble when the user cancelled, append an `[interrupted]`
+    /// marker so the user knows the reply is INCOMPLETE rather than reading a
+    /// half-sentence as if it were the whole answer. No-op when nothing was
+    /// streaming. Mirrors Claude Code marking an interrupted turn.
+    pub(crate) fn seal_interrupted_stream(&mut self) {
+        if !self.stream_text_active {
+            return;
+        }
+        self.stream_text_active = false;
+        let marker = umadev_i18n::t(self.lang, "chat.interrupted");
+        if let Some(last) = self.history.back_mut() {
+            if last.role == ChatRole::Host && !last.body.ends_with(marker) {
+                last.body.push_str(marker);
+            }
+        }
+    }
+
     pub fn cancel_run(&mut self) {
+        // Seal any half-streamed reply BEFORE the reset clears the stream flag, so
+        // the user sees the partial answer is incomplete (not the whole reply).
+        self.seal_interrupted_stream();
         self.reset_for_new_run();
         self.run_started_at = None;
         self.phase_started_at = None;
@@ -6703,6 +6727,33 @@ mod tests {
         let action = a.apply_key(KeyCode::Esc);
         assert_eq!(action, Action::Cancel);
         assert!(!a.should_quit);
+    }
+
+    #[test]
+    fn interrupt_seals_a_half_streamed_reply_as_incomplete() {
+        let mut a = fresh_app(Some("offline"));
+        // Simulate a Host reply mid-stream.
+        a.push(ChatRole::Host, "the answer so far".to_string());
+        a.stream_text_active = true;
+        a.cancel_run();
+        let marker = umadev_i18n::t(a.lang, "chat.interrupted");
+        let last = a.history.iter().rev().find(|m| m.role == ChatRole::Host).unwrap();
+        assert!(
+            last.body.contains(marker.trim()),
+            "an interrupted reply must be marked incomplete: {:?}",
+            last.body
+        );
+        assert!(!a.stream_text_active, "the stream flag is cleared on seal");
+    }
+
+    #[test]
+    fn seal_is_a_noop_when_nothing_was_streaming() {
+        let mut a = fresh_app(Some("offline"));
+        a.push(ChatRole::Host, "a finished reply".to_string());
+        a.stream_text_active = false;
+        a.seal_interrupted_stream();
+        let last = a.history.iter().rev().find(|m| m.role == ChatRole::Host).unwrap();
+        assert_eq!(last.body, "a finished reply", "no marker when nothing streamed");
     }
 
     #[test]

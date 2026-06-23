@@ -157,6 +157,7 @@
 "gate.revision_received" = "收到修訂:\"{}\"。重新跑目前 block…"
 "run.queued" = "[queued] 已排隊 — 當前階段跑完(下個 gate / 空隙)就把它作為修改發給底座。再按 Esc 可中斷當前階段。"
 "chat.queued" = "[排隊] 上一條還在回覆,這條會在它回完後立刻發出。"
+"chat.interrupted" = " [已中斷] 回覆未完成"
 "run.steer_applied" = "[steer] 套用你排隊的訊息,按它重做當前階段…"
 "run.queued_unsent" = "[note] 流水線已結束,你排隊的訊息「{}」沒趕上 gate、未發送 —— 直接重新發給我即可。"
 "run.classified_build" = "-> 判斷為開發任務 · 進入 9 階段流水線(想中途停用 /cancel)"
@@ -275,7 +276,7 @@
 "setup.step.base" = "選擇已登入的底座 CLI"
 "setup.progress" = "第 {} / 3 步"
 "setup.back_hint" = "Esc 返回上一步"
-"setup.nav_hint" = "↑↓ 選擇 · Enter 下一步 · Esc 返回/結束"
+"setup.nav_hint" = "↑↓/jk 選擇 · 1-9 快選 · Home/End 首末 · Enter 下一步 · Esc 返回/結束"
 "setup.more_above" = "↑ 上面還有 {} 項"
 "setup.more_below" = "↓ 下面還有 {} 項"
 
