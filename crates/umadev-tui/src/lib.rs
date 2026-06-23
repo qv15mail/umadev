@@ -600,6 +600,112 @@ fn spawn_continuous_block(
     })
 }
 
+/// Spawn the **real-time director loop** for an explicit `/run` (Wave 3 of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5) — the TUI counterpart of the CLI's
+/// `drive_director_run`. It opens ONE live [`umadev_runtime::BaseSession`] (the
+/// director's brain) and drives [`umadev_agent::drive_director_loop`], so the
+/// director plans + delegates LIVE: it emits team-lever markers (summon / review /
+/// verify / checkpoint) that the loop mediates and re-injects the results of,
+/// instead of working alone inside a single opaque `complete_streaming` call (the
+/// Wave 1/2 limitation). Floor preserved exactly as the CLI path: the single-writer
+/// run-lock is held for the whole loop, the always-on irreversible floor + the
+/// governance hook still apply, and the objective source-present hard-gate runs
+/// after the loop reports done.
+///
+/// All the surrounding TUI machinery is UNCHANGED: tool calls + text stream live
+/// via [`EngineEvent::WorkerStream`] (the same render path), and a terminal
+/// [`RouteDecision::AgenticDone`] / [`RouteDecision::Failed`] clears `thinking` and
+/// records the assistant turn for chat-memory continuity — identical to
+/// [`spawn_agentic`]. A NEW base session is opened per `/run` (a director build is
+/// a standalone, run-to-settle orchestration, not a gate-anchored block sequence),
+/// and `end()`-ed when the loop settles.
+///
+/// **Fail-open:** a session that can't open / the run-lock held by a DIFFERENT live
+/// run emits the honest `ABORT_SENTINEL` note and a terminal `Failed`; a session
+/// that dies mid-loop is a `Failed` outcome. It NEVER panics or wedges, and a base
+/// that emits no marker degrades to a plain agentic build (Wave 1 behaviour).
+fn spawn_director_loop(
+    options: RunOptions,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    autonomous: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let backend = options.backend.clone();
+        let model = options.model.clone();
+        let root = options.project_root.clone();
+
+        // Single-writer run-lock for the whole director loop — the SAME guard the
+        // CLI `drive_director_run` + the legacy pipeline hold, so a director build
+        // serializes with any other workspace-mutating run. A lock held by a
+        // DIFFERENT live run is an honest terminal abort; any other lock IO fails
+        // open inside `acquire_for_run` to an un-owned guard (a lock bug never
+        // blocks a legitimate build). The guard lives for the task's scope.
+        let _run_lock = match umadev_agent::run_lock::RunLock::acquire_for_run(&root) {
+            Ok(g) => g,
+            Err(e) => {
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    block_abort_note(&e, &backend)
+                )));
+                let _ = route_tx.send(RouteDecision::Failed(start_failed_note(&e)));
+                return;
+            }
+        };
+
+        // Open the director's live base session. Fail-open: a session that can't
+        // open emits the honest terminal abort + a terminal Failed (the user can
+        // retry, or opt into the legacy pipeline with `UMADEV_LEGACY_PIPELINE=1`).
+        let mut session = match umadev_host::session_for(&backend, &root, &model, autonomous).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    umadev_i18n::tlf("continuous.tui_session_unavailable", &[&e.to_string()])
+                )));
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                    "continuous.tui_session_unavailable",
+                    &[&e.to_string()],
+                )));
+                return;
+            }
+        };
+
+        // Frame the goal for the director, then drive the real-time loop. The
+        // capability/marker syntax is folded into the first directive by the loop.
+        let directive = umadev_agent::experts::director_build_directive(&options.requirement);
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let outcome =
+            umadev_agent::drive_director_loop(session.as_mut(), &options, &sink_dyn, directive)
+                .await;
+        // Always end the session (release the process / server).
+        let _ = session.end().await;
+
+        match outcome {
+            umadev_agent::DirectorLoopOutcome::Done { reply } => {
+                // Objective source-present hard-gate (the deterministic reality
+                // floor) — the SAME check the free-text agentic path + the CLI run
+                // apply. A `/run` that CLAIMED a build but produced zero real source
+                // is reported honestly (an `ABORT_SENTINEL` note), never celebrated.
+                if let Some(note) = director_source_hardgate(&root, &reply) {
+                    sink.emit(EngineEvent::Note(note));
+                }
+                // The body already streamed live; hand the assembled text to the
+                // event loop to record as the assistant turn + clear `thinking`.
+                let _ = route_tx.send(RouteDecision::AgenticDone(reply));
+            }
+            umadev_agent::DirectorLoopOutcome::Failed(reason) => {
+                // An honest terminal abort (session died / a turn failed). Flag the
+                // terminal state (so the bar shows a real aborted state) + clear
+                // `thinking` via the terminal Failed decision.
+                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+                let _ = route_tx.send(RouteDecision::Failed(reason));
+            }
+        }
+    })
+}
+
 /// Marker prefixed onto the terminal-abort note emitted by [`spawn_block`] when
 /// a block ends with `Err` (zero phases produced). The TUI app recognises this
 /// prefix to flip the run into an explicit **aborted** terminal state — clearing
@@ -1418,58 +1524,6 @@ fn fire_agentic(
     handle
 }
 
-/// Fire an explicit `/run` (full product build) through the SAME director agentic
-/// engine a free-text message reaches (Wave 1 of
-/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5) — NOT the legacy fixed 9-phase
-/// pipeline. The raw requirement is framed as a complete commercial build via
-/// [`experts::director_build_directive`], and the turn runs in **director-build
-/// mode**: it holds the single-writer run-lock and is checked by the objective
-/// source-present hard-gate after it reports done. Everything else (resume the
-/// chat session, the live `WorkerStream` render, Ctrl-C abort via `run_task`) is
-/// shared with [`fire_agentic`] — `/run` and a typed requirement now run ONE
-/// engine, differing only in the build framing + the build-mode floor.
-fn fire_director_build(
-    app: &mut App,
-    sink: &Arc<ChannelSink>,
-    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-    requirement: String,
-) -> tokio::task::JoinHandle<()> {
-    let spec = app.brain_spec();
-    let host_cli = matches!(spec, BrainSpec::HostCli(_));
-    let continue_session = app.host_chat_session_active;
-    let session_id = if host_cli {
-        Some(app.ensure_chat_session_id())
-    } else {
-        None
-    };
-    // Keep the waiting state alive through the (potentially long) build loop.
-    app.thinking = true;
-    app.thinking_started = Some(std::time::Instant::now());
-    app.last_output_at = None;
-    app.tool_in_progress = false;
-    app.agentic_in_flight = true;
-    // Frame the goal for the director: a full, ship-quality product build it
-    // orchestrates with its team however it judges fit (no fixed phase walk).
-    let task = umadev_agent::experts::director_build_directive(&requirement);
-    let handle = spawn_agentic(
-        AgenticTurn {
-            task,
-            spec,
-            continue_session,
-            session_id,
-            fallback_model: app.effective_model(),
-            project_root: app.project_root.clone(),
-            director_build: true,
-        },
-        sink.clone(),
-        route_tx.clone(),
-    );
-    if host_cli {
-        app.host_chat_session_active = true;
-    }
-    handle
-}
-
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
 /// the user parked while the route was in flight, keeping same-session routing
 /// serial. Returns `true` if a parked turn was dispatched.
@@ -2047,14 +2101,38 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
                                 let legacy = umadev_agent::legacy_pipeline_from_env();
                                 if host_cli && !legacy {
-                                    // DEFAULT: the director build. No fixed-phase
-                                    // continuous run is in flight, so the gate-resume
-                                    // machinery stays dormant (the director pauses by
-                                    // asking the user inside its own turn when it judges
-                                    // a decision is theirs).
+                                    // DEFAULT (Wave 3): the REAL-TIME director loop.
+                                    // `/run` opens a live base session and drives
+                                    // `drive_director_loop`, so the director plans +
+                                    // delegates LIVE — emitting team-lever markers
+                                    // (summon / review / verify / checkpoint) that
+                                    // UmaDev mediates mid-run — instead of working
+                                    // alone inside one opaque streaming call. No
+                                    // fixed-phase continuous run is in flight, so the
+                                    // gate-resume machinery stays dormant (the director
+                                    // pauses by emitting a checkpoint marker when it
+                                    // judges a decision is the user's). The run-lock +
+                                    // governance + source-present hard-gate are held
+                                    // inside the loop's task.
                                     continuous_run_active = false;
-                                    run_task =
-                                        Some(fire_director_build(app, &sink, &route_tx, req));
+                                    app.thinking = true;
+                                    app.thinking_started = Some(std::time::Instant::now());
+                                    app.last_output_at = None;
+                                    app.tool_in_progress = false;
+                                    app.agentic_in_flight = true;
+                                    // Remember the goal so the status bar + a later
+                                    // revise see it, then build the run options for
+                                    // this director build with the requirement set.
+                                    app.requirement.clone_from(&req);
+                                    let mut run_opts = current_run_options(app, &opts);
+                                    run_opts.requirement = req;
+                                    let autonomous = continuous_autonomous(run_opts.mode);
+                                    run_task = Some(spawn_director_loop(
+                                        run_opts,
+                                        sink.clone(),
+                                        route_tx.clone(),
+                                        autonomous,
+                                    ));
                                 } else {
                                     // LEGACY (opt-in) or offline / non-host: drive the
                                     // fixed pipeline exactly as before. Continuous is

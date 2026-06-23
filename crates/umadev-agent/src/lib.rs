@@ -44,6 +44,7 @@ pub mod coverage;
 pub mod critics;
 pub mod deploy;
 pub mod director;
+pub mod director_loop;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
@@ -87,6 +88,7 @@ pub use director::{
     summon as director_summon, verify as director_verify, CheckpointDecision, ReviewResult,
     SummonMode, SummonResult, VerifyKind, VerifyResult,
 };
+pub use director_loop::{director_loop_capability, drive_director_loop, DirectorLoopOutcome};
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};
 pub use lessons::{
@@ -103,7 +105,8 @@ pub use phases::{
     agentic_knowledge_digest, knowledge_top_files, phase_knowledge_digest, PhaseOutput,
 };
 pub use planner::{
-    phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan, TaskKind,
+    advisory_prior, phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan,
+    TaskKind,
 };
 pub use pr::{
     assess_readiness, feature_branch_name, latest_proof_pack, manual_steps, plan_branches,

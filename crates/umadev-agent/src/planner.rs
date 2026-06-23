@@ -669,6 +669,73 @@ pub fn redoable_phase_ids() -> Vec<&'static str> {
     umadev_spec::PHASE_CHAIN.iter().map(|p| p.id()).collect()
 }
 
+/// An **advisory prior** the director may read — Wave 3 of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3 (planner DEMOTED from "decides the
+/// fixed phase list" to "an advisory prior").
+///
+/// In the Wave 3 model the director (thinking through the base) decides on the
+/// spot how to get a goal done — who to bring in, in what order, how much process.
+/// The planner no longer DICTATES that route; it only offers a *suggestion* the
+/// director can take or ignore. This function renders the classifier's read of a
+/// requirement as a SHORT, explicitly-advisory hint: "this looks like X; a goal
+/// like this usually benefits from Y — but YOU judge what THIS one needs." It
+/// deliberately uses non-binding language and never names a forced phase chain.
+///
+/// Deterministic + fail-open: it reuses [`classify`] (no model call), so an
+/// unrecognised requirement falls back to the [`TaskKind::Greenfield`] advisory —
+/// the most thorough suggestion, which the director is still free to trim.
+#[must_use]
+pub fn advisory_prior(requirement: &str) -> String {
+    let kind = classify(requirement);
+    // The non-binding "you might consider" framing per inferred kind. Each line
+    // describes the SHAPE of work a goal like this usually warrants, then hands the
+    // call back to the director — it is a prior, not an order.
+    let hint = match kind {
+        TaskKind::Greenfield => {
+            "This reads like a full product build from scratch. A goal this size \
+             usually benefits from framing the requirements (PM) and an approach \
+             (architect) before splitting frontend / backend, then a QA + security \
+             pass — but scale that to what THIS goal actually needs."
+        }
+        TaskKind::FrontendOnly => {
+            "This reads like frontend / UI work. It usually centres on the design \
+             system + the components, with a quick contract check that the calls \
+             line up — little or no backend. Bring in a designer / frontend seat as \
+             you see fit."
+        }
+        TaskKind::BackendOnly => {
+            "This reads like backend / API / data work. It usually centres on the \
+             routes + data model + validation, with the frontend contract kept in \
+             mind — little or no UI. Bring in an architect / backend seat as you \
+             see fit."
+        }
+        TaskKind::Bugfix => {
+            "This reads like a focused bug fix. It usually wants a minimal, targeted \
+             change and a check that the original failure path is actually gone — no \
+             research / docs ceremony. Often one engineer end to end."
+        }
+        TaskKind::Refactor => {
+            "This reads like a refactor / cleanup. It usually wants a structural \
+             change that keeps behaviour identical — lean on the existing tests to \
+             prove nothing broke. No new docs ceremony."
+        }
+        TaskKind::DocsOnly => {
+            "This reads like docs / research / planning, not code. It usually wants \
+             the writing done well and a checkpoint with the user before any \
+             implementation."
+        }
+        TaskKind::Light => {
+            "This reads like a small, scoped change. It usually wants you to just do \
+             it directly — implement + a quick verify — with none of the research / \
+             docs / gate ceremony a full product needs."
+        }
+    };
+    format!(
+        "[advisory — a prior you may use or ignore] {hint} The plan is YOURS to \
+         decide; this is only a read of the goal, not a route you must follow."
+    )
+}
+
 /// Build a plan that FORCES the lightweight fast track regardless of how the
 /// requirement classifies. This is what `umadev quick` / `/quick` use: the user
 /// has explicitly asked for the lean path, so we skip classification and pin
@@ -962,6 +1029,51 @@ mod tests {
             assert!(!p.includes(Phase::PreviewConfirm));
             assert!(!p.includes(Phase::Delivery));
         }
+    }
+
+    #[test]
+    fn advisory_prior_is_explicitly_non_binding_per_kind() {
+        // The Wave 3 demotion: the planner returns an ADVISORY prior the director
+        // may ignore — never a forced phase chain. Every kind's hint must read as a
+        // suggestion (the "advisory" / "may use or ignore" framing) and hand the
+        // plan back to the director.
+        for req in [
+            "做一个电商平台",          // Greenfield
+            "做一个前端落地页",        // FrontendOnly
+            "写一个后端 graphql 接口", // BackendOnly
+            "修复一个报错",            // Bugfix
+            "重构 app.rs 拆分模块",    // Refactor
+            "先写需求文档",            // DocsOnly
+            "帮我改个文案",            // Light
+        ] {
+            let a = advisory_prior(req);
+            let lower = a.to_lowercase();
+            assert!(
+                lower.contains("advisory"),
+                "the prior is explicitly advisory for `{req}`: {a}"
+            );
+            assert!(
+                lower.contains("yours to decide") || lower.contains("not a route you must"),
+                "the prior hands the plan back to the director for `{req}`: {a}"
+            );
+            // It must NOT prescribe the literal fixed phase chain.
+            assert!(
+                !lower.contains("research -> docs") && !a.contains("研究→文档"),
+                "the prior must not name a forced phase chain for `{req}`: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn advisory_prior_reflects_the_classification() {
+        // A greenfield prior mentions the full-build shape; a light prior mentions
+        // doing it directly — so the director's read matches the goal's size.
+        assert!(advisory_prior("做一个电商平台")
+            .to_lowercase()
+            .contains("full product"));
+        assert!(advisory_prior("帮我改个文案")
+            .to_lowercase()
+            .contains("just do it"));
     }
 
     #[test]

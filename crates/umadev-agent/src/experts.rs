@@ -599,6 +599,50 @@ pub fn phase_persona(phase: umadev_spec::Phase) -> &'static str {
     }
 }
 
+/// The ROLE PERSONA for a director-summoned seat, keyed by the seat's **role id**
+/// (the same ids [`crate::director::summon`] / the critic roster use:
+/// `frontend-engineer`, `architect`, `qa-engineer`, …) — Wave 3 of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3 (personas DEMOTED from "tied to a
+/// fixed phase" to "a role capability the director injects whenever it assigns that
+/// role a move").
+///
+/// In the fixed pipeline a persona was bound to a PHASE ([`phase_persona`]); the
+/// director loop instead delegates by ROLE, on its own judgement, so the persona
+/// must be reachable by role id. This maps each seat to its craft + remit, reusing
+/// the `phase_persona` wording for the seats that have a phase analogue so the
+/// taste lives in one place. Case-insensitive + alias-tolerant (matches the
+/// `critic_for_role` aliasing). Returns `""` for an unknown role so a caller can
+/// prepend unconditionally (fail-open: an unknown seat carries no persona, just the
+/// instruction).
+#[must_use]
+pub fn persona_for_role(role: &str) -> &'static str {
+    use umadev_spec::Phase;
+    match role.trim().to_ascii_lowercase().as_str() {
+        "product-manager" | "pm" | "product" | "product-researcher" | "researcher" => {
+            phase_persona(Phase::Research)
+        }
+        "architect" | "architecture" | "tech-lead" => phase_persona(Phase::Spec),
+        "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
+            "You are now working as a senior UI/UX designer. Your remit: a \
+             deliberate design system — tokens, typography, a declared icon library \
+             (never emoji), every component state — that reads as intentional craft, \
+             never a template."
+        }
+        "frontend-engineer" | "frontend" | "fe" => phase_persona(Phase::Frontend),
+        "backend-engineer" | "backend" | "be" => phase_persona(Phase::Backend),
+        "qa-engineer" | "qa" => phase_persona(Phase::Quality),
+        "security-engineer" | "security" => {
+            "You are now working as a senior security engineer. Your remit: a \
+             genuine security pass — no hardcoded secrets, every input validated, \
+             safe error handling, a sound auth/session posture — sign off only on \
+             what actually holds."
+        }
+        "devops-engineer" | "devops" | "sre" | "release" => phase_persona(Phase::Delivery),
+        // Unknown seat → no persona (fail-open).
+        _ => "",
+    }
+}
+
 /// The one-line ROLE PERSONA for a LEAN gateless phase (`Light` / `Bugfix` /
 /// `Refactor`). The lean fast-track has no document phases, so the role is a
 /// short "you are a senior engineer, just implement this" rather than the
@@ -690,9 +734,13 @@ pub fn agentic_engineering_rules() -> &'static str {
 #[must_use]
 pub fn director_with_team_tools() -> String {
     format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         agentic_team_identity(),
-        crate::director::director_tools_capability()
+        crate::director::director_tools_capability(),
+        // Wave 3 (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5): the marker syntax
+        // that turns the Wave 2 "you HAVE these levers" into "and here is how you
+        // CALL one, live" — UmaDev mediates each marker and re-injects the result.
+        crate::director_loop::director_loop_capability()
     )
 }
 
@@ -714,6 +762,11 @@ pub fn director_with_team_tools() -> String {
 /// reality after the director reports done; this directive only sets the goal.
 #[must_use]
 pub fn director_build_directive(requirement: &str) -> String {
+    // Wave 3 (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3): surface the planner's
+    // read of the goal as an ADVISORY PRIOR — a non-binding hint the director may
+    // use or ignore — NOT a fixed phase list it must walk. The planner is demoted
+    // from "decides the route" to "a prior the director consults".
+    let prior = crate::planner::advisory_prior(requirement);
     format!(
         "## Your goal (treat this as a COMPLETE, ship-quality product build)\n\n\
          {requirement}\n\n\
@@ -728,6 +781,7 @@ pub fn director_build_directive(requirement: &str) -> String {
          never ceremony for its own sake, never under-built either. There is no \
          fixed phase checklist you must march through; orchestrate it the way a \
          strong senior director would.\n\
+         {prior}\n\
          Build to your team's craft and taste, write real representative content \
          (never placeholders), and ground every \"done\" claim in the real files on \
          disk and the project's real build/test — report only what actually works."
@@ -1055,6 +1109,41 @@ mod tests {
         // Gate phases never receive a directive → empty persona.
         assert!(phase_persona(Phase::DocsConfirm).is_empty());
         assert!(phase_persona(Phase::PreviewConfirm).is_empty());
+    }
+
+    #[test]
+    fn persona_for_role_resolves_seats_and_aliases_and_fails_open() {
+        // Wave 3: the director summons by ROLE id, so the persona must be reachable
+        // by role id (with the same aliases `critic_for_role` accepts), and an
+        // unknown seat fails open to "" (no persona, just the instruction).
+        assert!(persona_for_role("frontend-engineer")
+            .to_lowercase()
+            .contains("frontend engineer"));
+        assert!(
+            persona_for_role("fe")
+                .to_lowercase()
+                .contains("frontend engineer"),
+            "alias resolves"
+        );
+        assert!(
+            persona_for_role("ARCHITECT")
+                .to_lowercase()
+                .contains("architect"),
+            "case-insensitive"
+        );
+        assert!(persona_for_role("qa").to_lowercase().contains("qa"));
+        assert!(persona_for_role("security")
+            .to_lowercase()
+            .contains("security"));
+        assert!(persona_for_role("uiux-designer")
+            .to_lowercase()
+            .contains("designer"));
+        assert!(persona_for_role("devops").to_lowercase().contains("devops"));
+        assert!(persona_for_role("product-manager")
+            .to_lowercase()
+            .contains("product manager"));
+        // Unknown seat → empty (fail-open).
+        assert!(persona_for_role("astrologer").is_empty());
     }
 
     #[test]

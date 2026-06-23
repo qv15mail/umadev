@@ -270,6 +270,14 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
     let mut directive = String::new();
     directive.push_str(crate::experts::agentic_engineering_rules());
     directive.push_str("\n\n");
+    // Wave 3 (§3): inject the SEAT'S persona (its craft + remit) by role id — the
+    // persona is a role capability the director injects per move, not a phase-bound
+    // prompt. Fail-open: an unknown role yields "" → just the generic seat line.
+    let persona = crate::experts::persona_for_role(role);
+    if !persona.is_empty() {
+        directive.push_str(persona);
+        directive.push_str("\n\n");
+    }
     directive.push_str(&format!(
         "You are now wearing the {role} seat on this team. Do THIS slice of the \
          goal directly, with real files on disk — edit/create the files, run any \
@@ -705,6 +713,12 @@ mod tests {
         assert!(
             directive.contains("build the login form"),
             "the instruction is carried"
+        );
+        // Wave 3: the seat's PERSONA (its craft + remit) is injected by role id, so
+        // a summoned doer carries the same craft the fixed-phase persona did.
+        assert!(
+            directive.to_lowercase().contains("frontend engineer"),
+            "the seat's persona is injected: {directive}"
         );
     }
 

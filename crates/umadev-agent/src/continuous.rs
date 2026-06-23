@@ -179,8 +179,21 @@ fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
     let _ = crate::coach::write_coach_prompt(options, phase);
 }
 
-/// Drive ONE block of the 9-phase pipeline over a single live [`BaseSession`],
-/// stopping at the first confirmation gate (or at delivery / a hard stop).
+/// Drive ONE block of the **legacy** fixed 9-phase pipeline over a single live
+/// [`BaseSession`], stopping at the first confirmation gate (or at delivery / a
+/// hard stop).
+///
+/// **Wave 3 status (DEMOTED — `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3/§5):**
+/// this fixed `block_phases` walk is **no longer the default route** for a `/run`.
+/// The default is the real-time director loop ([`crate::director_loop`]), where the
+/// director plans + delegates live and the planner/phases are only an advisory
+/// prior. `run_block` is retained UNTOUCHED behind the explicit
+/// `UMADEV_LEGACY_PIPELINE=1` opt-in ([`legacy_pipeline_from_env`]) so the field
+/// can revert with no code change. Its *capabilities* — [`review_and_rework`] /
+/// [`run_review_team`] / [`run_quality_gate`] / [`quality_floor`] / [`team_for`] /
+/// [`fork_with_timeout`] / [`Blackboard`] / [`drive_rework_turn`] — are KEPT and
+/// REUSED as the director's tool underpinnings ([`crate::director`] /
+/// [`crate::director_loop`]); only the FIXED WALK below is legacy.
 ///
 /// `start_after` is the phase the block begins at: a fresh run passes
 /// [`Phase::Research`]; a resume after the docs gate passes [`Phase::Spec`];
@@ -1017,7 +1030,12 @@ fn phases_for_block(start_after: Phase) -> &'static [Phase] {
 }
 
 /// The actual phases to drive this block, tailoring [`phases_for_block`] to the
-/// plan. Two regimes:
+/// plan. **LEGACY (Wave 3 — only reached under `UMADEV_LEGACY_PIPELINE=1`):** this
+/// is the fixed-walk route the director loop replaced as the default; the planner
+/// here decides a forced phase list, whereas the director loop treats the planner
+/// as an advisory prior ([`crate::planner::advisory_prior`]) and decides the route
+/// itself. Kept verbatim so the legacy opt-in behaves exactly as before. Two
+/// regimes:
 ///
 /// - **Gated plan** (any plan that still has a confirm gate — `Greenfield` /
 ///   `FrontendOnly` / `BackendOnly` / `DocsOnly`): the unchanged gate-anchored

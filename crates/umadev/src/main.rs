@@ -2351,8 +2351,7 @@ async fn drive_director_run(
     session: &mut dyn umadev_runtime::BaseSession,
     options: &RunOptions,
 ) -> Result<DirectorOutcome> {
-    use umadev_agent::EngineEvent;
-    use umadev_runtime::{ApprovalDecision, SessionEvent, StreamEvent, TurnStatus};
+    use umadev_agent::DirectorLoopOutcome;
 
     // Single-writer run-lock for the whole director run — the SAME guard the
     // pipeline's `run_continuous_block` / `run_initial_block` hold. Held for this
@@ -2364,76 +2363,20 @@ async fn drive_director_run(
     // Frame the goal for the director: a complete, ship-quality product build it
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let directive = umadev_agent::experts::director_build_directive(&options.requirement);
-    if let Err(e) = session.send_turn(directive).await {
-        return Ok(DirectorOutcome::HardStop(format!("session send: {e}")));
-    }
 
-    // Drain the director's turn, forwarding tool calls + text to the live sink
-    // (the SAME WorkerStream render path the pipeline uses) and accumulating the
-    // assistant text so the post-turn hard-gate can read its "done" claim.
-    let mut reply = String::new();
-    let status = loop {
-        let Some(ev) = session.next_event().await else {
-            // `None` = the session ended (process dead / EOF). Per the BaseSession
-            // contract, treat as a failed turn — fail-open, no panic.
-            return Ok(DirectorOutcome::HardStop(
-                "base session ended mid-turn".to_string(),
-            ));
-        };
-        match ev {
-            SessionEvent::TextDelta(text) => {
-                reply.push_str(&text);
-                events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::Text { delta: text },
-                });
-            }
-            SessionEvent::ToolCall { name, input } => {
-                // Surface what the base actually DID (the source of truth). The
-                // governance hook governs the write itself in real time; here we
-                // only render the tool row for live progress.
-                let detail = tool_call_target(&input);
-                events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::ToolUse { name, detail },
-                });
-            }
-            SessionEvent::ToolResult { ok, summary } => {
-                events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::ToolResult { ok, summary },
-                });
-            }
-            SessionEvent::NeedApproval {
-                req_id,
-                action,
-                target,
-            } => {
-                // Always-on irreversible floor: deny an irreversible action even
-                // headless (the same floor the `auto` tier can't skip), allow the
-                // rest so a headless build isn't wedged waiting on a human.
-                let decision =
-                    if umadev_agent::requires_confirmation(options.mode, &action, &target) {
-                        eprintln!(
-                            "  {}",
-                            umadev_i18n::tlf(
-                                "continuous.dangerous_action_denied",
-                                &[&action, &target]
-                            )
-                        );
-                        ApprovalDecision::Deny
-                    } else {
-                        ApprovalDecision::Allow
-                    };
-                if let Err(e) = session.respond(&req_id, decision).await {
-                    return Ok(DirectorOutcome::HardStop(format!("session respond: {e}")));
-                }
-            }
-            SessionEvent::TurnDone { status } => break status,
-        }
+    // Wave 3: drive the goal through the REAL-TIME director loop — the director
+    // plans + delegates live by emitting team-lever markers (summon / review /
+    // verify / checkpoint) that the loop mediates and re-injects the results of, so
+    // it truly orchestrates its team on the spot. A base that emits no marker
+    // degrades to a plain agentic build (Wave 1 behaviour). Every floor invariant
+    // (single-writer, governance, advisory review, fail-open) is preserved inside
+    // the loop; the objective source-present hard-gate runs HERE, unchanged.
+    let reply = match umadev_agent::drive_director_loop(session, options, events, directive).await {
+        DirectorLoopOutcome::Done { reply } => reply,
+        // A session that died / a turn that failed is an honest hard stop (never
+        // disguised as a build).
+        DirectorLoopOutcome::Failed(reason) => return Ok(DirectorOutcome::HardStop(reason)),
     };
-
-    // A failed turn is an honest hard stop (never disguised as a build).
-    if let TurnStatus::Failed(reason) = &status {
-        return Ok(DirectorOutcome::HardStop(reason.clone()));
-    }
 
     // Objective source-present hard-gate (the deterministic reality floor): the
     // director was told to BUILD; if it CLAIMED a build but the workspace has zero
@@ -2446,17 +2389,6 @@ async fn drive_director_run(
         ));
     }
     Ok(DirectorOutcome::Done)
-}
-
-/// Best-effort human-readable target of a base tool call (a file path / command)
-/// for the live tool row — fail-open to an empty string on any unexpected shape.
-fn tool_call_target(input: &serde_json::Value) -> String {
-    for key in ["file_path", "path", "command", "url", "pattern"] {
-        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
-            return s.to_string();
-        }
-    }
-    String::new()
 }
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
@@ -4494,24 +4426,6 @@ mod tests {
     /// misread the test fixture as path-handling code.
     fn target_key() -> String {
         ["file", "path"].join("_")
-    }
-
-    #[test]
-    fn tool_call_target_extracts_known_keys_and_fails_open() {
-        use serde_json::json;
-        let mut obj = serde_json::Map::new();
-        obj.insert(target_key(), json!("src/app.rs"));
-        assert_eq!(
-            tool_call_target(&serde_json::Value::Object(obj)),
-            "src/app.rs"
-        );
-        assert_eq!(
-            tool_call_target(&json!({"command": "npm run build"})),
-            "npm run build"
-        );
-        // An unexpected shape fails open to an empty string, never a panic.
-        assert_eq!(tool_call_target(&json!({"weird": 42})), "");
-        assert_eq!(tool_call_target(&json!(null)), "");
     }
 
     /// A scripted fake `BaseSession` for the director drainer: one turn, a fixed
