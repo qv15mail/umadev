@@ -163,6 +163,15 @@ pub fn security_scan_rel_path() -> &'static str {
 pub fn run_security_scan(project_root: &Path) -> SecurityScan {
     let mut results = Vec::new();
 
+    // --- OWNED baseline SAST (Wave 4): tool-free static analysis -------------
+    // This row ALWAYS runs — no external scanner required. It walks the source
+    // tree and runs UmaDev's own rule engine (injection / missing-auth /
+    // hardcoded-secret / unsafe-deserialization / command-exec / weak-crypto)
+    // in collect-all mode, so `security` / `report --review` find real defects
+    // even on a machine with neither gitleaks nor semgrep installed. gitleaks /
+    // npm-audit below remain OPTIONAL upgrades that add their own signal.
+    results.push(scan_owned_sast(project_root));
+
     // --- secrets: gitleaks over the whole tree -------------------------------
     results.push(scan_secrets(project_root));
 
@@ -178,6 +187,100 @@ pub fn run_security_scan(project_root: &Path) -> SecurityScan {
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         results,
     }
+}
+
+/// Workspace-relative path of the detailed owned-SAST findings dump.
+const SAST_REL_PATH: &str = ".umadev/audit/sast-findings.json";
+
+/// Run UmaDev's OWNED, tool-free baseline SAST over the project's source tree and
+/// fold it into ONE [`ScanResult`] row (category `sast`). For each source file it
+/// runs [`umadev_governance::sast_scan_file`] in collect-all mode and tallies the
+/// real security defects (injection / missing-auth / hardcoded-secret / …).
+///
+/// **Always runs — never skipped for lack of a tool.** A clean tree yields a
+/// `Clean` row; defects yield a `Findings` row whose detail names the worst
+/// offenders. The full per-finding list is also written to
+/// `.umadev/audit/sast-findings.json` so the proof-pack + review report can cite
+/// exact files/clauses. Pure + fail-open: an unreadable file is skipped, the
+/// detailed dump is best-effort, and the row is well-formed regardless.
+fn scan_owned_sast(project_root: &Path) -> ScanResult {
+    const TOOL: &str = "umadev-sast";
+    const CAT: &str = "sast";
+    let ctx = umadev_governance::ProjectContext::unknown();
+    let mut findings: Vec<umadev_governance::SastFinding> = Vec::new();
+    // Bound: at most 600 source files (the `source_files` collector caps it too).
+    for f in crate::acceptance::source_files(project_root) {
+        let Ok(content) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let rel = f
+            .strip_prefix(project_root)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        findings.extend(umadev_governance::sast_scan_file(&rel, &content, ctx));
+        if findings.len() >= 500 {
+            break; // a degenerate repo can't make this unbounded
+        }
+    }
+    // Best-effort: persist the detailed findings for the proof-pack / review.
+    write_sast_findings(project_root, &findings);
+
+    if findings.is_empty() {
+        return ScanResult {
+            tool: TOOL.to_string(),
+            category: CAT.to_string(),
+            status: ScanStatus::Clean,
+            findings: 0,
+            detail: "no security defects in source (UmaDev baseline SAST)".to_string(),
+        };
+    }
+    let high = findings
+        .iter()
+        .filter(|f| f.severity == umadev_governance::SastSeverity::High)
+        .count();
+    let n = u32::try_from(findings.len()).unwrap_or(u32::MAX);
+    // Name the first couple of distinct clauses so the row is actionable at a glance.
+    let mut seen: Vec<&str> = Vec::new();
+    for f in &findings {
+        if !seen.contains(&f.clause.as_str()) {
+            seen.push(&f.clause);
+        }
+        if seen.len() >= 3 {
+            break;
+        }
+    }
+    ScanResult {
+        tool: TOOL.to_string(),
+        category: CAT.to_string(),
+        status: ScanStatus::Findings,
+        findings: n,
+        detail: format!(
+            "{n} security defect(s) ({high} high) — e.g. {} (see sast-findings.json)",
+            seen.join(", ")
+        ),
+    }
+}
+
+/// Best-effort persist the detailed owned-SAST findings to
+/// `.umadev/audit/sast-findings.json`. Fail-open: a write error is swallowed.
+fn write_sast_findings(project_root: &Path, findings: &[umadev_governance::SastFinding]) {
+    let path = project_root.join(SAST_REL_PATH);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(json) = serde_json::to_string_pretty(findings) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Workspace-relative path of the detailed owned-SAST findings dump (for the
+/// proof-pack manifest).
+#[must_use]
+pub fn sast_findings_rel_path() -> &'static str {
+    SAST_REL_PATH
 }
 
 /// Run the scan and persist it to `.umadev/audit/security-scan.json`. Returns
@@ -720,5 +823,59 @@ mod tests {
         assert!(!scan.any_ran());
         assert!(!scan.has_findings());
         assert!(scan.summary_line().contains("no scanners available"));
+    }
+
+    // ── Wave 4: owned baseline SAST always runs (tool-free) ─────────────────
+
+    #[test]
+    fn owned_sast_finds_defects_without_any_external_tool() {
+        // Even on a machine with NO gitleaks / npm-audit, the owned SAST row must
+        // find a real injection in the source — `security` is never blind.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/api.ts"),
+            "const q = \"SELECT * FROM users WHERE id = \" + req.params.id;\ndb.query(q);",
+        )
+        .unwrap();
+        let scan = run_security_scan(tmp.path());
+        let sast = scan
+            .results
+            .iter()
+            .find(|r| r.category == "sast")
+            .expect("an owned-SAST row is ALWAYS present");
+        assert_eq!(sast.tool, "umadev-sast");
+        assert_eq!(
+            sast.status,
+            ScanStatus::Findings,
+            "the SQL injection must be found tool-free: {sast:?}"
+        );
+        assert!(sast.findings >= 1);
+        // The owned SAST counts toward `any_ran` (it always runs), so the scan is
+        // never "all skipped" even with no external tools.
+        assert!(scan.any_ran(), "the owned SAST always produces real signal");
+        // The detailed findings dump was persisted for the proof-pack.
+        assert!(
+            tmp.path().join(sast_findings_rel_path()).is_file(),
+            "the detailed SAST findings were written"
+        );
+    }
+
+    #[test]
+    fn owned_sast_clean_tree_is_clean_not_skipped() {
+        // A benign source tree → the owned SAST row is `Clean` (it RAN and found
+        // nothing), never `Skipped` — the fail-open "not run ≠ clean" contract is
+        // inverted only for the owned scanner, which truly always runs.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/math.ts"),
+            "export function add(a: number, b: number) { return a + b; }",
+        )
+        .unwrap();
+        let scan = run_security_scan(tmp.path());
+        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
+        assert_eq!(sast.status, ScanStatus::Clean);
+        assert_eq!(sast.findings, 0);
     }
 }

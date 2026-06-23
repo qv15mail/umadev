@@ -411,20 +411,17 @@ async fn drive_director_loop_with_idle(
         //    inspecting reality over the borrowed brain. When a route is in hand, the
         //    review team is sized from the ROUTE's seats (deliverable 3 on the
         //    single-turn path too); else the kind-derived team (the legacy entry).
-        let qc = run_auto_qc(
-            session,
-            options,
-            events,
-            route.map(|r| r.team.as_slice()),
-            Some(turn.text.as_str()),
-        )
-        .await;
+        let qc = run_auto_qc(session, options, events, route, Some(turn.text.as_str())).await;
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
             // Plan visibility (Wave 1): a clean pass means the work the plan
             // describes landed — tick its steps Done + persist the final plan.
             complete_plan(&mut plan, options, events);
+            // Wave 4 (§L4 / G8): restore the shareable delivery on the DEFAULT
+            // path — depth-gated, fail-open. A clean Build leaves a PRD /
+            // architecture / UI-UX doc (+ a proof-pack on the deliberate path).
+            director::finalize(options, events, route);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -590,6 +587,9 @@ async fn drive_plan_steps(
 
     // Persist the plan's terminal state for resume.
     persist_plan_ref(plan, options);
+    // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
+    // shareable delivery — core docs + proof-pack + scorecard. Fail-open inside.
+    director::finalize(options, events, Some(route));
     Some(DirectorLoopOutcome::Done { reply: last_reply })
 }
 
@@ -828,7 +828,7 @@ async fn run_final_gate(
             session,
             options,
             events,
-            Some(&route.team),
+            Some(route),
             Some(verify_signal.as_str()),
         )
         .await;
@@ -1208,10 +1208,11 @@ async fn run_auto_qc(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
-    route_team: Option<&[crate::critics::Seat]>,
+    route: Option<&RoutePlan>,
     last_turn_text: Option<&str>,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
+    let route_team = route.map(|r| r.team.as_slice());
     let mut blocking: Vec<String> = Vec::new();
 
     // 1. Honesty hard floor (UmaDev's own read-only check): did real source actually
@@ -1316,6 +1317,25 @@ async fn run_auto_qc(
         }
     }
 
+    // 2b. REQUIRED ACCEPTANCE FLOOR (Wave 4, §L4 / task 2). For a DELIBERATE build
+    //     (Standard/Deep) the spec→tasks + spec→code verification becomes a REQUIRED
+    //     blocking signal on the default path — not legacy-only. We fold in:
+    //       - coverage gaps   (FR-NNN declared in the PRD but no task cites it),
+    //       - acceptance gaps (planned API endpoints with no implementation),
+    //       - contract drift  (frontend fetch URLs with no matching backend route),
+    //       - runtime-proof   (a written runtime-proof.json that did NOT verify).
+    //     For a BUGFIX, additionally require a reproduction test (red→green): a fix
+    //     with no test asserting the bug is a fix that can silently regress.
+    //     Lean/Fast already returned above, so this only runs on the heavyweight
+    //     path — speed is preserved. Each contributor is fail-open (a missing
+    //     artifact / unreadable doc yields no gap, never a false alarm), so a check
+    //     that genuinely can't run is a NEUTRAL skip, not a fabricated failure.
+    if route.map(|r| r.depth.is_deliberate()).unwrap_or(false) {
+        for line in acceptance_floor_blocking(options, route) {
+            blocking.push(line);
+        }
+    }
+
     // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
     //    scales to the task, so a lean goal convenes no team and this contributes
     //    nothing. Advisory — the base's body acts on whatever it surfaces. When a
@@ -1339,6 +1359,143 @@ async fn run_auto_qc(
     }
 
     QcReport { blocking }
+}
+
+/// The REQUIRED acceptance floor for a deliberate build (Wave 4, §L4 / task 2) —
+/// the spec→tasks + spec→code verification, promoted to a blocking signal on the
+/// default deliberate path. Folds in coverage gaps, interface-acceptance gaps,
+/// frontend↔contract drift, an unverified runtime-proof, and (for a Bugfix) a
+/// missing reproduction test. Each contributor is fail-open: a missing artifact /
+/// unparseable doc yields no gap (a neutral skip), so a check that genuinely
+/// cannot run never fabricates a failure. Returns the blocking lines (empty =
+/// the floor is clean OR nothing could be checked).
+fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) -> Vec<String> {
+    let slug = options.effective_slug();
+    let root = &options.project_root;
+    let mut out: Vec<String> = Vec::new();
+
+    // spec→tasks: a declared FR-NNN no task covers (a requirement at risk of being
+    // silently dropped). Fail-open: no PRD / no FR ids → empty.
+    for r in crate::coverage::uncovered_requirements(root, &slug) {
+        out.push(format!(
+            "coverage gap: requirement {r} is declared in the PRD but no task implements it — \
+             build it, or remove it from scope honestly"
+        ));
+    }
+    // spec→code: a planned API endpoint with no implementation evidence on disk.
+    // Fail-open: no architecture doc / no endpoints → empty.
+    for g in crate::acceptance::task_acceptance_gaps(root, &slug) {
+        out.push(format!(
+            "acceptance gap: planned endpoint not implemented — {g}"
+        ));
+    }
+    // frontend↔backend contract drift: a fetch URL with no matching backend route.
+    // Reuses the same `quality_floor` machinery the legacy gate used; here we pull
+    // ONLY the qa half (coverage/acceptance already counted above are re-derived,
+    // so we filter to the genuinely-new "contract drift:" lines to avoid dup text).
+    let (qa_floor, _sec) = crate::continuous::quality_floor(options);
+    for line in qa_floor.split('\n').map(str::trim) {
+        let line = line.trim_start_matches("- ").trim();
+        if line.starts_with("contract drift:") {
+            out.push(line.to_string());
+        }
+    }
+
+    // runtime-proof: when a `runtime-proof.json` was written (by `verify --runtime`)
+    // and it did NOT verify, that is a real, recorded failure (the app didn't boot /
+    // a route didn't answer). Absent file → neutral skip (the runtime check simply
+    // wasn't run this loop; we never fabricate a "didn't boot" from a missing file).
+    if let Some(line) = runtime_proof_blocking(root) {
+        out.push(line);
+    }
+
+    // BUGFIX: require a reproduction test (red→green). A fix that lands no test
+    // asserting the bug can silently regress. Fail-open: only fires when the route
+    // is classified Bugfix AND we can read the source tree.
+    if route
+        .map(|r| r.kind == crate::planner::TaskKind::Bugfix)
+        .unwrap_or(false)
+        && !has_reproduction_test(root)
+    {
+        out.push(
+            "bugfix without a reproduction test: add a test that FAILS on the bug before the fix \
+             and PASSES after (red→green), and keep the rest of the suite green — a fix with no \
+             test asserting the bug can silently regress"
+                .to_string(),
+        );
+    }
+
+    out
+}
+
+/// Read a written `runtime-proof.json` and, if it recorded a real (non-skipped)
+/// FAILURE to boot/answer, return a blocking line. A missing file → `None` (the
+/// runtime check simply wasn't run this loop — neutral, never a fabricated fail).
+/// A written-but-not-verified proof whose reason is a SKIP (no dev server / no
+/// curl) is also neutral; only a proof that ran and failed blocks. Fail-open: an
+/// unreadable / unparseable file → `None`.
+fn runtime_proof_blocking(root: &std::path::Path) -> Option<String> {
+    let path = root.join(crate::runtime_proof::runtime_proof_rel_path());
+    let body = std::fs::read_to_string(path).ok()?;
+    let proof: crate::runtime_proof::RuntimeProof = serde_json::from_str(&body).ok()?;
+    if proof.status.is_verified() {
+        return None; // booted + answered → no problem
+    }
+    // Not verified. Distinguish a real failure from a neutral skip: a skip reason
+    // names an absent precondition (no dev server / curl / not detected). Only a
+    // genuine boot/route failure is blocking.
+    let reason = proof.summary_line().to_ascii_lowercase();
+    let is_skip = reason.contains("not found")
+        || reason.contains("no dev server")
+        || reason.contains("not detected")
+        || reason.contains("skipped");
+    if is_skip {
+        return None;
+    }
+    Some(format!(
+        "runtime-proof: the app did not boot + answer its routes — {} (fix the cause so it \
+         actually runs, then re-verify)",
+        proof.summary_line()
+    ))
+}
+
+/// Heuristic: does the project carry at least one real test file? Used only for the
+/// Bugfix reproduction-test floor. Looks for the universal test-file conventions
+/// (`*.test.*` / `*.spec.*` / a `tests/` or `__tests__` dir / a `test_*.py` /
+/// `*_test.go` / a Rust `#[test]`). Pure + fail-open (bounded by `source_files`):
+/// an empty tree → `false`. Conservative — a false "has a test" only DROPS a
+/// blocking floor (never fabricates one), so we require a reasonably strong signal.
+fn has_reproduction_test(root: &std::path::Path) -> bool {
+    for f in crate::acceptance::source_files(root) {
+        let name = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let path_str = f.to_string_lossy().to_ascii_lowercase();
+        let by_name = name.contains(".test.")
+            || name.contains(".spec.")
+            || name.starts_with("test_")
+            || name.ends_with("_test.go")
+            || name.ends_with("_test.py")
+            || name.ends_with(".test.rs");
+        let by_dir = path_str.contains("/tests/")
+            || path_str.contains("/__tests__/")
+            || path_str.contains("/test/")
+            || path_str.contains("/spec/");
+        if by_name || by_dir {
+            return true;
+        }
+        // A Rust file carrying `#[test]` / `#[tokio::test]` is a real test too.
+        if name.to_ascii_lowercase().ends_with(".rs") {
+            if let Ok(content) = std::fs::read_to_string(&f) {
+                if content.contains("#[test]") || content.contains("#[tokio::test]") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Map a [`VerifyResult`] from a build/test check to a blocking line, or `None` when
@@ -2043,6 +2200,145 @@ mod tests {
         assert!(d.contains("must be fixed"));
         assert!(d.contains("build: FAILED"));
         assert!(d.contains("no input validation"));
+    }
+
+    // ── Wave 4: required acceptance floor (deliberate only; bugfix repro test) ──
+
+    /// Write a PRD declaring FR-001 + FR-002 and a tasks list covering only FR-001,
+    /// so `uncovered_requirements` reports FR-002 as a coverage gap.
+    fn seed_coverage_gap(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output").join("demo-prd.md"),
+            "| FR-001 | login |\n| FR-002 | logout |",
+        )
+        .unwrap();
+        let cdir = root.join(".umadev").join("changes").join("demo-1");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(cdir.join("tasks.md"), "- [ ] login _(FR-001)_").unwrap();
+    }
+
+    /// A Bugfix route (Standard depth) for the reproduction-test floor test.
+    fn bugfix_route() -> crate::router::RoutePlan {
+        let mut r = build_route();
+        r.kind = crate::planner::TaskKind::Bugfix;
+        r
+    }
+
+    #[test]
+    fn acceptance_floor_blocks_a_deliberate_build_with_a_coverage_gap() {
+        // A deliberate build with a declared-but-unimplemented requirement must
+        // surface a coverage gap as a blocking finding (the required floor).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_coverage_gap(tmp.path());
+        let o = opts(tmp.path());
+        let route = build_route();
+        let blocking = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.contains("coverage gap") && b.contains("FR-002")),
+            "the uncovered requirement is a blocking finding: {blocking:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
+        // The acceptance floor is REQUIRED on the deliberate path but NOT on lean.
+        // Same project (a coverage gap) → blocks on a deliberate route, clean on a
+        // lean requirement (which returns before the floor — speed preserved).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        seed_coverage_gap(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+
+        // Deliberate route → the floor runs → the coverage gap blocks.
+        let mut deliberate = opts(tmp.path());
+        deliberate.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+        let qc = run_auto_qc(&mut sess, &deliberate, &events, Some(&route), None).await;
+        assert!(
+            qc.blocking.iter().any(|b| b.contains("coverage gap")),
+            "deliberate QC enforces the acceptance floor: {:?}",
+            qc.blocking
+        );
+
+        // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
+        let mut lean = opts(tmp.path());
+        lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+        let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None).await;
+        assert!(
+            !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
+            "a lean goal does NOT pay the acceptance floor (speed): {:?}",
+            qc2.blocking
+        );
+    }
+
+    #[test]
+    fn bugfix_without_a_reproduction_test_blocks_and_a_test_clears_it() {
+        // A Bugfix with source but NO test → the reproduction-test floor blocks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("fix.ts"), "export const x = 1;").unwrap();
+        let o = opts(tmp.path());
+        let route = bugfix_route();
+        let blocking = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            blocking.iter().any(|b| b.contains("reproduction test")),
+            "a bugfix with no test must demand a reproduction test: {blocking:?}"
+        );
+
+        // Add a real reproduction test → the floor clears (red→green is now possible).
+        std::fs::write(
+            tmp.path().join("fix.test.ts"),
+            "test('reproduces the bug', () => { expect(fixed()).toBe(true); });",
+        )
+        .unwrap();
+        let blocking2 = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            !blocking2.iter().any(|b| b.contains("reproduction test")),
+            "a reproduction test clears the bugfix floor: {blocking2:?}"
+        );
+    }
+
+    #[test]
+    fn acceptance_floor_is_fail_open_when_artifacts_are_missing() {
+        // No PRD / no architecture / no source → every contributor reads empty →
+        // the floor is clean (a neutral skip, never a fabricated failure).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let route = build_route();
+        assert!(
+            acceptance_floor_blocking(&o, Some(&route)).is_empty(),
+            "an empty project yields no fabricated acceptance failures"
+        );
+    }
+
+    #[test]
+    fn runtime_proof_blocking_distinguishes_failure_from_skip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp
+            .path()
+            .join(crate::runtime_proof::runtime_proof_rel_path());
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        // A SKIP (no dev server) → neutral, no block.
+        std::fs::write(
+            &dir,
+            r#"{"timestamp":"t","status":{"kind":"not_verified","reason":"no dev server detected"},"dev_server":null,"command":null,"base_url":null,"ready_ms":null,"routes":[],"e2e":null}"#,
+        )
+        .unwrap();
+        assert!(
+            runtime_proof_blocking(tmp.path()).is_none(),
+            "a runtime SKIP is neutral, not a block"
+        );
+        // A real boot FAILURE → blocking.
+        std::fs::write(
+            &dir,
+            r#"{"timestamp":"t","status":{"kind":"not_verified","reason":"server did not become ready within 60s"},"dev_server":"vite","command":"npm run dev","base_url":"http://localhost:5173","ready_ms":null,"routes":[],"e2e":null}"#,
+        )
+        .unwrap();
+        let line = runtime_proof_blocking(tmp.path()).expect("a real boot failure blocks");
+        assert!(line.contains("runtime-proof"));
     }
 
     // ── Wave 1: routed entry — visible intent + owned plan, fully fail-open ──

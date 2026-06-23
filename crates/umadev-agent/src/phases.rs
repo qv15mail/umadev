@@ -2313,6 +2313,10 @@ fn build_and_zip_proof_pack(
         // customer's own installed scanners. Fail-open: an all-skipped report
         // still ships so the reviewer sees what was (and wasn't) checked.
         crate::security::security_scan_rel_path().to_string(),
+        // Owned baseline SAST findings (tool-free) — the per-defect detail behind
+        // the `umadev-sast` row in security-scan.json. Absent (skipped) when the
+        // tree was clean / no scan ran; the pack simply omits it then.
+        crate::security::sast_findings_rel_path().to_string(),
         // Runtime evidence — proof the app actually BOOTS + answers, not just
         // that it compiles. Written by `verify --runtime`; absent (skipped)
         // when no runtime check ran, in which case the pack simply omits it.
@@ -3263,6 +3267,77 @@ fn walk_md(dir: &Path, out: &mut Vec<String>, depth: usize) {
             }
         }
     }
+}
+
+/// One delivery doc the default path guarantees exists once a build settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreDoc {
+    /// `output/<slug>-prd.md` — the Product Requirements Document.
+    Prd,
+    /// `output/<slug>-architecture.md` — the system + API-surface design.
+    Architecture,
+    /// `output/<slug>-uiux.md` — the design system (tokens, type, components).
+    Uiux,
+    /// `output/<slug>-execution-plan.md` — the task breakdown.
+    ExecutionPlan,
+}
+
+impl CoreDoc {
+    /// Workspace-relative file name of this doc for `slug`.
+    fn rel_name(self, slug: &str) -> String {
+        match self {
+            Self::Prd => format!("output/{slug}-prd.md"),
+            Self::Architecture => format!("output/{slug}-architecture.md"),
+            Self::Uiux => format!("output/{slug}-uiux.md"),
+            Self::ExecutionPlan => format!("output/{slug}-execution-plan.md"),
+        }
+    }
+}
+
+/// Ensure the run's core delivery docs (PRD / architecture / UI-UX / execution
+/// plan) exist on disk, writing a deterministic scaffold for any that are absent
+/// — the lifted half of the old delivery writers, callable on the DEFAULT path
+/// (`director::finalize`) once a build settles clean.
+///
+/// **Idempotent + never clobbers real content.** A doc the base already wrote
+/// (e.g. a real architecture table during the build) is left untouched; only a
+/// genuinely-missing doc gets the offline scaffold, so finalize never overwrites
+/// the team's real work. Returns the workspace-relative names actually WRITTEN
+/// (the scaffolds), so the caller can report what it backfilled vs. what was
+/// already present.
+///
+/// Pure + fail-open: a failed `create_dir_all` / `write` for one doc is swallowed
+/// and the next doc is still attempted; a doc that can't be written is simply not
+/// in the returned list. Never an error, never a panic — finalize must never
+/// block a build that already succeeded.
+#[must_use]
+pub fn scaffold_core_docs(opts: &RunOptions) -> Vec<String> {
+    let slug = opts.effective_slug();
+    let out_dir = opts.project_root.join("output");
+    let _ = fs::create_dir_all(&out_dir);
+    let mut written = Vec::new();
+    for doc in [
+        CoreDoc::Prd,
+        CoreDoc::Architecture,
+        CoreDoc::Uiux,
+        CoreDoc::ExecutionPlan,
+    ] {
+        let rel = doc.rel_name(&slug);
+        let path = opts.project_root.join(&rel);
+        if path.is_file() {
+            continue; // never clobber a doc the base already wrote
+        }
+        let body = match doc {
+            CoreDoc::Prd => render_prd(&slug, &opts.requirement),
+            CoreDoc::Architecture => render_architecture(&slug, &opts.requirement),
+            CoreDoc::Uiux => render_uiux(&slug, &opts.requirement),
+            CoreDoc::ExecutionPlan => render_execution_plan(&slug, &opts.requirement),
+        };
+        if fs::write(&path, body).is_ok() {
+            written.push(rel);
+        }
+    }
+    written
 }
 
 fn render_prd(slug: &str, requirement: &str) -> String {

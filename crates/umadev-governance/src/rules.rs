@@ -430,6 +430,175 @@ pub fn scan_content_with_context(
     Decision::pass()
 }
 
+// ===================================================================
+// Owned baseline SAST (Wave 4, §L4 / G8) — find security defects tool-free.
+//
+// `scan_content_*` is the PRE-WRITE hook: it returns the FIRST blocking
+// decision and stops, because the host only needs one reason to refuse a
+// write. A SAST PASS is different — `umadev security` / `report --review`
+// must surface EVERY security defect in a file at once, not just the first,
+// and without depending on gitleaks/semgrep being installed. So this collects
+// ALL hits from the security-relevant subset of the existing rule engine
+// (injection / missing-auth / hardcoded-secret / unsafe-deserialization /
+// command-exec / weak-crypto …). It REUSES the rule functions verbatim — no
+// re-implemented heuristics — it just runs them in collect-all mode over a
+// classified severity map. gitleaks/cargo-audit remain optional UPGRADES.
+// ===================================================================
+
+/// How serious one owned-SAST finding is — used to rank the report and to let a
+/// caller gate on `High` while still surfacing `Medium`/`Low` advisories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SastSeverity {
+    /// A directly-exploitable defect: injection, a leaked secret, a missing auth
+    /// guard, unsafe deserialization, eval/command execution of input.
+    High,
+    /// A real weakness that needs review but isn't a one-step exploit: weak
+    /// crypto, insecure cookies/CORS/TLS, SSRF surface, path traversal.
+    Medium,
+    /// A hardening gap / hygiene issue (missing security header, no rate limit).
+    Low,
+}
+
+impl SastSeverity {
+    /// Stable lowercase id for display / serialization.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// One owned-SAST finding — a security defect found tool-free in one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SastFinding {
+    /// Workspace-relative file the defect is in.
+    pub file: String,
+    /// The clause that fired (`UD-SEC-011` …) — the stable defect id.
+    pub clause: String,
+    /// How serious the defect is.
+    pub severity: SastSeverity,
+    /// A short, one-line description (the rule's reason, first sentence).
+    pub message: String,
+}
+
+/// Classify a security clause into a severity bucket — keyed on the clause id the
+/// rule function ACTUALLY returns at runtime (verified against the rule bodies).
+/// Conservative: an unmapped clause defaults to `Medium` (real, review it) rather
+/// than silently dropping a finding.
+fn sast_severity(clause: &str) -> SastSeverity {
+    use SastSeverity::{High, Low, Medium};
+    match clause {
+        // Directly-exploitable: injection, secrets, missing auth, code exec.
+        "UD-SEC-003"  // hardcoded secret
+        | "UD-SEC-007" // eval / new Function / template injection (code exec)
+        | "UD-SEC-008" // unsafe deserialization (RCE vector)
+        | "UD-SEC-011" // SQL injection
+        | "UD-SEC-012" // XPath injection
+        | "UD-SEC-013" // XXE
+        | "UD-SEC-014" // command injection (string-built shell)
+        | "UD-SEC-015" // JWT defects (alg:none / hardcoded secret)
+        | "UD-SEC-018" // plaintext password / weak crypto over secrets
+        | "UD-SEC-020" // path traversal
+        | "UD-ARCH-023" // OS command injection (shell exec of input)
+        | "UD-ARCH-025" // ruby eval/send metaprogramming injection
+        | "UD-ARCH-026" // sensitive route missing auth guard
+        => High,
+        // Real weaknesses needing review.
+        "UD-SEC-004"  // frontend reaching straight into a DB
+        | "UD-SEC-009" // SSRF
+        | "UD-SEC-010" // insecure CORS (reflected/wildcard origin)
+        | "UD-SEC-019" // open redirect
+        | "UD-ARCH-061" // client-side redirect injection
+        | "UD-ARCH-043" // insecure RNG in a token/secret context
+        => Medium,
+        // Hardening gaps.
+        "UD-ARCH-013" // CSP missing
+        | "UD-ARCH-016" // HTTPS redirect missing
+        | "UD-ARCH-019" // security headers missing
+        | "UD-ARCH-022" // HSTS missing
+        | "UD-ARCH-024" // shell-exec hardening
+        => Low,
+        // Any other security clause we route through here is a real defect we
+        // simply haven't tiered — surface it as Medium, never drop it.
+        _ => Medium,
+    }
+}
+
+/// The security-relevant subset of the rule engine, run in COLLECT-ALL mode.
+/// Deliberately omits the craft/style rules (emoji, color tokens, AI-slop,
+/// magic numbers, unused vars, framework lints) — a SAST pass reports SECURITY
+/// defects, not taste. Every entry is an existing rule function reused verbatim.
+const SAST_CHECKS: &[fn(&str, &str) -> Decision] = &[
+    check_hardcoded_secret,
+    check_sql_injection,
+    check_xpath_injection,
+    check_xxe,
+    check_command_injection,
+    check_template_injection,
+    check_eval_injection,
+    check_missing_auth_guard,
+    check_unsafe_deserialization,
+    check_ssrf,
+    check_weak_crypto,
+    check_jwt_defects,
+    check_insecure_cors,
+    check_insecure_cookie,
+    check_plaintext_password,
+    check_path_traversal,
+    check_open_redirect,
+    check_client_redirect_injection,
+    check_php_shell_exec,
+    check_ruby_eval_send,
+    check_insecure_random,
+    check_frontend_db_access,
+];
+
+/// **Owned baseline SAST over one file** — every security defect, tool-free.
+///
+/// Runs the [`SAST_CHECKS`] subset in COLLECT-ALL mode (unlike the pre-write
+/// hook, which stops at the first block) and returns one [`SastFinding`] per
+/// firing rule, severity-classified. Pure + fail-open by construction: it only
+/// calls the existing pure rule functions, dedups by clause, and never errors —
+/// an empty result means "no security defect found in this file", exactly like a
+/// clean external scanner. The `ctx` lets a proven static frontend skip the
+/// server-surface rules (it has no auth/header surface to defend).
+#[must_use]
+pub fn sast_scan_file(file_path: &str, content: &str, ctx: ProjectContext) -> Vec<SastFinding> {
+    let skip_surface = ctx.skip_server_surface(file_path, content);
+    let mut out: Vec<SastFinding> = Vec::new();
+    for check in SAST_CHECKS {
+        if skip_surface && is_server_surface_rule(*check) {
+            continue;
+        }
+        let d = check(file_path, content);
+        if !d.block {
+            continue;
+        }
+        // Dedup by clause within a file (one rule may match several lines).
+        if out.iter().any(|f| f.clause == d.clause) {
+            continue;
+        }
+        out.push(SastFinding {
+            file: file_path.to_string(),
+            clause: d.clause.clone(),
+            severity: sast_severity(&d.clause),
+            // First sentence of the reason — the terse one-line defect summary.
+            message: d
+                .reason
+                .split(". ")
+                .next()
+                .unwrap_or(&d.reason)
+                .trim()
+                .to_string(),
+        });
+    }
+    out
+}
+
 /// `true` when `check` is one of the server/security-surface rules (compared by
 /// function pointer). These are skipped for a static frontend with no per-file
 /// server evidence; see [`SERVER_SURFACE_RULES`] / [`ProjectContext`].
@@ -12048,6 +12217,92 @@ const x = 1;",
         assert!(
             !d.block,
             "explicitly disabled surface clauses must not block"
+        );
+    }
+
+    // ── Wave 4: owned baseline SAST (tool-free) ─────────────────────────────
+
+    #[test]
+    fn sast_finds_sql_injection() {
+        // String-concatenated SQL is the #1 injection vector — the owned SAST must
+        // surface it tool-free, classified High.
+        let src = r#"
+            const q = "SELECT * FROM users WHERE id = " + req.params.id;
+            db.query(q);
+        "#;
+        let hits = sast_scan_file("api/users.ts", src, ProjectContext::unknown());
+        assert!(
+            hits.iter().any(|f| f.clause == "UD-SEC-011"),
+            "SQL injection must be found: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|f| f.clause == "UD-SEC-011" && f.severity == SastSeverity::High),
+            "SQL injection is High severity"
+        );
+    }
+
+    #[test]
+    fn sast_finds_missing_auth_guard() {
+        // A sensitive mutation route with no auth check → UD-ARCH-026 (High).
+        let src = "export async function DELETE(req) {\n  \
+                   await db.user.delete({ where: { id: req.body.userId } });\n  \
+                   return Response.json({ ok: true });\n}";
+        let hits = sast_scan_file("app/api/user/route.ts", src, ProjectContext::unknown());
+        assert!(
+            hits.iter().any(|f| f.clause == "UD-ARCH-026"),
+            "a sensitive route with no auth guard must be found: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn sast_finds_hardcoded_secret() {
+        // A real hardcoded API key → UD-SEC-003 (High). Split via `concat!` so this
+        // source file carries no contiguous key (GitHub push-protection safe);
+        // the compiler re-joins it.
+        let src = concat!(
+            "const apiKey = \"sk_live_abcdefghij",
+            "klmnopqrstuvwxyz0123456789\";"
+        );
+        let hits = sast_scan_file("config.ts", src, ProjectContext::unknown());
+        assert!(
+            hits.iter()
+                .any(|f| f.clause == "UD-SEC-003" && f.severity == SastSeverity::High),
+            "a hardcoded secret must be found, High: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn sast_clean_file_yields_no_findings() {
+        // A benign, parameterized-query file with no defect → empty result (a
+        // clean scan, exactly like an external scanner that found nothing).
+        let src = "export function add(a: number, b: number) { return a + b; }";
+        let hits = sast_scan_file("math.ts", src, ProjectContext::unknown());
+        assert!(
+            hits.is_empty(),
+            "a clean file has no SAST findings: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn sast_collects_all_findings_not_just_the_first() {
+        // Unlike the pre-write hook (first-block-and-stop), the SAST pass reports
+        // EVERY defect in a file. This file has both a hardcoded secret AND a SQL
+        // injection — both must come back (deduped by clause).
+        let src = concat!(
+            "const apiKey = \"sk_live_abcdefghij",
+            "klmnopqrstuvwxyz0123456789\";\n",
+            "const q = \"SELECT * FROM t WHERE x = \" + userInput;\n",
+            "db.query(q);"
+        );
+        let hits = sast_scan_file("h.ts", src, ProjectContext::unknown());
+        assert!(
+            hits.iter().any(|f| f.clause == "UD-SEC-003"),
+            "the secret is reported: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|f| f.clause == "UD-SEC-011"),
+            "the SQL injection is ALSO reported (collect-all): {hits:?}"
         );
     }
 }

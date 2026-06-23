@@ -77,6 +77,7 @@ use umadev_runtime::BaseSession;
 use crate::continuous::{self, ReviewKind};
 use crate::critics::RoleVerdict;
 use crate::events::{EngineEvent, EventSink};
+use crate::router::{RouteClass, RoutePlan};
 use crate::runner::RunOptions;
 
 /// How a [`summon`]ed seat works the goal.
@@ -587,6 +588,130 @@ pub fn checkpoint(
     CheckpointDecision::AskUser
 }
 
+// ===================================================================
+// finalize — restore the shareable delivery on the DEFAULT path (Wave 4)
+// ===================================================================
+
+/// What [`finalize`] produced — the depth-gated delivery surface. Built fail-open:
+/// every field is whatever actually landed; a degraded finalize still returns a
+/// well-formed (possibly empty) result, never an error.
+#[derive(Debug, Clone, Default)]
+pub struct FinalizeResult {
+    /// Whether a full delivery (proof-pack + scorecard + review report + security
+    /// scan) was produced — `true` only on the deliberate path. A lean build gets
+    /// just the core docs, so this stays `false`.
+    pub proof_pack: bool,
+    /// Workspace-relative names of the deliverables finalize wrote or refreshed
+    /// (the backfilled core docs, plus the delivery artifacts on the deliberate
+    /// path). Empty when nothing was produced.
+    pub artifacts: Vec<String>,
+}
+
+impl FinalizeResult {
+    /// Whether finalize produced anything at all (any doc / proof-pack).
+    #[must_use]
+    pub fn produced_anything(&self) -> bool {
+        !self.artifacts.is_empty()
+    }
+}
+
+/// **Finalize a clean build into a shareable delivery** — the Wave 4 (§L4 / G8)
+/// recovery of the delivery artifacts on the DEFAULT `/run` path, run ONCE after
+/// QC settles clean. Lifts the artifact writers out of the (stranded) legacy
+/// pipeline so a default build again leaves a PRD, an architecture doc, a UI/UX
+/// doc, a scorecard, and a shareable proof-pack — not just source files.
+///
+/// **Depth-gated, so we never over-deliver:**
+/// - **Lean / Fast** (a todo page, a quick edit) → ensure only the core docs
+///   exist ([`crate::phases::scaffold_core_docs`]). A single page does NOT earn a
+///   zipped proof-pack + scorecard (that would be ceremony nobody asked for).
+/// - **Deliberate (`Standard` / `Deep`)** → the FULL delivery
+///   ([`crate::phases::run_delivery`]): core docs + compliance mapping + the
+///   owned + tool security scan + the PR-ready review report + the zipped
+///   proof-pack + the shareable HTML scorecard.
+///
+/// **Only on a Build route with real source on disk.** A chat / explain / a build
+/// that produced no code gets nothing (there is nothing to deliver). The caller
+/// passes the same `route` the loop drove off; a `None` route (the legacy entry)
+/// → no finalize (backward-compatible — the old callers are unchanged).
+///
+/// **Fail-open by contract** (mirrors every other director tool): a failed
+/// scaffold / a delivery writer that errors degrades to a `Note` + the partial
+/// result, never an `Err`, never a panic — finalize must NEVER turn a build that
+/// already succeeded into a failure. It writes only UmaDev's own `output/` +
+/// `release/` artifacts (single-writer preserved: the main build is already done;
+/// this is post-build bookkeeping, not a base turn).
+pub fn finalize(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: Option<&RoutePlan>,
+) -> FinalizeResult {
+    // Only a real build with code on disk has anything to deliver. A None route
+    // (legacy entry) is a no-op so existing callers are byte-for-byte unchanged.
+    let Some(route) = route else {
+        return FinalizeResult::default();
+    };
+    if route.class != RouteClass::Build {
+        return FinalizeResult::default();
+    }
+    // Honesty floor: nothing was built ⇒ nothing to finalize (don't scaffold docs
+    // around an empty tree and call it a delivery).
+    if crate::acceptance::source_files(&options.project_root).is_empty() {
+        return FinalizeResult::default();
+    }
+
+    let mut result = FinalizeResult::default();
+
+    // ALWAYS (every Build depth): guarantee the core docs exist. Idempotent +
+    // never clobbers a doc the base already wrote. Fail-open inside.
+    let scaffolded = crate::phases::scaffold_core_docs(options);
+    if !scaffolded.is_empty() {
+        events.emit(EngineEvent::Note(format!(
+            "team · delivery — wrote {} core doc(s) ({})",
+            scaffolded.len(),
+            scaffolded.join(", ")
+        )));
+    }
+    result.artifacts.extend(scaffolded);
+
+    // DELIBERATE only: the full, shareable proof-pack. A lean/Fast build stops at
+    // the core docs above — no zip/scorecard ceremony for a todo page.
+    if route.depth.is_deliberate() {
+        match crate::phases::run_delivery(options) {
+            Ok(out) => {
+                let rels: Vec<String> = out
+                    .artifacts
+                    .iter()
+                    .map(|p| {
+                        p.strip_prefix(&options.project_root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/")
+                    })
+                    .collect();
+                events.emit(EngineEvent::Note(format!(
+                    "team · delivery — assembled the proof-pack + scorecard ({} artifact(s))",
+                    rels.len()
+                )));
+                result.proof_pack = true;
+                for r in rels {
+                    if !result.artifacts.contains(&r) {
+                        result.artifacts.push(r);
+                    }
+                }
+            }
+            Err(e) => {
+                // Fail-open: a delivery-writer error never fails a clean build.
+                events.emit(EngineEvent::Note(format!(
+                    "team · delivery — proof-pack skipped (non-fatal: {e})"
+                )));
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,5 +1100,122 @@ mod tests {
         assert!(critic_for_role("frontend").is_some(), "alias resolves");
         assert!(critic_for_role("SECURITY").is_some(), "case-insensitive");
         assert!(critic_for_role("unknown-seat").is_none());
+    }
+
+    // ── Wave 4: finalize — depth-gated delivery on the default path ──────────
+
+    /// A Build route at the given depth, with a real build team.
+    fn build_route(depth: crate::router::Depth) -> RoutePlan {
+        RoutePlan {
+            class: RouteClass::Build,
+            kind: crate::planner::TaskKind::Greenfield,
+            depth,
+            team: vec![crate::critics::Seat::FrontendEngineer],
+            scope: vec![],
+            needs_clarify: None,
+            est_budget: crate::router::Budget::for_route(RouteClass::Build, depth),
+            confidence: 0.7,
+        }
+    }
+
+    /// Seed a real source file so the source-present honesty floor passes.
+    fn seed_source(root: &std::path::Path) {
+        std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
+    }
+
+    #[test]
+    fn finalize_lean_build_writes_core_docs_but_no_proof_pack() {
+        // A LEAN/Fast Build leaves the three core docs (PRD/architecture/uiux) +
+        // execution plan — but NO zipped proof-pack (no over-delivery for a page).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Fast);
+        let r = finalize(&o, &ev, Some(&route));
+        assert!(!r.proof_pack, "a lean build earns no proof-pack");
+        assert!(r.produced_anything(), "the core docs were written");
+        // The three core docs exist on disk.
+        for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
+            assert!(
+                tmp.path().join("output").join(name).is_file(),
+                "{name} was scaffolded"
+            );
+        }
+        // No proof-pack zip in release/.
+        let release = tmp.path().join("release");
+        assert!(
+            !release.exists()
+                || std::fs::read_dir(&release)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "a lean build produces no release/ proof-pack"
+        );
+    }
+
+    #[test]
+    fn finalize_deliberate_build_assembles_the_full_proof_pack() {
+        // A DELIBERATE (Standard/Deep) Build leaves the full shareable delivery —
+        // core docs AND the zipped proof-pack + scorecard in release/.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &ev, Some(&route));
+        assert!(r.proof_pack, "a deliberate build assembles the proof-pack");
+        // A proof-pack zip landed in release/.
+        let release = tmp.path().join("release");
+        let has_zip = std::fs::read_dir(&release)
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("zip"))
+            })
+            .unwrap_or(false);
+        assert!(has_zip, "the proof-pack zip was assembled");
+    }
+
+    #[test]
+    fn finalize_does_not_clobber_a_real_doc_the_base_wrote() {
+        // Idempotent: a doc the base already wrote (a real architecture table) is
+        // left untouched — finalize only backfills the MISSING ones.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        let arch = tmp.path().join("output").join("demo-architecture.md");
+        std::fs::write(&arch, "# REAL architecture written by the base").unwrap();
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Fast);
+        finalize(&o, &ev, Some(&route));
+        let after = std::fs::read_to_string(&arch).unwrap();
+        assert!(
+            after.contains("REAL architecture written by the base"),
+            "the base's real doc must not be clobbered: {after}"
+        );
+    }
+
+    #[test]
+    fn finalize_is_a_noop_with_no_source_or_no_route_or_a_chat_route() {
+        let ev = sink();
+        // No route (legacy entry) → no-op.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        assert!(!finalize(&o, &ev, None).produced_anything());
+        // A Build route but an EMPTY tree (nothing built) → no-op (don't scaffold
+        // docs around a build that produced nothing).
+        let route = build_route(crate::router::Depth::Standard);
+        assert!(
+            !finalize(&o, &ev, Some(&route)).produced_anything(),
+            "no source → nothing to deliver"
+        );
+        // A non-Build (chat/explain) route with source → no-op (nothing to ship).
+        seed_source(tmp.path());
+        let mut chat = build_route(crate::router::Depth::Fast);
+        chat.class = RouteClass::Chat;
+        assert!(
+            !finalize(&o, &ev, Some(&chat)).produced_anything(),
+            "a chat route delivers nothing"
+        );
     }
 }
