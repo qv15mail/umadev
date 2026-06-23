@@ -308,6 +308,13 @@ pub struct App {
     /// the half-page (Ctrl-U/D) and full-page (PageUp/Down) scroll steps match
     /// the actual visible height instead of a guessed constant.
     pub transcript_viewport_rows: std::cell::Cell<usize>,
+    /// Display columns available to the input TEXT (after the `>_ ` mode prefix),
+    /// published by the renderer every frame. The Up/Down key handlers use it to
+    /// move the caret by one *wrapped* visual row inside a multi-line / wrapped
+    /// prompt (Claude Code parity) before falling through to history recall. `0`
+    /// until the first render — the handlers treat that as "no wrap info yet" and
+    /// fall back to the plain history-recall behavior.
+    pub input_text_cols: std::cell::Cell<u16>,
     /// `true` when the mouse-wheel → transcript-scroll binding is active. A
     /// `/mouse` toggle flips it: capturing the mouse takes over the terminal's
     /// native text selection, so a user who wants to select/copy turns it off
@@ -564,6 +571,7 @@ impl App {
             transcript_scroll: 0,
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
+            input_text_cols: std::cell::Cell::new(0),
             // OFF by default so native click-drag text selection / copy keeps
             // working; `/mouse` opts into wheel-scroll (and takes over selection).
             mouse_scroll: false,
@@ -1012,6 +1020,46 @@ impl App {
             let fwd = delta as usize;
             self.input_cursor = self.input_cursor.saturating_add(fwd).min(len);
         }
+    }
+
+    /// Try to move the caret UP one wrapped visual row, preserving the display
+    /// column (Claude Code parity for multi-line / wrapped prompts). Returns
+    /// `true` if the caret actually moved — i.e. it was NOT already on the first
+    /// visual row. When it returns `false`, the caller falls through to history
+    /// recall. Uses the input width the renderer last published; with no width
+    /// yet (pre-first-render) it reports "can't move" so history recall still
+    /// works. Fail-open: any degenerate width clamps to 1.
+    #[must_use]
+    pub fn caret_move_up_wrapped(&mut self) -> bool {
+        let w = self.input_text_cols.get();
+        if w == 0 {
+            return false;
+        }
+        let (row, col) = crate::ui::caret_in_wrapped(&self.input, self.input_cursor, w);
+        if row == 0 {
+            return false;
+        }
+        self.input_cursor = crate::ui::offset_at_wrapped(&self.input, row - 1, col, w);
+        true
+    }
+
+    /// Try to move the caret DOWN one wrapped visual row, preserving the display
+    /// column. Mirror of [`Self::caret_move_up_wrapped`]; returns `false` (so the
+    /// caller can recall newer history) when the caret is already on the last
+    /// visual row.
+    #[must_use]
+    pub fn caret_move_down_wrapped(&mut self) -> bool {
+        let w = self.input_text_cols.get();
+        if w == 0 {
+            return false;
+        }
+        let total = crate::ui::wrapped_row_count(&self.input, w);
+        let (row, col) = crate::ui::caret_in_wrapped(&self.input, self.input_cursor, w);
+        if row + 1 >= total {
+            return false;
+        }
+        self.input_cursor = crate::ui::offset_at_wrapped(&self.input, row + 1, col, w);
+        true
     }
 
     /// Clear the input buffer + reset cursor + history-recall index.
@@ -2073,18 +2121,36 @@ impl App {
                 Action::None
             }
 
-            // ---- input history recall (no palette + empty-or-recalling input) ----
-            KeyCode::Up
-                if !has_palette && (self.input.is_empty() || self.input_history_idx.is_some()) =>
-            {
-                self.input_history_back();
+            // ---- multi-line caret nav, then input history recall ----
+            // Claude Code parity: a bare ↑ inside a multi-line / wrapped prompt
+            // moves the caret UP one visual row (preserving the column) instead of
+            // wiping the draft with a history recall. Only when the caret is
+            // already on the FIRST visual row does ↑ fall through to history. This
+            // is what stops the "↑ in a multi-line prompt destroys my draft" bug.
+            KeyCode::Up if !has_palette => {
+                if self.caret_move_up_wrapped() {
+                    return Action::None;
+                }
+                // Caret is on the first row — recall history if we have any to
+                // recall (an empty box, or we're already paging history). An
+                // un-recalled, non-empty single-line draft is left alone so a stray
+                // ↑ at the start of a fresh draft can't clobber it.
+                if self.input.is_empty() || self.input_history_idx.is_some() {
+                    self.input_history_back();
+                }
                 Action::None
             }
-            KeyCode::Down if !has_palette && self.input_history_idx.is_some() => {
-                self.input_history_forward();
+            // ↓ mirrors ↑: move the caret DOWN a visual row first; only recall
+            // newer history (or restore the draft) when already on the last row.
+            KeyCode::Down if !has_palette => {
+                if self.caret_move_down_wrapped() {
+                    return Action::None;
+                }
+                if self.input_history_idx.is_some() {
+                    self.input_history_forward();
+                }
                 Action::None
             }
-
             // ---- enter: submit, or insert newline with Shift ----
             KeyCode::Enter => {
                 if shift {

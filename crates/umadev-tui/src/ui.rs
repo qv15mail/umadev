@@ -1059,38 +1059,29 @@ fn render_gate_block(body: &str, bar: Color, rendered: &mut Vec<Line<'static>>) 
 }
 
 /// The prompt — opencode-style. A panel with the agent-tinted left bar, the
-/// Check if a char is double-width (CJK, emoji, etc.) for terminal display.
-/// Used to calculate cursor position correctly — without this, typing
-/// Chinese/Japanese/Korean would put the cursor in the wrong place.
-trait CjkWide {
-    fn is_cjk_wide(&self) -> bool;
+/// Display columns one char occupies in a monospace terminal, via the Unicode
+/// width tables (`unicode-width`). This replaces the old hand-rolled CJK range
+/// list, which was wrong in three ways that desynced the cursor: zero-width
+/// combining marks (U+0300–036F), ZWJ (U+200D) and variation selectors
+/// (U+FE00–0F) were counted as 1 (should be 0), and dingbat / symbol emoji that
+/// render two cells (✅ U+2705, ⚠ U+26A0, ☑ U+2611) were counted as 1.
+///
+/// `unicode-width` returns `None` for control chars; the editor never stores
+/// bare control chars (they're filtered on insert), and `\t` is the only one
+/// that can reach a render path, so we map `None` → 0 (fail-open: a stray
+/// control char takes no columns rather than panicking the layout).
+///
+/// The TUI is not bound by the "dependency-light" rule — that constraint only
+/// applies to the `spec` / `governance` / `contract` crates.
+pub(crate) fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-impl CjkWide for char {
-    fn is_cjk_wide(&self) -> bool {
-        let c = *self as u32;
-        // Common CJK ranges (double-width in monospace terminals).
-        c >= 0x1100
-            && (
-                // Hangul Jamo, CJK Radicals, Kangxi
-                c <= 0x115F || // Hangul Jamo
-            c == 0x2329 || c == 0x232A ||
-            (0x2E80..=0xA4CF).contains(&c) || // CJK Radicals + Yi
-            (0xAC00..=0xD7A3).contains(&c) || // Hangul Syllables
-            (0xF900..=0xFAFF).contains(&c) || // CJK Compatibility Ideographs
-            (0xFE30..=0xFE4F).contains(&c) || // CJK Compatibility Forms
-            (0xFF00..=0xFF60).contains(&c) || // Fullwidth Forms
-            (0xFFE0..=0xFFE6).contains(&c) || // Fullwidth Signs
-            (0x1F300..=0x1FAFF).contains(&c) || // Emoji + CJK Symbols
-            (0x20000..=0x3FFFD).contains(&c)
-                // CJK Extensions B-F
-            )
-    }
-}
-
-/// Display columns a string occupies (ASCII = 1, CJK/wide = 2).
+/// Display columns a string occupies (uses the Unicode width table: ASCII = 1,
+/// wide CJK / emoji = 2, zero-width combining marks / ZWJ / variation selectors
+/// = 0).
 fn disp_width(s: &str) -> usize {
-    s.chars().map(|c| usize::from(c.is_cjk_wide()) + 1).sum()
+    unicode_width::UnicodeWidthStr::width(s)
 }
 
 /// Truncate `s` to at most `max` display columns (CJK = 2), char-aligned so a
@@ -1101,7 +1092,7 @@ fn truncate_to_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
     for c in s.chars() {
-        let cw = usize::from(c.is_cjk_wide()) + 1;
+        let cw = char_width(c);
         if col + cw > max {
             break;
         }
@@ -1126,7 +1117,7 @@ fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
             col = 0;
             continue;
         }
-        let cw = usize::from(c.is_cjk_wide()) + 1;
+        let cw = char_width(c);
         if col + cw > w && col > 0 {
             rows.push(std::mem::take(&mut cur));
             col = 0;
@@ -1136,6 +1127,114 @@ fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
     }
     rows.push(cur);
     rows
+}
+
+/// Where the caret sits in the *wrapped* layout of `text` at `width` display
+/// columns, as `(row, col)` — both 0-based, matching exactly how
+/// [`wrap_input_rows`] folds the same text. `cursor` is a char index into
+/// `text` (`0` = before the first char).
+///
+/// The subtle part is the **wrap boundary**: [`wrap_input_rows`] only folds when
+/// the *next* glyph would overflow, so a row can fill to exactly `width` columns
+/// and the caret would land on column `width` — i.e. on the right border / next
+/// cell, the "caret 越界一列" bug. When the row is exactly full **and** there is
+/// another glyph after the caret, the caret really belongs at the start of the
+/// next visual row, so we advance it to `(row + 1, 0)`. An explicit `\n` always
+/// starts a fresh row (col resets to 0), same as the wrapper.
+pub(crate) fn caret_in_wrapped(text: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let w = width.max(1) as usize;
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for c in text.chars().take(cursor) {
+        if c == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cw = char_width(c);
+        if col + cw > w && col > 0 {
+            row += 1;
+            col = 0;
+        }
+        col += cw;
+    }
+    // Row is exactly full and more text follows the caret → the next glyph wraps,
+    // so the caret shows at the head of the next row instead of on the border.
+    if col >= w && text.chars().nth(cursor).is_some_and(|c| c != '\n') {
+        row += 1;
+        col = 0;
+    }
+    (
+        u16::try_from(row).unwrap_or(u16::MAX),
+        u16::try_from(col).unwrap_or(u16::MAX),
+    )
+}
+
+/// Number of wrapped visual rows `text` occupies at `width` columns — the same
+/// fold [`wrap_input_rows`] produces, but without allocating the row strings.
+/// Always at least 1.
+pub(crate) fn wrapped_row_count(text: &str, width: u16) -> u16 {
+    let w = width.max(1) as usize;
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for c in text.chars() {
+        if c == '\n' {
+            rows += 1;
+            col = 0;
+            continue;
+        }
+        let cw = char_width(c);
+        if col + cw > w && col > 0 {
+            rows += 1;
+            col = 0;
+        }
+        col += cw;
+    }
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Inverse of [`caret_in_wrapped`]: the char index in `text` whose caret lands
+/// on visual `(target_row, target_col)` at `width` columns — used by Up/Down to
+/// move the caret a wrapped row while preserving the display column. Walks the
+/// same fold and returns the offset of the first glyph at/after `target_col` on
+/// `target_row` (clamped to the row's end, and to the end of the text). A
+/// `target_col` that lands *inside* a wide glyph snaps to that glyph's start.
+pub(crate) fn offset_at_wrapped(text: &str, target_row: u16, target_col: u16, width: u16) -> usize {
+    let w = width.max(1) as usize;
+    let target_row = target_row as usize;
+    let target_col = target_col as usize;
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut idx = 0usize; // char index of the glyph we're about to place
+    for c in text.chars() {
+        if c == '\n' {
+            if row == target_row {
+                // Caret can sit at end-of-line before a hard newline.
+                return idx;
+            }
+            row += 1;
+            col = 0;
+            idx += 1;
+            continue;
+        }
+        let cw = char_width(c);
+        if col + cw > w && col > 0 {
+            if row == target_row {
+                // Soft-wrap: the target row ended just before this glyph.
+                return idx;
+            }
+            row += 1;
+            col = 0;
+        }
+        if row == target_row && col >= target_col {
+            return idx;
+        }
+        col += cw;
+        idx += 1;
+    }
+    // Reached the end of the text: the caret clamps to the very end (which is
+    // also the end of the final row, where any target_col past the content lands).
+    idx
 }
 
 /// Strip bare control characters from `s`, keeping only printable text plus
@@ -1204,7 +1303,7 @@ fn prefold_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'st
         // straddles the fold. Accumulate into a buffer flushed whenever we wrap.
         let mut buf = String::new();
         for ch in clean.chars() {
-            let cw = usize::from(ch.is_cjk_wide()) + 1;
+            let cw = char_width(ch);
             if col + cw > w && col > (if started_continuation { hang } else { 0 }) {
                 // This row is full — commit the buffered text for THIS span,
                 // then start a new visual row.
@@ -1258,12 +1357,26 @@ fn prompt_block_height(input: &str, area_width: u16, prefix: u16) -> u16 {
 
 fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let text_width = input_text_width(area.width, mode_prefix_width(app));
+    // Publish the input text width so the Up/Down key handlers can move the caret
+    // by one wrapped visual row inside a multi-line prompt (CC parity).
+    app.input_text_cols.set(text_width);
     // Wrap the real input so the box height + underline track the content.
     let all_rows = wrap_input_rows(&app.input, text_width);
     let total_rows = u16::try_from(all_rows.len()).unwrap_or(INPUT_MAX_ROWS);
     let visible_rows = total_rows.clamp(1, INPUT_MAX_ROWS);
-    // Scroll so the LAST visible_rows (where the cursor is) stay on screen.
-    let scroll = total_rows.saturating_sub(visible_rows);
+    // Caret's absolute (row, col) in the wrapped layout — computed BEFORE the
+    // scroll so the scroll can keep it on screen.
+    let (cursor_row_abs, cursor_col) = caret_in_wrapped(&app.input, app.input_cursor, text_width);
+    // Scroll so the caret's row stays visible. The box only ever shows
+    // `visible_rows` of the `total_rows`; when the user edits ABOVE the bottom of
+    // a tall (>6-row) input, the old "always scroll to bottom" pinned the caret
+    // to row 0 and pushed the text it was editing off-screen. Anchor the window
+    // on the caret instead: keep it within the last visible row, clamped so we
+    // never scroll past the content (top or bottom).
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let scroll = cursor_row_abs
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(max_scroll);
     let prompt_chunks = Layout::default()
         .direction(Direction::Vertical)
         // input rows + bottom border, then the meta row.
@@ -1356,20 +1469,20 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let input_panel = Paragraph::new(lines).scroll((scroll, 0)).block(input_block);
     frame.render_widget(input_panel, prompt_chunks[0]);
 
-    // Cursor: derive its wrapped (row, col) by wrapping the text UP TO the
-    // cursor the same way. Display width (CJK = 2 cols) keeps it aligned.
+    // Cursor: place it at the wrapped `(cursor_row_abs, cursor_col)` computed
+    // above (same folding as the drawn rows, with the wrap-boundary push so a
+    // caret at a full row's edge wraps to col 0 of the next row instead of
+    // overrunning the right border). The column already counts wide glyphs (CJK
+    // = 2) via the Unicode width table. The vertical position subtracts `scroll`
+    // so it tracks the visible window.
     let input_area = prompt_chunks[0];
-    let pre: String = app.input.chars().take(app.input_cursor).collect();
-    let pre_rows = wrap_input_rows(&pre, text_width);
-    let cursor_row_abs = u16::try_from(pre_rows.len().saturating_sub(1)).unwrap_or(0);
-    let cursor_col = pre_rows.last().map_or(0, |r| disp_width(r));
     let cursor_row_vis = cursor_row_abs.saturating_sub(scroll);
     if app.overlay.is_none() && !app.show_help {
         frame.set_cursor_position((
             input_area
                 .x
                 .saturating_add(u16::try_from(prefix_w).unwrap_or(3))
-                .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX)),
+                .saturating_add(cursor_col),
             input_area.y.saturating_add(cursor_row_vis),
         ));
     }
