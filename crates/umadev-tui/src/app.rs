@@ -2387,7 +2387,7 @@ impl App {
 
     /// The route ended without a usable reply (base init failed, an empty
     /// reply, or a hard error). This is a TERMINAL route outcome, so — like
-    /// [`record_chat_reply`] / [`record_run_started`] — it stops the
+    /// `record_agentic_done` — it stops the
     /// "thinking…" status; otherwise the animation would spin forever on a
     /// route that already failed. The human-readable reason is surfaced as a
     /// System note. Also clears `agentic_in_flight`: a failed agentic execution
@@ -2403,8 +2403,8 @@ impl App {
     /// An agentic streaming turn finished cleanly. The body ALREADY streamed live
     /// into the transcript (via `WorkerStream`), so we do NOT re-render it — we
     /// only record it as the assistant turn for chat-memory continuity and clear
-    /// the waiting state. A TERMINAL agentic outcome, mirroring
-    /// [`record_chat_reply`] but without the duplicate render.
+    /// the waiting state. A TERMINAL agentic outcome, mirroring the chat-reply
+    /// recorder but without the duplicate render.
     pub(crate) fn record_agentic_done(&mut self, reply: String) {
         self.thinking = false;
         self.thinking_started = None;

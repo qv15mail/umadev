@@ -778,8 +778,8 @@ struct AgenticTurn {
     director_build: bool,
 }
 
-/// Spawn the tools-enabled agentic execution call. UNLIKE [`spawn_route`], this
-/// sends the user's task to the base with NO tool-ban system prompt and NO
+/// Spawn the tools-enabled agentic execution call. This is the live default
+/// path: it sends the user's task to the base with NO tool-ban system prompt and NO
 /// `max_tokens` cap, then drives [`Runtime::complete_streaming`] so the base
 /// runs its OWN agentic loop (read files, `git diff`, run commands, analyse) and
 /// the tool calls + text stream live into the transcript via
