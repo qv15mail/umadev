@@ -2118,6 +2118,34 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
         EngineEvent::VerifySkipped { phase, .. } => {
             eprintln!("  [skip] {} verify skipped", phase.id());
         }
+        // The base's LIVE work — tool calls + streaming text — during a director
+        // run. Previously swallowed by the `_` arm, so `umadev run` showed a few
+        // lines then 12 minutes of silence while the base was actually building.
+        // Now the base's body is visible: which file it writes, which command it
+        // runs, and its streamed reasoning, exactly like the TUI render path.
+        EngineEvent::WorkerStream { event } => match event {
+            umadev_runtime::StreamEvent::ToolUse { name, detail } => {
+                let d = detail.chars().take(100).collect::<String>();
+                eprintln!("  ● [{name}] {d}");
+            }
+            umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
+                let tag = if *ok { "ok" } else { "fail" };
+                let s = summary.chars().take(100).collect::<String>();
+                if !s.trim().is_empty() {
+                    eprintln!("    [{tag}] {s}");
+                }
+            }
+            umadev_runtime::StreamEvent::Warning { message } => {
+                eprintln!("  [warn] {message}");
+            }
+            // Streamed reasoning deltas: print inline without a newline per delta
+            // so a sentence reads as a sentence, not one word per line.
+            umadev_runtime::StreamEvent::Text { delta } => {
+                eprint!("{delta}");
+            }
+            // A "thinking" pulse carries no content — don't spam the log with it.
+            umadev_runtime::StreamEvent::Thinking => {}
+        },
         _ => {}
     }
     let _ = std::io::stderr().flush();
