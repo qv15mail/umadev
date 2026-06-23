@@ -2466,6 +2466,19 @@ async fn drive_continuous_run_from(
     Ok(RunOutcome::Completed)
 }
 
+/// Front-load UmaDev's composed firmware (Wave 2) onto a goal directive — the
+/// universal injection path that reaches every base (claude additionally gets it
+/// natively as a system prompt). The firmware leads, fenced off with a clear
+/// separator so the base reads it as the standing "who you are + how your team
+/// builds + what applies here" context above the concrete goal. Fail-open: an
+/// empty / whitespace firmware returns the goal directive unchanged.
+fn prepend_firmware(firmware: &str, goal: String) -> String {
+    if firmware.trim().is_empty() {
+        return goal;
+    }
+    format!("{firmware}\n\n---\n\n{goal}")
+}
+
 /// How a director-driven `/run` (Wave 1) settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DirectorOutcome {
@@ -2511,6 +2524,7 @@ async fn drive_director_run(
     events: &Arc<dyn umadev_agent::EventSink>,
     session: &mut dyn umadev_runtime::BaseSession,
     options: &RunOptions,
+    firmware: Option<&str>,
 ) -> Result<DirectorOutcome> {
     use umadev_agent::DirectorLoopOutcome;
 
@@ -2523,7 +2537,19 @@ async fn drive_director_run(
 
     // Frame the goal for the director: a complete, ship-quality product build it
     // orchestrates with its team however it judges fit (no fixed phase checklist).
-    let directive = umadev_agent::experts::director_build_directive(&options.requirement);
+    let goal = umadev_agent::experts::director_build_directive(&options.requirement);
+
+    // Wave 2 (firmware injection): the caller passes `firmware` ONLY for bases that
+    // could NOT take it natively as a system prompt (codex / opencode) — claude
+    // already received it via `session_for`'s `--append-system-prompt`, so the
+    // caller passes `None` there to avoid restating the identity. For the bases that
+    // need it, FRONT-LOAD the same firmware onto the first directive (the universal
+    // fail-open path). Fail-open: `None` / empty firmware → the goal directive is
+    // byte-for-byte unchanged.
+    let directive = match firmware {
+        Some(fw) => prepend_firmware(fw, goal),
+        None => goal,
+    };
 
     // Wave 1: `/run` is an EXPLICIT build — `router::for_run` forces the `Build`
     // class (never second-guesses a clear build into a quick-edit) while still
@@ -2675,11 +2701,25 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // path always uses the session.
         let continuous = args.continuous || umadev_agent::continuous_enabled_from_env();
         if !legacy_pipeline || continuous {
+            // Wave 2 firmware: for the DIRECTOR path, compose UmaDev's identity +
+            // craft + JIT knowledge/memory once (the `/run` route is deterministic,
+            // no session needed) so claude can take it NATIVELY via `session_for`'s
+            // `--append-system-prompt`. The legacy pipeline keeps its per-phase
+            // directive framing untouched → no firmware here (fail-open: `None`).
+            let director_firmware: Option<String> = if legacy_pipeline {
+                None
+            } else {
+                let route = umadev_agent::router::for_run(&opts.requirement);
+                let fw =
+                    umadev_agent::compose_firmware(&project_root, &route, &opts.requirement).await;
+                (!fw.trim().is_empty()).then_some(fw)
+            };
             match umadev_host::session_for(
                 backend.id(),
                 &project_root,
                 &opts.model,
                 continuous_autonomous(mode),
+                director_firmware.as_deref(),
             )
             .await
             {
@@ -2731,7 +2771,23 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                             print_engine_event(&event);
                         }
                     });
-                    let outcome = drive_director_run(&sink, session.as_mut(), &director_opts).await;
+                    // claude already took the firmware NATIVELY (system prompt) via
+                    // `session_for`; codex / opencode have no native slot, so they get
+                    // it through the first-directive prefix instead. Pass the firmware
+                    // to the director loop ONLY for the non-native bases so claude is
+                    // never double-injected.
+                    let directive_firmware = if backend.id() == "claude-code" {
+                        None
+                    } else {
+                        director_firmware.as_deref()
+                    };
+                    let outcome = drive_director_run(
+                        &sink,
+                        session.as_mut(),
+                        &director_opts,
+                        directive_firmware,
+                    )
+                    .await;
                     drop(runner);
                     // Always end the session (release the process / server).
                     let _ = session.end().await;
@@ -3353,6 +3409,9 @@ async fn drive_gate_block(
                 project_root,
                 &opts.model,
                 continuous_autonomous(trust),
+                // Legacy continuous resume: the per-phase directives carry the role +
+                // spec framing (the pre-Wave-2 behaviour), so no firmware here.
+                None,
             )
             .await
             {
@@ -4641,14 +4700,27 @@ mod tests {
     /// drain loop + the objective source-present hard-gate end to end.
     struct FakeDirectorSession {
         events: std::collections::VecDeque<umadev_runtime::SessionEvent>,
+        // Every directive the loop sent, captured so a test can assert the firmware
+        // was front-loaded onto the first one (defaults to a throwaway sink).
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeDirectorSession {
+        fn new(events: std::collections::VecDeque<umadev_runtime::SessionEvent>) -> Self {
+            Self {
+                events,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl umadev_runtime::BaseSession for FakeDirectorSession {
         async fn send_turn(
             &mut self,
-            _directive: String,
+            directive: String,
         ) -> Result<(), umadev_runtime::SessionError> {
+            self.sent.lock().unwrap().push(directive);
             Ok(())
         }
         async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
@@ -4693,8 +4765,8 @@ mod tests {
         let opts = director_test_opts(tmp.path());
         let sink: Arc<dyn umadev_agent::EventSink> =
             Arc::new(umadev_agent::RecordingSink::default());
-        let mut session = FakeDirectorSession {
-            events: [
+        let mut session = FakeDirectorSession::new(
+            [
                 SessionEvent::TextDelta("I implemented the login page".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
@@ -4702,8 +4774,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-        };
-        let outcome = drive_director_run(&sink, &mut session, &opts)
+        );
+        let outcome = drive_director_run(&sink, &mut session, &opts, None)
             .await
             .unwrap();
         assert!(
@@ -4731,8 +4803,8 @@ mod tests {
             Arc::new(umadev_agent::RecordingSink::default());
         let mut tool_input = serde_json::Map::new();
         tool_input.insert(target_key(), serde_json::json!("App.tsx"));
-        let mut session = FakeDirectorSession {
-            events: [
+        let mut session = FakeDirectorSession::new(
+            [
                 // Turn 1 — the planning turn (main session) replies with a JSON plan.
                 SessionEvent::TextDelta(
                     r#"{"steps":[{"id":"s1","title":"Build it","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}],"risks":[],"open_questions":[]}"#
@@ -4753,8 +4825,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-        };
-        let outcome = drive_director_run(&sink, &mut session, &opts)
+        );
+        let outcome = drive_director_run(&sink, &mut session, &opts, None)
             .await
             .unwrap();
         assert_eq!(outcome, DirectorOutcome::Done);
@@ -4769,15 +4841,82 @@ mod tests {
         let sink: Arc<dyn umadev_agent::EventSink> =
             Arc::new(umadev_agent::RecordingSink::default());
         // No events at all -> next_event yields None immediately.
-        let mut session = FakeDirectorSession {
-            events: std::collections::VecDeque::new(),
-        };
-        let outcome = drive_director_run(&sink, &mut session, &opts)
+        let mut session = FakeDirectorSession::new(std::collections::VecDeque::new());
+        let outcome = drive_director_run(&sink, &mut session, &opts, None)
             .await
             .unwrap();
         assert!(
             matches!(outcome, DirectorOutcome::HardStop(_)),
             "a dead session must fail open to a HardStop"
+        );
+    }
+
+    #[test]
+    fn prepend_firmware_fences_firmware_then_goal_and_is_fail_open() {
+        // The firmware leads, fenced from the goal with a separator; an empty /
+        // whitespace firmware leaves the goal directive byte-for-byte unchanged.
+        let out = prepend_firmware("FW", "GOAL".to_string());
+        assert!(out.starts_with("FW"));
+        assert!(out.contains("GOAL"));
+        assert!(out.find("FW").unwrap() < out.find("GOAL").unwrap());
+        // Fail-open on empty firmware.
+        assert_eq!(prepend_firmware("", "GOAL".to_string()), "GOAL");
+        assert_eq!(prepend_firmware("   ", "GOAL".to_string()), "GOAL");
+    }
+
+    #[tokio::test]
+    async fn director_run_front_loads_firmware_for_a_non_native_base() {
+        // Wave 2: for a base with no native system-prompt slot (codex / opencode),
+        // the firmware passed to `drive_director_run` is FRONT-LOADED onto the first
+        // directive the loop sends, so the base still receives the team identity +
+        // craft before the goal. claude is excluded by the CALLER (it took the
+        // firmware natively); here we verify the directive-prefix path directly.
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = director_test_opts(tmp.path());
+        opts.backend = "codex".to_string();
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let session = FakeDirectorSession::new(
+            [
+                // A chat-only reply (no change verb) settles after turn 1 — enough to
+                // capture the first directive without driving the whole QC loop.
+                SessionEvent::TextDelta("Here is my read of the goal.".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let sent = session.sent.clone();
+        let mut session = session;
+        let firmware = "YOU ARE UmaDev — a senior project director.";
+        let _ = drive_director_run(&sink, &mut session, &opts, Some(firmware))
+            .await
+            .unwrap();
+        let directives = sent.lock().unwrap();
+        // The director loop may send a JSON-only PLAN turn first (over the main
+        // session); the GOAL build directive is the one the firmware was prepended
+        // to. Exactly one directive must FRONT-LOAD the firmware (no native slot on
+        // codex), and that directive must also carry the goal text.
+        let goal_directive = directives
+            .iter()
+            .find(|d| d.starts_with(firmware))
+            .expect("a firmware-prefixed goal directive was sent");
+        assert!(
+            goal_directive.contains("build a login page"),
+            "the goal still follows the firmware: {goal_directive}"
+        );
+        // The JSON-only plan turn (if any) must NOT carry the firmware — only the
+        // substantive goal directive does.
+        assert!(
+            directives
+                .iter()
+                .filter(|d| d.starts_with(firmware))
+                .count()
+                == 1,
+            "exactly one directive front-loads the firmware"
         );
     }
 

@@ -337,6 +337,40 @@ struct BrainStep {
 /// unparseable reply, or an empty plan after normalisation — returns `None`, and the
 /// caller falls back to today's single-turn build behaviour. Never errors, never
 /// blocks.
+/// Send ONE directive on the MAIN session and collect its full text reply (for
+/// JSON parsing). Bounded by a generous idle timeout per event; non-text events
+/// (an unexpected tool call / result on a JSON-only turn) are ignored, and a
+/// pending approval is left unanswered so the watchdog ends the turn rather than
+/// letting the planning turn mutate anything. Fail-open: a dead session / a
+/// timeout / an empty reply → `None` (the caller then runs the plain build).
+async fn drain_plan_turn(session: &mut dyn BaseSession, directive: String) -> Option<String> {
+    use umadev_runtime::SessionEvent;
+    if session.send_turn(directive).await.is_err() {
+        return None;
+    }
+    let mut text = String::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(180), session.next_event()).await
+        {
+            Ok(Some(SessionEvent::TextDelta(t))) => text.push_str(&t),
+            Ok(Some(SessionEvent::TurnDone { .. })) => break,
+            // A JSON-only plan turn should emit no tools; ignore anything else and
+            // let the next-event timeout bound a misbehaving turn.
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Ask the borrowed brain to decompose the requirement into an owned [`Plan`] DAG.
+/// Runs as the session's first (JSON-only) turn; fail-open to `None` on any
+/// failure so the caller falls back to the plain single-turn build.
 pub async fn synthesize_plan(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -371,15 +405,20 @@ pub async fn synthesize_plan(
     );
     let user = format!("Requirement:\n{requirement}");
 
-    // Fork a read-only session and run one strict-JSON planning turn — reusing the
-    // exact ForkConsult mechanism the critic team + router use.
-    let fork = crate::continuous::fork_with_timeout(session).await;
-    let consult = crate::continuous::ForkConsult::new(fork);
-    let json_text = consult.judge_json("planner", &system, user).await;
-    consult.end().await;
-
-    let text = json_text?;
-    let raw: BrainPlan = serde_json::from_str(&text).ok()?;
+    // Run the planning turn on the MAIN session — NOT a fork. claude cannot
+    // `--resume` a session that has not had its first turn yet, so a pre-build
+    // planning FORK fails silently and the user never sees a plan. Running it here
+    // makes planning the session's FIRST turn: reliable, it establishes the session
+    // so later QC forks work, and the base keeps the plan in its own context when it
+    // then builds. JSON-only, tools forbidden this turn.
+    let directive = format!(
+        "{system}\n\nReturn EXACTLY ONE JSON object and nothing else — no markdown, \
+         no code fence, no prose. Do NOT write any files or run any commands in this \
+         turn; this is the PLAN only.\n\n{user}"
+    );
+    let text = drain_plan_turn(session, directive).await?;
+    let json = crate::continuous::extract_json_object(&text)?;
+    let raw: BrainPlan = serde_json::from_str(&json).ok()?;
     let plan = Plan {
         steps: raw
             .steps

@@ -1911,7 +1911,7 @@ fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
 /// may carry stray prose despite the strict-JSON instruction). Mirrors the
 /// runner's tolerant extractor — string/escape aware so a `}` inside a string
 /// can't close the object early.
-fn extract_json_object(text: &str) -> Option<String> {
+pub(crate) fn extract_json_object(text: &str) -> Option<String> {
     let start = text.find('{')?;
     let bytes = text.as_bytes();
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);

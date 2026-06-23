@@ -1398,6 +1398,24 @@ pub fn driver_for(backend_id: &str) -> Option<Box<dyn HostDriver>> {
 /// - `autonomous` — the trust tier's autonomy: `true` lets the base write code
 ///   unattended (governed by UmaDev's own rules); `false` raises approval
 ///   requests at gates. Derived by the caller from [`TrustMode`].
+/// - `append_system` — UmaDev's composed FIRMWARE (team identity + craft + JIT
+///   knowledge + pitfall memory; see `umadev_agent::compose_firmware`) to inject
+///   over the base's system-prompt surface. `None` → no firmware (the
+///   pre-Wave-2 behaviour). Injection is **per-base, best-effort**:
+///   - **claude-code** injects it NATIVELY via `--append-system-prompt` (Claude
+///     Code's documented "append custom text to the default system prompt"
+///     flag), so the firmware lives in the system prompt for the whole session.
+///   - **codex** / **opencode** have no clean generic system-prompt slot on
+///     their session-start handshake (codex `thread/start` exposes only
+///     `personality` / collaboration-mode templates; opencode's prompt body has
+///     no system field — its system override is the `--system` CLI flag /
+///     AGENTS.md, not the per-prompt HTTP payload). For those two the firmware
+///     reaches the base via the **first-directive prefix** the caller prepends
+///     (the universal fail-open path), NOT here — passing `append_system` for
+///     them is accepted but currently a no-op at the session layer, so the
+///     caller must still front-load the firmware into the first directive. This
+///     keeps the contract honest: nothing is silently dropped, and claude gets
+///     the stronger native injection.
 ///
 /// [`BaseSession`]: umadev_runtime::BaseSession
 /// [`TrustMode`]: umadev_runtime
@@ -1412,20 +1430,30 @@ pub async fn session_for(
     workspace: &std::path::Path,
     model: &str,
     autonomous: bool,
+    append_system: Option<&str>,
 ) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
+    // Treat an empty / whitespace-only firmware as absent so an over-eager caller
+    // can't inject a blank `--append-system-prompt`.
+    let append_system = append_system.filter(|s| !s.trim().is_empty());
     match backend_id {
         "claude-code" => {
             // The continuous claude session tracks the autonomy tier like codex /
             // opencode: `autonomous` → `--permission-mode acceptEdits` (write
             // unattended), otherwise → `default` (claude raises a `can_use_tool`
             // approval per tool → a `NeedApproval` the orchestrator answers, the
-            // guarded human-in-the-loop tier). We append no extra system prompt
-            // here — the runner's directives carry the role + spec constraints per
-            // phase.
-            let s = ClaudeSession::start(workspace, None, autonomous).await?;
+            // guarded human-in-the-loop tier). UmaDev's firmware (when present) is
+            // injected NATIVELY via `--append-system-prompt`, so it pins the team
+            // identity + craft + JIT knowledge/memory for the whole session; the
+            // runner's per-phase directives still carry the step-specific framing.
+            let s = ClaudeSession::start(workspace, append_system, autonomous).await?;
             Ok(Box::new(s))
         }
         "codex" => {
+            // codex app-server has no generic system-prompt slot on `thread/start`
+            // (only `personality` / collaboration-mode templates), so the firmware
+            // is NOT injected here — the caller front-loads it onto the first
+            // directive instead (the universal fail-open path). Accepting the param
+            // keeps the signature uniform across the three bases.
             let s = CodexSession::start(workspace, model, autonomous).await?;
             Ok(Box::new(s))
         }
@@ -1433,7 +1461,9 @@ pub async fn session_for(
             // `build` agent; pass the model through only when non-empty so the
             // base falls back to its own configured default otherwise. `autonomous`
             // selects the permission ruleset (wildcard allow vs guarded ask), so
-            // opencode's gate posture matches codex / claude.
+            // opencode's gate posture matches codex / claude. Like codex, opencode's
+            // per-prompt HTTP payload has no system field, so the firmware reaches
+            // the base via the caller's first-directive prefix, not here.
             let model = (!model.is_empty()).then_some(model);
             let s = OpenCodeSession::start(workspace, Some("build"), model, autonomous).await?;
             Ok(Box::new(s))
@@ -1548,6 +1578,22 @@ mod tests {
     fn clean_output_trims_and_strips() {
         let raw = "  \x1b[33m# PRD\x1b[0m\n\nbody  \n";
         assert_eq!(clean_output(raw), "# PRD\n\nbody");
+    }
+
+    #[tokio::test]
+    async fn session_for_accepts_firmware_and_rejects_unknown_backend() {
+        // The Wave-2 `append_system` (firmware) param is accepted on the public
+        // signature; an unknown backend id still errors DETERMINISTICALLY (no base
+        // process spawned), regardless of whether firmware is present, blank, or
+        // absent — so the caller's fail-open fallback path is reachable.
+        let ws = std::env::temp_dir();
+        for fw in [None, Some(""), Some("   "), Some("YOU ARE UmaDev firmware")] {
+            let r = session_for("not-a-real-backend", &ws, "", false, fw).await;
+            assert!(
+                matches!(r, Err(umadev_runtime::SessionError::Start(_))),
+                "unknown backend must error deterministically (firmware={fw:?})"
+            );
+        }
     }
 
     #[test]

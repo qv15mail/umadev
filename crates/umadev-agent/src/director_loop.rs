@@ -1431,8 +1431,10 @@ mod tests {
 
     #[tokio::test]
     async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
-        // A forking session whose fork emits a valid plan JSON → the loop synthesises
-        // the plan, persists `.umadev/plan.json`, posts it, and ticks a step active.
+        // The planning turn runs on the MAIN session (its first turn) and replies
+        // with a valid plan JSON → the loop synthesises the plan, persists
+        // `.umadev/plan.json`, posts it, and ticks a step active. The build reply
+        // follows as the second turn.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
         let (events, rec) = sink();
@@ -1440,8 +1442,11 @@ mod tests {
             {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
         ],"risks":["state mgmt"],"open_questions":[]}"#;
-        let turns = vec![text_turn("Built the whole app end to end. Done.")];
-        // can_fork = true so the planning consult gets a fork that replies with JSON.
+        // Turn 1 = the JSON plan (main-session planning turn); turn 2 = the build.
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Built the whole app end to end. Done."),
+        ];
         let mut sess = FakeSession::new(turns, true, plan_json);
         let mut o = opts(tmp.path());
         // A lean requirement would skip the heavy review but the plan path keys off

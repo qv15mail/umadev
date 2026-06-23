@@ -39,6 +39,7 @@ pub mod adopt;
 pub mod checkpoint;
 pub mod coach;
 pub mod config;
+pub mod context;
 pub mod continuous;
 pub mod coverage;
 pub mod critics;
@@ -72,6 +73,7 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
+pub use context::{compose_firmware, FIRMWARE_BUDGET};
 pub use continuous::{
     continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
     ReviewKind, RunOutcome,

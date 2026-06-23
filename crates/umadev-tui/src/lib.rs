@@ -538,7 +538,8 @@ fn spawn_continuous_block(
         let mut guard = holder.lock().await;
         let mut session = match guard.take() {
             Some(s) => s,
-            None => match umadev_host::session_for(&backend, &root, &model, autonomous).await {
+            None => match umadev_host::session_for(&backend, &root, &model, autonomous, None).await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     sink.emit(EngineEvent::Note(format!(
@@ -653,10 +654,26 @@ fn spawn_director_loop(
             }
         };
 
+        // Wave 2 (firmware): compose UmaDev's identity + craft + JIT knowledge +
+        // pitfall memory once (the `/run` route is deterministic, no session needed)
+        // so claude can take it NATIVELY as a system prompt via `session_for`'s
+        // `--append-system-prompt`. Fail-open: an empty firmware just leaves the base
+        // un-primed beyond the directive, exactly as before.
+        let route = umadev_agent::router::for_run(&options.requirement);
+        let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
+        let firmware = (!firmware.trim().is_empty()).then_some(firmware);
+
         // Open the director's live base session. Fail-open: a session that can't
         // open emits the honest terminal abort + a terminal Failed (the user can
         // retry, or opt into the legacy pipeline with `UMADEV_LEGACY_PIPELINE=1`).
-        let mut session = match umadev_host::session_for(&backend, &root, &model, autonomous).await
+        let mut session = match umadev_host::session_for(
+            &backend,
+            &root,
+            &model,
+            autonomous,
+            firmware.as_deref(),
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) => {
@@ -674,7 +691,15 @@ fn spawn_director_loop(
 
         // Frame the goal for the director (the firmware framing), then drive the
         // build loop: the base builds end to end, UmaDev runs its honesty/QC read.
-        let directive = umadev_agent::experts::director_build_directive(&options.requirement);
+        // claude already took the firmware NATIVELY (system prompt) above; codex /
+        // opencode have no native slot, so for THEM we front-load the same firmware
+        // onto the first directive (the universal fail-open path) — never restating
+        // it on claude. Fail-open: no firmware → the goal directive is unchanged.
+        let goal = umadev_agent::experts::director_build_directive(&options.requirement);
+        let directive = match firmware.as_deref() {
+            Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{goal}"),
+            _ => goal,
+        };
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
         let outcome =
             umadev_agent::drive_director_loop(session.as_mut(), &options, &sink_dyn, directive)
