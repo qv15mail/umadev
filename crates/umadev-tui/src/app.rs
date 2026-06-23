@@ -2665,6 +2665,9 @@ impl App {
         }
     }
 
+    /// Interrupt the active run / in-flight turn: seal any half-streamed reply,
+    /// stop the spinner, clear the in-flight + queued state, and post a cancelled
+    /// note. The canonical Esc/Ctrl-C handler (see `lib.rs`).
     pub fn cancel_run(&mut self) {
         // Seal any half-streamed reply BEFORE the reset clears the stream flag, so
         // the user sees the partial answer is incomplete (not the whole reply).
