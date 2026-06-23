@@ -1687,30 +1687,34 @@ impl App {
                             // also text and the last chat message is from Host,
                             // append this delta to it instead of pushing a new
                             // line. This gives a ChatGPT-like streaming feel.
-                            let appended = if self.stream_text_active {
+                            //
+                            // A long reply is NEVER truncated. CJK hits any byte
+                            // budget in a few sentences (3 bytes/char), and the
+                            // old `…` cap silently swallowed the rest of the
+                            // answer. Instead, when the current streamed segment
+                            // grows past a soft threshold we roll over into a
+                            // FRESH Host message — natural segmentation — so the
+                            // whole reply stays visible and the transcript keeps
+                            // pre-folding each segment correctly.
+                            const SEGMENT_BYTES: usize = 4000;
+                            // Decide WHERE the delta goes without holding a
+                            // mutable borrow across a `self.push` (which also
+                            // borrows `self.history`): append to the live Host
+                            // segment if it still has room, else roll over to a
+                            // new segment. Returns whether we appended in place.
+                            let append_in_place = self.stream_text_active
+                                && self.history.back().is_some_and(|m| {
+                                    m.role == ChatRole::Host && m.body.len() < SEGMENT_BYTES
+                                });
+                            if append_in_place {
                                 if let Some(last) = self.history.back_mut() {
-                                    if last.role == ChatRole::Host {
-                                        if last.body.len() < 2000 {
-                                            last.body.push_str(&delta);
-                                            true
-                                        } else {
-                                            if !last.body.ends_with('…') {
-                                                last.body.push_str(" …");
-                                            }
-                                            true
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
+                                    last.body.push_str(&delta);
                                 }
                             } else {
-                                false
-                            };
-                            if !appended {
-                                let preview: String = delta.chars().take(2000).collect();
-                                self.push(ChatRole::Host, preview);
+                                // Either a fresh stream, or a rollover because the
+                                // current segment is full — start a new Host bubble
+                                // so the long reply continues, never truncated.
+                                self.push(ChatRole::Host, delta);
                                 self.stream_text_active = true;
                             }
                         }
@@ -8163,6 +8167,54 @@ mod tests {
             "two consecutive text deltas should be one message"
         );
         assert_eq!(host_msgs[0].body, "Part 1 Part 2");
+    }
+
+    #[test]
+    fn long_stream_is_never_truncated_only_segmented() {
+        // The bug: a long streamed reply was hard-capped at 2000 bytes and the
+        // rest silenced with `…` (CJK hit that in a few sentences). The fix keeps
+        // EVERY byte — once a segment fills, the reply rolls into a fresh Host
+        // bubble. Stream ~20 KB of CJK in many deltas and assert nothing is lost
+        // and no `…` truncation marker is appended.
+        let mut a = fresh_app(Some("offline"));
+        let chunk = "这是一段很长的中文回复内容用来测试不被截断"; // 21 chars
+        let n = 500;
+        for _ in 0..n {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Text {
+                    delta: chunk.into(),
+                },
+            });
+        }
+        let host_total: usize = a
+            .history
+            .iter()
+            .filter(|m| m.role == ChatRole::Host)
+            .map(|m| m.body.chars().count())
+            .sum();
+        let expected = chunk.chars().count() * n;
+        assert_eq!(
+            host_total, expected,
+            "every streamed char must survive — no truncation"
+        );
+        // It segmented into more than one bubble (proof the rollover ran), and no
+        // segment carries the old truncation ellipsis.
+        let host_msgs: Vec<_> = a
+            .history
+            .iter()
+            .filter(|m| m.role == ChatRole::Host)
+            .collect();
+        assert!(
+            host_msgs.len() > 1,
+            "a 20 KB reply must roll over into multiple segments"
+        );
+        for m in &host_msgs {
+            assert!(
+                !m.body.contains('…'),
+                "no segment should be truncated with an ellipsis: {}",
+                m.body
+            );
+        }
     }
 
     #[test]

@@ -844,20 +844,41 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+/// The assistant bullet glyph (a filled circle, the Claude-Code
+/// `AssistantTextMessage` marker), built from its codepoint so the source
+/// carries no literal pictographic glyph. Followed by one space, it forms the
+/// two-column left gutter under which a wrapped body aligns.
+fn assistant_bullet() -> String {
+    let mut s = String::with_capacity(2);
+    s.push(char::from_u32(0x25CF).unwrap_or('*'));
+    s.push(' ');
+    s
+}
+
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     const MAX_RENDER_LINES: usize = 500;
     let inner_height = area.height as usize;
 
-    // Welcome banner first — it scrolls away as the conversation fills in.
-    let mut rendered: Vec<Line<'static>> = welcome_lines(app);
+    // Each logical line carries a `hang` (its left-gutter width). When the line
+    // is pre-folded to the viewport width, continuation rows are indented by
+    // `hang` so a wrapped paragraph stays aligned under its bullet/prefix instead
+    // of reflowing flush-left. Welcome-banner art keeps a zero hang (it never
+    // wraps at a sane width). A hang of 2 matches the two-column bullet gutter and
+    // the gate bar; a hang of 1 matches the user-row leading space.
+    let mut rendered: Vec<(Line<'static>, usize)> = welcome_lines(app)
+        .into_iter()
+        .map(|l| (l, 0usize))
+        .collect();
     for (msg_idx, msg) in app.history.iter().enumerate() {
         // Top gap before each message for breathing room (Claude Code: marginTop=1).
         if msg_idx > 0 {
-            rendered.push(Line::from(""));
+            rendered.push((Line::from(""), 0));
         }
 
         if msg.role == ChatRole::Gate {
-            render_gate_block(&msg.body, theme::WARNING(), &mut rendered);
+            let mut block: Vec<Line<'static>> = Vec::new();
+            render_gate_block(&msg.body, theme::WARNING(), &mut block);
+            rendered.extend(block.into_iter().map(|l| (l, 2usize)));
             continue;
         }
 
@@ -866,34 +887,45 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             // userMessageBackground = rgb(55,55,55)), no leading dot.
             ChatRole::You => {
                 for line in msg.body.lines() {
-                    rendered.push(Line::from(Span::styled(
-                        format!(" {line}"),
-                        Style::default().fg(theme::TEXT()).bg(theme::USER_MSG_BG()),
-                    )));
+                    rendered.push((
+                        Line::from(Span::styled(
+                            format!(" {line}"),
+                            Style::default().fg(theme::TEXT()).bg(theme::USER_MSG_BG()),
+                        )),
+                        1,
+                    ));
                 }
             }
-            // **Assistant/Host messages** — leading `●` bullet + plain text
-            // on terminal background (Claude Code: AssistantTextMessage).
-            ChatRole::UmaDev | ChatRole::Host => {
+            // **Assistant/Host messages** — leading bullet + plain text on the
+            // terminal background (Claude Code: AssistantTextMessage). The
+            // two-column bullet gutter is also the hang width, so a long paragraph
+            // that wraps lines up under the text, not under the bullet.
+            ChatRole::Host | ChatRole::UmaDev => {
                 let body_lines = markdown_to_lines(&msg.body, theme::TEXT());
                 for (i, bl) in body_lines.into_iter().enumerate() {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if i == 0 {
-                        spans.push(Span::styled("● ", Style::default().fg(theme::ACCENT())));
+                        spans.push(Span::styled(
+                            assistant_bullet(),
+                            Style::default().fg(theme::ACCENT()),
+                        ));
                     } else {
                         spans.push(Span::raw("  "));
                     }
                     spans.extend(bl.spans);
-                    rendered.push(Line::from(spans));
+                    rendered.push((Line::from(spans), 2));
                 }
             }
             // **System messages** — dim/muted, no bullet.
             ChatRole::System => {
                 for line in msg.body.lines() {
-                    rendered.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(theme::TEXT_MUTED()),
-                    )));
+                    rendered.push((
+                        Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(theme::TEXT_MUTED()),
+                        )),
+                        2,
+                    ));
                 }
             }
             ChatRole::Gate => unreachable!(),
@@ -913,39 +945,45 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             String::new()
         };
-        rendered.push(Line::from(""));
-        rendered.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", app.spinner()),
-                Style::default().fg(theme::ACCENT()),
-            ),
-            Span::styled(
-                umadev_i18n::t(app.lang, "status.thinking").to_string(),
-                Style::default()
-                    .fg(theme::ACCENT())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())),
-        ]));
+        rendered.push((Line::from(""), 0));
+        rendered.push((
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", app.spinner()),
+                    Style::default().fg(theme::ACCENT()),
+                ),
+                Span::styled(
+                    umadev_i18n::t(app.lang, "status.thinking").to_string(),
+                    Style::default()
+                        .fg(theme::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())),
+            ]),
+            2,
+        ));
     }
     if rendered.len() > MAX_RENDER_LINES {
         rendered = rendered.split_off(rendered.len() - MAX_RENDER_LINES);
     }
 
-    // Wrap long lines to the CURRENT width so content REFLOWS on resize (a
-    // narrower window re-wraps instead of clipping), then stick to the bottom by
-    // scrolling past the overflow. We estimate the wrapped height from each
-    // line's display width (exact for the common short-line case; `line_count`
-    // is private in ratatui).
+    // Pre-fold every logical line to the CURRENT width into the exact visual
+    // rows it occupies, then render WITHOUT `Paragraph::wrap`. This is the
+    // de-scramble fix: previously we *estimated* the wrapped height with
+    // `disp_width().div_ceil(w)` and let `Paragraph::wrap` fold the line a
+    // *different* way (its own unicode-width pass), so the scroll offset and the
+    // painted rows disagreed — long/CJK sessions scattered glyphs and smeared
+    // stale cells. Now the folded `Vec<Line>` length **is** the row count, so the
+    // estimate equals reality and the scroll offset lands on the right row.
+    // Continuation rows are indented by each line's `hang` so wrapped paragraphs
+    // stay aligned under their bullet/prefix.
     let w = usize::from(area.width).max(1);
-    let total: usize = rendered
-        .iter()
-        .map(|l| {
-            let lw: usize = l.spans.iter().map(|s| disp_width(s.content.as_ref())).sum();
-            lw.div_ceil(w).max(1)
-        })
-        .sum();
-    let para = Paragraph::new(rendered).wrap(Wrap { trim: false });
+    let folded: Vec<Line<'static>> = rendered
+        .into_iter()
+        .flat_map(|(line, hang)| prefold_line(&line, w, hang))
+        .collect();
+    let total = folded.len();
+    let para = Paragraph::new(folded);
     let hidden_above = total.saturating_sub(inner_height);
 
     // Publish the scroll bounds for the key handlers (Home/End, Page, Ctrl-U/D,
@@ -1098,6 +1136,92 @@ fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
     }
     rows.push(cur);
     rows
+}
+
+/// Strip bare control characters from `s`, keeping only printable text plus
+/// `\t` (tabs the renderer can handle) — `\n` is already split out by the
+/// caller before this runs, so newlines never reach here. The base streams
+/// structured JSON-text (no ANSI), but a stray ESC / cursor-move byte in any
+/// delta would let the model move the terminal cursor and scribble outside the
+/// transcript rect. Filtering them here keeps every glyph inside its cell.
+/// Fail-open: a clean string is returned unchanged (no realloc on the hot path).
+fn strip_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(|c| c.is_control() && c != '\t') {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .filter(|c| !c.is_control() || *c == '\t')
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Pre-fold one logical [`Line`] into the exact visual rows it occupies at
+/// `width` display columns, splitting [`Span`]s at display-width boundaries so
+/// every style is preserved. This is the heart of the de-scramble fix: instead
+/// of *estimating* the wrapped height with `disp_width().div_ceil(w)` and then
+/// handing the un-folded line to `Paragraph::wrap` (whose own unicode-width
+/// algorithm folds it a *different* way, so the scroll offset and the painted
+/// rows disagree and CJK/long sessions scatter glyphs and smear stale cells),
+/// we fold here and the returned `Vec<Line>` length **is** the real row count.
+///
+/// `hang` indents every continuation row by that many spaces, so a wrapped
+/// assistant paragraph (the bullet-prefixed body) aligns under the text rather
+/// than reflowing flush to the left gutter. Wide glyphs (CJK = 2 cols, via
+/// [`disp_width`]) are never split across a fold, so no half-character ever
+/// lands in a cell.
+///
+/// Always returns at least one row. Fail-open: a zero `width` is treated as 1.
+fn prefold_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    let w = width.max(1);
+    let hang = hang.min(w.saturating_sub(1)); // never indent past the usable width
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // Accumulator for the current visual row: the spans built so far + the
+    // display column we've filled. The first row starts at column 0; every
+    // continuation row starts after the hanging indent.
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    let mut started_continuation = false;
+
+    // Emit the accumulated row and start a fresh continuation row (with hang).
+    macro_rules! flush_row {
+        () => {{
+            out.push(Line::from(std::mem::take(&mut cur)));
+            col = 0;
+            started_continuation = true;
+            if hang > 0 {
+                cur.push(Span::styled(" ".repeat(hang), Style::default()));
+                col = hang;
+            }
+        }};
+    }
+
+    for span in &line.spans {
+        let style = span.style;
+        let clean = strip_control_chars(span.content.as_ref());
+        // Build the current span's text char-by-char so a wide glyph never
+        // straddles the fold. Accumulate into a buffer flushed whenever we wrap.
+        let mut buf = String::new();
+        for ch in clean.chars() {
+            let cw = usize::from(ch.is_cjk_wide()) + 1;
+            if col + cw > w && col > (if started_continuation { hang } else { 0 }) {
+                // This row is full — commit the buffered text for THIS span,
+                // then start a new visual row.
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                flush_row!();
+            }
+            buf.push(ch);
+            col += cw;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    out.push(Line::from(cur));
+    out
 }
 
 /// Display width of the input's row-0 prefix (mode marker + one space):
@@ -2419,6 +2543,129 @@ mod tests {
         assert!(
             col_of(&cells, "a").is_some(),
             "aborted status head should still render at a narrow width"
+        );
+    }
+
+    // --- Pre-fold de-scramble fix ---
+
+    /// Total display width of all spans on a line — the honest per-row width.
+    fn line_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|s| disp_width(s.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn prefold_row_count_equals_real_visual_rows() {
+        // The core invariant the scroll math depends on: the number of folded
+        // rows is EXACTLY ceil(content_width / w), and no row exceeds `w` cols.
+        // This is what the old div_ceil estimate got wrong relative to ratatui's
+        // own wrap. ASCII case: 25 cols of text at width 10 → 3 rows.
+        let line = Line::from(Span::raw("a".repeat(25)));
+        let rows = prefold_line(&line, 10, 0);
+        assert_eq!(rows.len(), 3, "25 cols / 10 = 3 rows");
+        for r in &rows {
+            assert!(line_width(r) <= 10, "no folded row exceeds the width");
+        }
+        // A short line is one row, unchanged.
+        let short = Line::from(Span::raw("hi"));
+        assert_eq!(prefold_line(&short, 10, 0).len(), 1);
+    }
+
+    #[test]
+    fn prefold_cjk_width_never_splits_a_wide_glyph() {
+        // 6 CJK glyphs = 12 cols. At width 5, a glyph is 2 cols, so each row fits
+        // 2 glyphs (4 cols; a 3rd would need 6 > 5) → 3 rows. Critically, no row
+        // is wider than 5 and no glyph is split across the fold.
+        let line = Line::from(Span::raw("正在思考问题".to_string())); // 6 wide glyphs
+        let rows = prefold_line(&line, 5, 0);
+        assert_eq!(rows.len(), 3, "6 wide glyphs at width 5 → 3 rows of 2");
+        for r in &rows {
+            assert!(line_width(r) <= 5, "a folded CJK row never exceeds width");
+            // Every span content is whole CJK chars — reassembling preserves them.
+            let joined: String = r.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                joined
+                    .chars()
+                    .all(|c| c == ' ' || "正在思考问题".contains(c)),
+                "no half-glyph leaked into a row: {joined:?}"
+            );
+        }
+        // Round-trip: concatenating all rows (minus the hang spaces) is the input.
+        let back: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(back, "正在思考问题");
+    }
+
+    #[test]
+    fn prefold_hang_indents_continuation_rows() {
+        // A 2-col hang means every continuation row starts with 2 spaces, so a
+        // wrapped assistant paragraph aligns under the bullet's text column.
+        let line = Line::from(Span::raw("a".repeat(20)));
+        let rows = prefold_line(&line, 10, 2);
+        assert!(rows.len() >= 2, "20 cols at width 10 wraps");
+        // Row 0 has no leading hang; every later row starts with the 2-space hang.
+        let first: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !first.starts_with("  "),
+            "first row is not indented: {first:?}"
+        );
+        for r in &rows[1..] {
+            let s: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            assert!(s.starts_with("  "), "continuation row not hung: {s:?}");
+            assert!(line_width(r) <= 10, "hang row still respects width");
+        }
+    }
+
+    #[test]
+    fn strip_control_chars_drops_escapes_keeps_tab() {
+        // The control bytes themselves are removed so the model can't move the
+        // cursor or clear the screen; printable text and tabs survive untouched.
+        // (Only the C0/C1 control *characters* are dropped — the printable
+        // residue of an escape sequence, e.g. `[2J`, is harmless text and stays;
+        // what matters is that the ESC byte that would activate it is gone.)
+        assert_eq!(strip_control_chars("clean text").as_ref(), "clean text");
+        assert_eq!(strip_control_chars("a\x1b[2Jb").as_ref(), "a[2Jb");
+        assert_eq!(strip_control_chars("a\x00\x07\x1bb").as_ref(), "ab");
+        assert!(!strip_control_chars("x\x1by").contains('\x1b'));
+        assert_eq!(strip_control_chars("col1\tcol2").as_ref(), "col1\tcol2");
+        // Borrowed (no realloc) when already clean.
+        assert!(matches!(
+            strip_control_chars("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn long_cjk_transcript_renders_without_scrambling() {
+        // End-to-end regression for the floating-glyph bug: a long CJK assistant
+        // message in a narrow terminal must render cleanly — every painted cell is
+        // a real glyph or space, the scroll lands on a row boundary, and the most
+        // recent content is on screen (bottom-pinned). No control chars, no smear.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        for i in 0..40 {
+            app.apply_engine(umadev_agent::EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Text {
+                    delta: format!("这是第{i}行很长的中文回复内容用来触发换行和滚动"),
+                },
+            });
+            // Force each into its own bubble so the transcript has many CJK rows.
+            app.stream_text_active = false;
+        }
+        // Render at a narrow width where CJK lines must wrap — the old code
+        // scrambled here. The proof is simply that it renders to a full buffer
+        // without panicking and the bottom-pinned recent content is visible.
+        let out = render_chat_at(&app, 40, 20);
+        assert!(out.contains('行'), "CJK content should be on screen: {out}");
+        // No ESC/control bytes ever reach the buffer.
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "no control chars in the rendered transcript"
         );
     }
 }
