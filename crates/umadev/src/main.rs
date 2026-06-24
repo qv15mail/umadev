@@ -2535,6 +2535,28 @@ async fn drive_director_run(
     // guard inside `acquire_for_run`, so a lock bug never blocks a legitimate build.
     let _run_lock = umadev_agent::run_lock::RunLock::acquire_for_run(&options.project_root)?;
 
+    // Wave 6 (branch isolation): a workspace-mutating `/run` operates on a derived
+    // `umadev/<slug>` branch off HEAD — NEVER the user's working/default branch,
+    // NEVER auto-merged or pushed. Fail-open: a non-git dir / dirty tree / any error
+    // just runs in the working tree (setup_run_isolation returns None). The TUI does
+    // the same in spawn_director_loop; the CLI path must isolate too so `umadev run`
+    // from a terminal can't touch the user's main branch.
+    let slug = if options.slug.is_empty() {
+        options
+            .project_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+    } else {
+        &options.slug
+    };
+    if let Some((branch, from)) = umadev_agent::setup_run_isolation(&options.project_root, slug) {
+        events.emit(umadev_agent::EngineEvent::Note(umadev_i18n::tlf(
+            "trust.branch_isolated",
+            &[&branch, &from],
+        )));
+    }
+
     // Frame the goal for the director: a complete, ship-quality product build it
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let goal = umadev_agent::experts::director_build_directive(&options.requirement);
