@@ -237,6 +237,44 @@ pub fn read_workflow_state(project_root: &Path) -> Option<WorkflowState> {
     }
 }
 
+/// A cross-session goal-continuity summary (Wave 5 / G11 deliverable 4): when a
+/// prior session left a persisted plan (`.umadev/plan.json`) that is **not yet
+/// finished**, this returns `(next_step_title, done, total)` so the host can
+/// surface "resume goal X (step N/M)?" on launch and an `auto`-tier run can drive
+/// it to completion. Reuses the Wave-1 [`crate::plan_state`] plan (read-only — it
+/// does not modify the plan) so there is one source of truth for build progress.
+///
+/// Returns `None` when there is no plan, the plan is fully [`StepStatus::Done`],
+/// or the plan has no steps — i.e. there is nothing to resume. Fail-open by
+/// construction: `plan_state::load` already swallows a missing / corrupt file
+/// (→ `None`), so this never errors and never blocks launch.
+#[must_use]
+pub fn unfinished_plan_summary(project_root: &Path) -> Option<(String, usize, usize)> {
+    let plan = crate::plan_state::load(project_root)?;
+    let (done, total) = plan.progress();
+    if total == 0 || done >= total {
+        return None;
+    }
+    // The "next step" is the first step that isn't done yet (active, then pending,
+    // then any non-done) — what the user would resume INTO. Title falls back to
+    // the step id when a title was empty.
+    let next = plan
+        .steps
+        .iter()
+        .find(|s| s.status == crate::plan_state::StepStatus::Active)
+        .or_else(|| {
+            plan.steps
+                .iter()
+                .find(|s| s.status != crate::plan_state::StepStatus::Done)
+        })?;
+    let title = if next.title.trim().is_empty() {
+        next.id.clone()
+    } else {
+        next.title.clone()
+    };
+    Some((title, done, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +287,48 @@ mod tests {
         write_workflow_state(tmp.path(), &s).unwrap();
         let back = read_workflow_state(tmp.path()).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn unfinished_plan_summary_reports_next_step_and_progress() {
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = TempDir::new().unwrap();
+        let plan = Plan {
+            steps: vec![
+                PlanStep {
+                    id: "scaffold".into(),
+                    title: "Scaffold the app".into(),
+                    seat: Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec![],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    status: StepStatus::Done,
+                },
+                PlanStep {
+                    id: "auth".into(),
+                    title: "Add email auth".into(),
+                    seat: Seat::BackendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec!["scaffold".into()],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    status: StepStatus::Pending,
+                },
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        crate::plan_state::save(&plan, tmp.path()).unwrap();
+        let (title, done, total) = unfinished_plan_summary(tmp.path()).unwrap();
+        assert_eq!(title, "Add email auth");
+        assert_eq!((done, total), (1, 2));
+    }
+
+    #[test]
+    fn unfinished_plan_summary_is_none_when_no_plan_or_all_done() {
+        let tmp = TempDir::new().unwrap();
+        // No plan on disk → None.
+        assert!(unfinished_plan_summary(tmp.path()).is_none());
     }
 
     #[test]

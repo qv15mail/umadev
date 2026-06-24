@@ -434,6 +434,22 @@ mod tests {
             // + its objective source-present hard-stop.
             "director.run_done",
             "director.no_source_hardstop",
+            // Wave 5 (memory + conversation): persistent chat restore, the
+            // /sessions //resume //compact surfaces, cross-session goal continuity,
+            // and the new help rows.
+            "chat.restored",
+            "sessions.empty",
+            "sessions.header",
+            "resume.usage",
+            "resume.not_found",
+            "resume.done",
+            "compact.too_short",
+            "compact.summary",
+            "compact.done",
+            "session.resume_goal",
+            "tui.help.inspect.sessions",
+            "tui.help.inspect.resume",
+            "tui.help.edit.compact",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

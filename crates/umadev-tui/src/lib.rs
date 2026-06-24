@@ -801,6 +801,13 @@ struct AgenticTurn {
     /// disguising "claimed done" as success). A normal free-text turn leaves this
     /// `false` and keeps the lighter git-diff fact line only.
     director_build: bool,
+    /// **UmaDev's own bounded conversation transcript** (Wave 5 / G11) — the
+    /// multi-turn dialogue, oldest → newest, INCLUDING the current user turn the
+    /// caller just recorded. Threaded into the request so the base sees the
+    /// dialogue from UmaDev's side rather than relying solely on its `--resume`.
+    /// Bounded to a token budget inside [`drive_agentic_stream`]; empty means the
+    /// single-message request form (today's behaviour) is used.
+    conversation: Vec<Message>,
 }
 
 /// Spawn the tools-enabled agentic execution call. This is the live default
@@ -830,6 +837,7 @@ fn spawn_agentic(
         fallback_model,
         project_root,
         director_build,
+        conversation,
     } = turn;
     tokio::spawn(async move {
         let label = spec.label();
@@ -878,6 +886,7 @@ fn spawn_agentic(
             &label,
             &project_root,
             director_build,
+            &conversation,
             &sink,
             &route_tx,
         )
@@ -1308,6 +1317,51 @@ fn agentic_system_prompt(
     p
 }
 
+/// Token budget for the conversation transcript UmaDev threads into each agentic
+/// turn (Wave 5 / G11). Bounds prompt growth so a long chat can't blow the base's
+/// context: the most-recent turns within this budget are kept, older ones drop
+/// off, and the base's own `--resume` belt-and-suspenders still carries deeper
+/// history on its side. Roughly six thousand tokens is a generous multi-turn
+/// window without crowding out the system prompt and the user's current task.
+const TRANSCRIPT_TOKEN_BUDGET: usize = 6_000;
+
+/// Build the bounded prior-transcript to prepend to an agentic request: the
+/// `conversation` messages, oldest to newest, EXCLUDING a trailing message that
+/// duplicates the current `task` (the caller records the current user turn into
+/// `conversation` BEFORE this runs, so its last entry is usually the task itself,
+/// and sending it twice would double the ask). The kept window is the most-recent
+/// suffix whose estimated token cost (chars over four, the project-wide heuristic)
+/// fits `budget`. Fail-open: an empty conversation, or one that is only the
+/// current task, yields an empty `Vec` so the request is the single-message form
+/// exactly as before this wave.
+fn bounded_transcript(conversation: &[Message], task: &str, budget: usize) -> Vec<Message> {
+    // Drop a trailing user turn equal to the current task (avoid sending it twice).
+    let task_trim = task.trim();
+    let mut prior: &[Message] = conversation;
+    if let Some(last) = prior.last() {
+        if last.role == "user" && last.content.trim() == task_trim {
+            prior = &prior[..prior.len() - 1];
+        }
+    }
+    if prior.is_empty() {
+        return Vec::new();
+    }
+    // Walk newest to oldest accumulating a token estimate; keep the suffix that
+    // fits the budget. chars/4 mirrors `coach`/`director_loop::approx_tokens`.
+    let mut kept_rev: Vec<Message> = Vec::new();
+    let mut est: usize = 0;
+    for m in prior.iter().rev() {
+        let cost = (m.role.len() + m.content.len()) / 4 + 1;
+        if est + cost > budget && !kept_rev.is_empty() {
+            break;
+        }
+        est += cost;
+        kept_rev.push(m.clone());
+    }
+    kept_rev.reverse();
+    kept_rev
+}
+
 /// Build the tools-unlocked execution request and drive the base's streaming
 /// tool loop, forwarding every event to the live render pipeline and sending the
 /// terminal [`RouteDecision`] when the stream ends. Split out of [`spawn_agentic`]
@@ -1340,6 +1394,7 @@ async fn drive_agentic_stream(
     label: &str,
     project_root: &std::path::Path,
     director_build: bool,
+    conversation: &[Message],
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
@@ -1371,19 +1426,36 @@ async fn drive_agentic_stream(
         director_build,
     );
 
-    // The execution request: the user's raw task, tools UNLOCKED, no max_tokens
-    // (so the base isn't cut off mid-loop). The system prompt does NOT re-ban
-    // tools — it unlocks them and only adds the reality contract.
+    // Wave 5 / G11: thread UmaDev's OWN bounded conversation transcript into the
+    // request, oldest → newest, so the base sees the multi-turn dialogue from
+    // UmaDev's side — not just whatever the base's `--resume` happens to hold. The
+    // base `--resume` becomes belt-and-suspenders, not the only memory: a restart,
+    // a switched base, or a host that forgot its session still carries forward this
+    // transcript. `prior` is the conversation EXCLUDING the current user turn (the
+    // caller already appended it before recording), bounded to a token budget so a
+    // long history can't blow the prompt. Fail-open: an empty transcript yields the
+    // single-message request exactly as before.
+    let prior = bounded_transcript(conversation, task, TRANSCRIPT_TOKEN_BUDGET);
+    let mut messages = prior;
+    messages.push(Message {
+        role: "user".to_string(),
+        content: task.to_string(),
+    });
+    // The execution request: the bounded transcript + the user's raw task, tools
+    // UNLOCKED, no max_tokens (so the base isn't cut off mid-loop). The system
+    // prompt does NOT re-ban tools — it unlocks them and only adds the reality
+    // contract. Keep a clone for the offline-empty fallback echo below.
     let request = CompletionRequest {
         model: model.to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: task.to_string(),
-        }],
+        messages,
         max_tokens: None,
         temperature: None,
         system: Some(system),
     };
+    // Keep a clone of the request ONLY for an offline brain, so the empty-body
+    // fallback below can echo the user's ask — host-CLI turns (the hot path) skip
+    // the clone entirely.
+    let request_echo = brain.is_offline().then(|| request.clone());
     // Forward every stream event straight into the existing WorkerStream
     // render pipeline (tool calls + text deltas show live). A `Warning` event is
     // also latched into `truncated` so the terminal note can flag an incomplete
@@ -1445,6 +1517,22 @@ async fn drive_agentic_stream(
                     sink.emit(EngineEvent::Note(note));
                 }
             }
+            // Wave 5 / G11: offline chat must never read as silence. When the brain
+            // owns no model (offline) and the streamed body came back empty, the
+            // pipeline's empty-body template contract does NOT apply to a chat turn
+            // — synthesize a context-aware, non-silent reply (echo the ask + the
+            // concrete next step) and stream it so the transcript shows a real
+            // answer instead of the bare "[agentic] done." marker. Fail-open: this
+            // only fires offline + empty; a host-CLI turn is untouched.
+            if let Some(echo) = request_echo.filter(|_| reply.trim().is_empty()) {
+                let fallback = umadev_runtime::offline_chat_reply(&echo);
+                sink.emit(EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::Text {
+                        delta: fallback.clone(),
+                    },
+                });
+                reply = fallback;
+            }
             // The body already streamed live; hand the assembled text to the
             // event loop ONLY to record it as the assistant turn. An empty body
             // (the base emitted only tool calls / a side-effect) is still a clean
@@ -1496,18 +1584,36 @@ fn fire_agentic_routed(
 ) -> tokio::task::JoinHandle<()> {
     let spec = app.brain_spec();
     let host_cli = matches!(spec, BrainSpec::HostCli(_));
-    let continue_session = app.host_chat_session_active;
-    let session_id = if host_cli {
+    // Wave 5 deliverable 2: if a finished `/run` director session was just handed
+    // back to chat, the FIRST follow-up chat turn resumes the base's MOST-RECENT
+    // session in this dir (`--continue`) — that session IS the director build, so
+    // "why did you build it that way?" continues the same session with full
+    // context. `--continue` needs `session_id = None` + `continue_session = true`
+    // (the driver maps no-id + resume → `--continue`), so we DON'T mint a fresh
+    // chat id this turn. Consumed here (one-shot); subsequent turns re-pin a stable
+    // chat id as usual. Fail-open: if the base can't `--continue`, it starts fresh.
+    let handing_back = host_cli && app.run_session_handed_to_chat;
+    let continue_session = app.host_chat_session_active || handing_back;
+    let session_id = if host_cli && !handing_back {
         Some(app.ensure_chat_session_id())
     } else {
         None
     };
+    app.run_session_handed_to_chat = false;
+    // Wave 5 / G11: hand the base UmaDev's OWN bounded conversation transcript so
+    // memory no longer depends solely on the base's `--resume` (a restart, a
+    // switched base, or a host that lost its session would otherwise be amnesia).
+    let conversation = app.conversation_snapshot();
     // Keep the waiting state alive through the (potentially long) tool loop.
     app.thinking = true;
     app.thinking_started = Some(std::time::Instant::now());
     app.last_output_at = None;
     app.tool_in_progress = false;
     app.agentic_in_flight = true;
+    // Wave 5 deliverable 2: a director build (a Build-class deliberate turn) hands
+    // its session back to chat when it finishes — mark it so `record_agentic_done`
+    // knows this was a real build, not a plain chat turn.
+    app.director_run_in_flight = director_build;
     let handle = spawn_agentic(
         AgenticTurn {
             task,
@@ -1522,6 +1628,7 @@ fn fire_agentic_routed(
             // line). Fail-open: a routing failure leaves this `false` (today's
             // behaviour).
             director_build,
+            conversation,
         },
         sink.clone(),
         route_tx.clone(),
@@ -2191,6 +2298,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     app.last_output_at = None;
                                     app.tool_in_progress = false;
                                     app.agentic_in_flight = true;
+                                    // Wave 5 deliverable 2: an explicit `/run` is a
+                                    // director build — its session is handed back to
+                                    // chat when it settles (see `record_agentic_done`).
+                                    app.director_run_in_flight = true;
                                     // Remember the goal so the status bar + a later
                                     // revise see it, then build the run options for
                                     // this director build with the requirement set.
@@ -2555,6 +2666,159 @@ mod tests {
         }
     }
 
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn bounded_transcript_drops_the_duplicate_current_turn_and_keeps_order() {
+        // The caller records the current user turn into `conversation` BEFORE the
+        // turn fires, so the last entry equals `task` — it must NOT be sent twice.
+        let conv = vec![
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "build a todo app"),
+        ];
+        let prior = bounded_transcript(&conv, "build a todo app", TRANSCRIPT_TOKEN_BUDGET);
+        // The trailing duplicate of the current task is dropped; the rest is in order.
+        assert_eq!(prior.len(), 2);
+        assert_eq!(prior[0].content, "hi");
+        assert_eq!(prior[1].content, "hello");
+    }
+
+    #[test]
+    fn bounded_transcript_is_empty_when_only_the_current_turn() {
+        let conv = vec![msg("user", "just this")];
+        assert!(bounded_transcript(&conv, "just this", TRANSCRIPT_TOKEN_BUDGET).is_empty());
+        assert!(bounded_transcript(&[], "x", TRANSCRIPT_TOKEN_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn bounded_transcript_keeps_the_recent_suffix_within_budget() {
+        // A tiny budget keeps only the most-recent message(s), oldest drop off,
+        // and the result never sends the current `task` twice.
+        let mut conv = Vec::new();
+        for i in 0..50 {
+            conv.push(msg("user", &format!("question number {i}")));
+            conv.push(msg("assistant", &format!("answer number {i}")));
+        }
+        conv.push(msg("user", "current ask"));
+        let prior = bounded_transcript(&conv, "current ask", 20);
+        // Budget-bounded: a small suffix, not the whole 100-message history.
+        assert!(!prior.is_empty());
+        assert!(prior.len() < 100);
+        // The kept window is the most-recent suffix (ends near the latest answer).
+        assert!(prior.last().unwrap().content.contains("answer number 49"));
+    }
+
+    /// A runtime spy that CAPTURES the request it was driven with, so a test can
+    /// assert the conversation transcript was threaded into the messages.
+    struct CapturingSpy {
+        seen: Arc<std::sync::Mutex<Option<CompletionRequest>>>,
+    }
+    #[async_trait::async_trait]
+    impl Runtime for CapturingSpy {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            unreachable!("agentic path uses streaming")
+        }
+        async fn complete_streaming(
+            &self,
+            req: CompletionRequest,
+            on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            *self.seen.lock().unwrap() = Some(req);
+            on_event(umadev_runtime::StreamEvent::Text { delta: "ok".into() });
+            Ok(umadev_runtime::CompletionResponse {
+                text: "ok".into(),
+                id: "spy".into(),
+                model: "spy".into(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_turn_threads_the_conversation_transcript_into_the_request() {
+        // Wave 5 / G11: UmaDev's OWN bounded transcript is sent every turn (not just
+        // the single task), so memory no longer relies solely on the base's --resume.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let spy = CapturingSpy {
+            seen: Arc::clone(&seen),
+        };
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conversation = vec![
+            msg("user", "我在做看板"),
+            msg("assistant", "好的"),
+            msg("user", "继续"),
+        ];
+        drive_agentic_stream(
+            &spy,
+            "继续",
+            "m",
+            "claude-code",
+            tmp.path(),
+            false,
+            &conversation,
+            &sink,
+            &route_tx,
+        )
+        .await;
+        let req = seen.lock().unwrap().take().expect("request captured");
+        // The request carries the prior dialogue + the current task (last), in order,
+        // and does NOT duplicate the current "继续" turn.
+        assert!(
+            req.messages.len() >= 3,
+            "transcript threaded: {:?}",
+            req.messages
+        );
+        assert_eq!(req.messages[0].content, "我在做看板");
+        assert_eq!(req.messages.last().unwrap().content, "继续");
+        let continues = req.messages.iter().filter(|m| m.content == "继续").count();
+        assert_eq!(continues, 1, "current turn must not be sent twice");
+    }
+
+    #[tokio::test]
+    async fn offline_chat_never_returns_silence() {
+        // Wave 5 / G11: an offline chat turn with an empty body gets a context-aware
+        // fallback reply (echoing the ask), never the bare "[agentic] done." silence.
+        let brain = OfflineRuntime::new(RuntimeKind::Anthropic);
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tmp = tempfile::TempDir::new().unwrap();
+        drive_agentic_stream(
+            &brain,
+            "帮我做个登录页",
+            "m",
+            "offline",
+            tmp.path(),
+            false,
+            &[],
+            &sink,
+            &route_tx,
+        )
+        .await;
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone(reply)) => {
+                assert!(!reply.trim().is_empty(), "offline reply must not be empty");
+                assert!(reply.contains("帮我做个登录页"), "echoes the ask: {reply}");
+            }
+            other => panic!("expected a non-empty AgenticDone, got {other:?}"),
+        }
+    }
+
     #[test]
     fn detect_base_model_reads_each_base_config() {
         // The base's OWN model is read from its own config, in the base's order.
@@ -2708,6 +2972,7 @@ mod tests {
             "claude-code",
             tmp.path(),
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -2808,6 +3073,7 @@ mod tests {
             "claude-code",
             tmp.path(),
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -3105,6 +3371,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -3145,6 +3412,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -3185,6 +3453,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -3223,6 +3492,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &[],
             &sink,
             &route_tx,
         )
@@ -3318,6 +3588,7 @@ mod tests {
             "claude-code",
             &path,
             true, // director_build
+            &[],
             &sink,
             &route_tx,
         )

@@ -2248,6 +2248,14 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("/config", umadev_i18n::t(lang, "tui.help.inspect.config")),
                     ("/doctor", umadev_i18n::t(lang, "tui.help.inspect.doctor")),
                     ("/history", umadev_i18n::t(lang, "tui.help.inspect.history")),
+                    (
+                        "/sessions",
+                        umadev_i18n::t(lang, "tui.help.inspect.sessions"),
+                    ),
+                    (
+                        "/resume <id>",
+                        umadev_i18n::t(lang, "tui.help.inspect.resume"),
+                    ),
                     ("/version", umadev_i18n::t(lang, "tui.help.inspect.version")),
                     (
                         "/changelog",
@@ -2263,6 +2271,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("Shift+Enter", umadev_i18n::t(lang, "tui.help.edit.newline")),
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
+                    ("/compact", umadev_i18n::t(lang, "tui.help.edit.compact")),
                     ("/clear", umadev_i18n::t(lang, "tui.help.edit.clear")),
                     ("/help or /?", umadev_i18n::t(lang, "tui.help.edit.help")),
                     ("/quit or q", umadev_i18n::t(lang, "tui.help.edit.quit")),

@@ -299,6 +299,67 @@ impl Default for OfflineRuntime {
     }
 }
 
+/// Build a **context-aware, non-silent** offline chat reply from a request.
+///
+/// The offline runtime owns no model, so [`OfflineRuntime::complete`] returns an
+/// empty body on purpose — the *pipeline* relies on that empty body to fall back
+/// to its deterministic artifact templates (see the crate doc + the `is_empty()`
+/// checks in `umadev-agent::phases`). But a *chat* turn driven offline must NOT
+/// read as silence: an empty reply leaves the user staring at a dead prompt
+/// (Wave 5 / gap G11, "offline chat returns empty").
+///
+/// This is the chat-side counterpart: given the same [`CompletionRequest`], it
+/// returns a short, deterministic, **context-aware** acknowledgement that names
+/// the user's last ask back to them and points at the real fix (select a base
+/// CLI), so the offline chat surface stays honest and responsive without
+/// pretending to think. The caller (the TUI chat path) uses it ONLY when the
+/// brain `is_offline()` and the streamed body came back empty — so the pipeline's
+/// empty-body template contract is untouched.
+///
+/// Fail-open by construction: it never errors and never returns an empty string
+/// (an empty / whitespace-only task still yields the base-less guidance line).
+#[must_use]
+pub fn offline_chat_reply(req: &CompletionRequest) -> String {
+    // The user's last turn is the most-recent `user` message (the actual ask);
+    // fall back to the final message of any role, then to empty.
+    let last_user = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| req.messages.last())
+        .map_or("", |m| m.content.trim());
+    // A compact, single-line echo of the ask so the reply is visibly ABOUT what
+    // the user said (context-aware), capped so a long paste doesn't flood the
+    // transcript. Char-boundary safe (`char_indices`), so multibyte CJK is never
+    // split mid-codepoint.
+    let echo: String = {
+        let one_line: String = last_user.split_whitespace().collect::<Vec<_>>().join(" ");
+        match one_line.char_indices().nth(120) {
+            Some((idx, _)) => format!("{}…", &one_line[..idx]),
+            None => one_line,
+        }
+    };
+    if echo.is_empty() {
+        // No ask to echo — still never silent: the base-less guidance line.
+        "[offline] No base CLI is connected, so I can't think this through yet. \
+         Pick a base with /claude, /codex or /opencode (or run `umadev` again to \
+         re-open the picker), and I'll pick up the conversation with full context. \
+         離線:尚未连接底座 CLI / 離線:尚未連接底座 CLI。"
+            .to_string()
+    } else {
+        // Echo the ask + the concrete next step. Bilingual tail mirrors the rest
+        // of the offline surfaces (the catalogs gate full i18n; this is the
+        // runtime-crate floor, which has no i18n dep on purpose).
+        format!(
+            "[offline] I heard: \u{201c}{echo}\u{201d} — but no base CLI is connected, \
+             so I can't actually work on it yet. Connect a base with /claude, /codex \
+             or /opencode and ask again; I'll keep this conversation's context. \
+             離線:已收到你的需求,但尚未连接底座 / 已收到你的需求,但尚未連接底座。"
+        )
+    }
+}
+
 #[async_trait]
 impl Runtime for OfflineRuntime {
     fn kind(&self) -> RuntimeKind {
@@ -310,6 +371,10 @@ impl Runtime for OfflineRuntime {
     }
 
     async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {
+        // Intentionally empty: the PIPELINE path keys off an empty offline body to
+        // fall back to its deterministic artifact templates. The CHAT path never
+        // ships this silence — it calls [`offline_chat_reply`] when the brain is
+        // offline and the body is empty (Wave 5 / G11). Do not return text here.
         Ok(CompletionResponse {
             text: String::new(),
             id: "offline".to_string(),
@@ -491,4 +556,73 @@ pub trait BaseSession: Send {
 
     /// Close the session and release the underlying process / server.
     async fn end(&mut self) -> Result<(), SessionError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(messages: Vec<(&str, &str)>) -> CompletionRequest {
+        CompletionRequest {
+            model: "offline".into(),
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| Message {
+                    role: role.into(),
+                    content: content.into(),
+                })
+                .collect(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+        }
+    }
+
+    #[test]
+    fn offline_chat_reply_echoes_the_last_user_ask_and_is_never_empty() {
+        // Wave 5 / G11: offline chat must NOT return silence — the reply names the
+        // user's ask back to them and points at the fix (connect a base).
+        let r = offline_chat_reply(&req(vec![
+            ("user", "build me a todo app"),
+            ("assistant", "ok"),
+            ("user", "actually make it a kanban board"),
+        ]));
+        assert!(!r.trim().is_empty());
+        assert!(
+            r.contains("kanban board"),
+            "should echo the LAST user ask: {r}"
+        );
+        assert!(
+            r.contains("/claude"),
+            "should point at connecting a base: {r}"
+        );
+    }
+
+    #[test]
+    fn offline_chat_reply_with_no_ask_still_guides_to_a_base() {
+        // An empty / whitespace-only ask still yields the base-less guidance line,
+        // never an empty string.
+        let r = offline_chat_reply(&req(vec![("user", "   ")]));
+        assert!(!r.trim().is_empty());
+        assert!(r.contains("/codex") || r.contains("base CLI"));
+    }
+
+    #[test]
+    fn offline_chat_reply_caps_a_long_ask_on_a_char_boundary() {
+        // A long multibyte ask is truncated with an ellipsis on a char boundary
+        // (no panic from slicing mid-codepoint).
+        let long = "用".repeat(300);
+        let r = offline_chat_reply(&req(vec![("user", &long)]));
+        assert!(!r.is_empty());
+        assert!(r.contains('\u{2026}'), "long ask should be elided: {r}");
+    }
+
+    #[tokio::test]
+    async fn offline_complete_stays_empty_for_the_pipeline_template_contract() {
+        // The pipeline keys off an EMPTY offline body to fall back to templates;
+        // `complete` must keep returning empty even though chat has its own reply.
+        let rt = OfflineRuntime::default();
+        let resp = rt.complete(req(vec![("user", "hi")])).await.unwrap();
+        assert!(resp.text.is_empty());
+    }
 }

@@ -441,6 +441,32 @@ pub struct App {
     /// Reset (to `None`) at the same points as [`Self::host_chat_session_active`].
     pub chat_session_id: Option<String>,
 
+    /// **Persistent chat id** (Wave 5 / G11) — the stable id of the on-disk
+    /// `.umadev/chat/<id>.json` that mirrors [`Self::conversation`] so a restart
+    /// reopens the same dialogue instead of amnesia. Distinct from
+    /// [`Self::chat_session_id`] (the BASE session pin, which the base may rotate):
+    /// this id names the SAVED transcript and survives `/clear` re-mints. Minted at
+    /// construction; `/resume <id>` swaps it to an existing saved chat; `/clear`
+    /// starts a fresh one. Fail-open: every persist/load is best-effort — a write
+    /// failure or corrupt file degrades to the live in-memory buffer, never a crash.
+    pub(crate) chat_id: String,
+
+    /// `true` once the run loop has handed a finished `/run` director session back
+    /// to chat (Wave 5 deliverable 2). The NEXT chat turn then resumes the base's
+    /// most-recent session in this dir (`--continue`, i.e. `session_id = None` +
+    /// `continue_session = true`) so "why did you build it that way?" continues the
+    /// SAME session that did the build — not a disjoint cold one. Consumed (reset)
+    /// once that first post-run chat turn fires. Fail-open: if the resume misses,
+    /// the base starts fresh (today's behaviour).
+    pub(crate) run_session_handed_to_chat: bool,
+
+    /// `true` while an explicit `/run` **director build** is the in-flight agentic
+    /// turn (Wave 5 deliverable 2). Set when the director loop is launched, read
+    /// when its terminal `AgenticDone` lands so the finished build session is handed
+    /// back to chat (sets [`Self::run_session_handed_to_chat`]); a PLAIN chat turn
+    /// leaves it `false` so the handoff fires ONLY after a real build.
+    pub(crate) director_run_in_flight: bool,
+
     /// Currently active backend id (matches `config.backend`).
     /// `None` means offline / no host CLI.
     pub backend: Option<String>,
@@ -700,6 +726,11 @@ impl App {
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
+            // A fresh persistent-chat id; `load_chat_for_launch` below may replace
+            // it with the most-recent saved chat so a restart reopens the dialogue.
+            chat_id: new_chat_session_id(),
+            run_session_handed_to_chat: false,
+            director_run_in_flight: false,
             backend,
             backend_label,
             slug: slug.into(),
@@ -747,7 +778,12 @@ impl App {
         app.load_history();
         if app.mode == AppMode::Chat {
             app.push_greeting();
+            // Wave 5 / G11: reopen the most-recent saved chat so a restart keeps
+            // the conversation instead of amnesia. Fail-open: no saved chat (or a
+            // corrupt one) leaves the fresh empty buffer + freshly-minted id.
+            app.load_chat_for_launch();
             app.maybe_push_resume_hint();
+            app.maybe_push_goal_continuity();
         }
         app.refresh_status();
         app
@@ -811,6 +847,131 @@ impl App {
         let _ = std::fs::write(path, lines.join("\n"));
     }
 
+    /// Directory holding this project's persisted chats (Wave 5 / G11):
+    /// `.umadev/chat/`. One `<id>.json` per saved chat so a restart can reopen
+    /// the dialogue and `/sessions` can list them.
+    fn chat_dir(&self) -> std::path::PathBuf {
+        self.project_root.join(".umadev").join("chat")
+    }
+
+    /// The on-disk path for a chat by id: `.umadev/chat/<id>.json`.
+    fn chat_path(&self, id: &str) -> std::path::PathBuf {
+        self.chat_dir().join(format!("{id}.json"))
+    }
+
+    /// Persist the live conversation to `.umadev/chat/<chat_id>.json`, **atomically**
+    /// (write a temp sibling, then rename — the same temp-then-rename pattern
+    /// `config::save_to` uses, so a crash mid-write never corrupts the saved chat).
+    ///
+    /// Best-effort + **fail-open**: an empty conversation writes nothing (no empty
+    /// file litter), and ANY IO / serialise error is swallowed — a failed persist
+    /// must never block a chat turn or crash the TUI. Called after every recorded
+    /// turn (user + assistant) so the saved transcript tracks the live one.
+    pub(crate) fn persist_chat(&self) {
+        if self.conversation.is_empty() {
+            return;
+        }
+        let session = ChatSession {
+            id: self.chat_id.clone(),
+            updated_at: now_iso8601(),
+            backend: self.backend.clone().unwrap_or_default(),
+            messages: self.conversation.clone(),
+        };
+        let Ok(body) = serde_json::to_string_pretty(&session) else {
+            return;
+        };
+        let dir = self.chat_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let final_path = self.chat_path(&self.chat_id);
+        // Temp sibling in the SAME dir so the rename is atomic on POSIX/Windows.
+        let tmp = dir.join(format!("{}.json.tmp-{}", self.chat_id, std::process::id()));
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &final_path);
+        }
+    }
+
+    /// List persisted chats for this project, most-recently-updated first (Wave 5).
+    /// Returns `(id, updated_at, turn_count, preview)` tuples. Fail-open: a missing
+    /// dir / unreadable / corrupt file yields an empty list (never an error).
+    pub(crate) fn list_chats(&self) -> Vec<(String, String, usize, String)> {
+        let mut out: Vec<(String, String, usize, String)> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.chat_dir()) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(session) = serde_json::from_str::<ChatSession>(&text) else {
+                continue;
+            };
+            // First user message as a short preview so the list is recognisable.
+            let preview = session
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| {
+                    let line: String = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match line.char_indices().nth(48) {
+                        Some((i, _)) => format!("{}…", &line[..i]),
+                        None => line,
+                    }
+                })
+                .unwrap_or_default();
+            out.push((
+                session.id,
+                session.updated_at,
+                session.messages.len(),
+                preview,
+            ));
+        }
+        // Most-recent first by the ISO-8601 timestamp (lexicographic == chronological).
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
+    /// Load a saved chat by id into the live buffer (Wave 5 / `/resume <id>`).
+    /// Returns `true` on success. Fail-open: a missing / corrupt / empty file
+    /// returns `false` and leaves the live conversation untouched.
+    pub(crate) fn load_chat(&mut self, id: &str) -> bool {
+        let Ok(text) = std::fs::read_to_string(self.chat_path(id)) else {
+            return false;
+        };
+        let Ok(session) = serde_json::from_str::<ChatSession>(&text) else {
+            return false;
+        };
+        if session.messages.is_empty() {
+            return false;
+        }
+        self.conversation = session.messages;
+        self.trim_conversation();
+        self.chat_id = session.id;
+        true
+    }
+
+    /// On launch (Chat mode), reopen the most-recently-updated saved chat so the
+    /// dialogue survives a restart (Wave 5 / G11). Fail-open: no saved chat leaves
+    /// the fresh empty buffer + freshly-minted [`Self::chat_id`]. Surfaces a short
+    /// system note so the user knows prior context was restored.
+    fn load_chat_for_launch(&mut self) {
+        let Some((id, _, _, _)) = self.list_chats().into_iter().next() else {
+            return;
+        };
+        if self.load_chat(&id) {
+            let n = self.conversation.len();
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "chat.restored", &[&n.to_string()]),
+            );
+        }
+    }
+
     /// If a `.umadev/workflow-state.json` exists in the workspace
     /// (meaning a prior session left the pipeline mid-flight), surface
     /// it as a system message so the user can resume with `/continue`
@@ -842,6 +1003,28 @@ impl App {
                 umadev_i18n::tf(self.lang, "session.unfinished", &[&state.phase, &req]),
             );
         }
+    }
+
+    /// Wave 5 / G11 deliverable 4 — cross-session goal continuity. If a prior
+    /// session left an unfinished plan (`.umadev/plan.json`, persisted by Wave 1),
+    /// surface "resume goal X (step N/M)?" on launch so the user can pick the build
+    /// back up with `/run` (or, in `auto` tier, be driven to completion). Read-only
+    /// over the existing plan; fail-open: no plan / a finished plan / a corrupt file
+    /// all push nothing.
+    fn maybe_push_goal_continuity(&mut self) {
+        let Some((next_step, done, total)) =
+            umadev_agent::unfinished_plan_summary(&self.project_root)
+        else {
+            return;
+        };
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(
+                self.lang,
+                "session.resume_goal",
+                &[&next_step, &done.to_string(), &total.to_string()],
+            ),
+        );
     }
 
     fn push(&mut self, role: ChatRole, body: impl Into<String>) {
@@ -1340,6 +1523,9 @@ impl App {
         ("doctor", "self-test"),
         ("diff", "show an artifact (default: PRD)"),
         ("history", "show the conversation history"),
+        ("sessions", "list saved chats you can /resume"),
+        ("resume", "reopen a saved chat (/resume <id>)"),
+        ("compact", "summarize-and-fold the chat to free up context"),
         ("changelog", "show CHANGELOG.md"),
         ("version", "show umadev / spec / worker versions"),
         ("help", "show all keybindings"),
@@ -2804,6 +2990,8 @@ impl App {
             content: text.to_string(),
         });
         self.trim_conversation();
+        // Wave 5 / G11: mirror the live buffer to disk so a restart reopens it.
+        self.persist_chat();
     }
 
     #[cfg(test)]
@@ -2849,6 +3037,9 @@ impl App {
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
+        // A failed director run does NOT hand a session back to chat (there is no
+        // settled build session to continue) — just clear the in-flight marker.
+        self.director_run_in_flight = false;
         self.refresh_status();
         self.push(ChatRole::System, note);
     }
@@ -2865,6 +3056,17 @@ impl App {
         self.tool_in_progress = false;
         self.stream_text_active = false;
         self.stream_tool_batch = None;
+        // Wave 5 deliverable 2 — unify chat ↔ /run memory. A finished director
+        // `/run` hands its session back to chat: the NEXT chat turn resumes the
+        // base's most-recent session in this dir (`--continue`) so "why did you
+        // build it that way?" continues the SAME session that did the build, with
+        // full context — instead of a disjoint cold chat session. Only fires after a
+        // real director build (a plain chat turn leaves `director_run_in_flight`
+        // false). Fail-open: if the base can't resume, it starts fresh.
+        if self.director_run_in_flight {
+            self.director_run_in_flight = false;
+            self.run_session_handed_to_chat = true;
+        }
         self.refresh_status();
         let reply = reply.trim().to_string();
         if reply.is_empty() {
@@ -2882,6 +3084,9 @@ impl App {
             content: reply,
         });
         self.trim_conversation();
+        // Wave 5 / G11: persist after the assistant turn lands so the saved chat
+        // holds complete user→assistant exchanges.
+        self.persist_chat();
     }
 
     /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
@@ -2906,8 +3111,9 @@ impl App {
         self.queued_chat.len() + self.queued_steer.len()
     }
 
-    #[cfg(test)]
-    /// A bounded clone of the conversation memory to hand to a routed turn.
+    /// A clone of the conversation memory to hand to a routed turn (Wave 5 / G11).
+    /// The receiver (`drive_agentic_stream`) bounds it to a token budget before
+    /// threading it into the request, so this is a plain clone of the live buffer.
     #[must_use]
     pub(crate) fn conversation_snapshot(&self) -> Vec<umadev_runtime::Message> {
         self.conversation.clone()
@@ -3021,6 +3227,8 @@ impl App {
         // clear its flag so a later Ctrl-C doesn't think one is still running.
         self.agentic_in_flight = false;
         self.tool_in_progress = false;
+        // A cancelled director run hands nothing back to chat.
+        self.director_run_in_flight = false;
         // Drop chat turns parked behind the in-flight route so they can't fire
         // into a freshly-reset state.
         self.queued_chat.clear();
@@ -3075,6 +3283,11 @@ impl App {
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
                 self.chat_session_id = None;
+                self.run_session_handed_to_chat = false;
+                // Wave 5 / G11: `/clear` starts a FRESH persistent chat — mint a new
+                // id so the prior saved chat stays on disk (resumable via /resume)
+                // and the next turn persists under the new id.
+                self.chat_id = new_chat_session_id();
                 self.push(
                     ChatRole::System,
                     umadev_i18n::t(self.lang, "slash.history_cleared"),
@@ -3206,6 +3419,10 @@ impl App {
                 self.open_history_overlay();
                 Action::None
             }
+            // Wave 5 / G11: conversation memory surfaces.
+            "sessions" => self.slash_sessions(),
+            "resume" => self.slash_resume(rest),
+            "compact" => self.slash_compact(),
             "manual" => self.slash_set_review_mode(false),
             "auto" => self.slash_set_review_mode(true),
             "mode" => self.slash_mode(rest),
@@ -3374,6 +3591,122 @@ impl App {
             }
         }
         best
+    }
+
+    /// `/sessions` — list this project's persisted chats (Wave 5 / G11), most
+    /// recent first, so the user can pick one to `/resume`. Fail-open: no saved
+    /// chats just says so.
+    fn slash_sessions(&mut self) -> Action {
+        let chats = self.list_chats();
+        if chats.is_empty() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "sessions.empty"),
+            );
+            return Action::None;
+        }
+        let mut body = String::new();
+        for (id, updated, turns, preview) in &chats {
+            // Mark the currently-open chat so the user knows where they are.
+            let here = if *id == self.chat_id { "* " } else { "  " };
+            body.push_str(&format!("{here}{id}  ({updated}, {turns})  {preview}\n"));
+        }
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "sessions.header", &[&body]),
+        );
+        Action::None
+    }
+
+    /// `/resume <id>` — load a saved chat into the live buffer (Wave 5 / G11) and
+    /// point the base at its own session for that chat. Fail-open: a missing id or
+    /// a corrupt file leaves the current conversation untouched and explains why.
+    fn slash_resume(&mut self, arg: &str) -> Action {
+        let id = arg.trim();
+        if id.is_empty() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "resume.usage"));
+            return Action::None;
+        }
+        if !self.load_chat(id) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "resume.not_found", &[id]),
+            );
+            return Action::None;
+        }
+        // The transcript is back; pin the base session to this chat id so a
+        // host CLI resumes ITS OWN conversation for this chat (claude `--resume
+        // <id>`), and clear any pending run-handoff (we explicitly chose a chat).
+        self.chat_session_id = Some(id.to_string());
+        self.host_chat_session_active = true;
+        self.run_session_handed_to_chat = false;
+        let n = self.conversation.len();
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "resume.done", &[id, &n.to_string()]),
+        );
+        Action::None
+    }
+
+    /// `/compact` — token-budgeted summarize-and-fold of the conversation (Wave 5
+    /// / G11), replacing the blunt FIFO-drop-at-16 with a deterministic, fail-open
+    /// fold: collapse the older half of the transcript into ONE compact summary
+    /// message, keeping the recent tail verbatim, so long chats stay within budget
+    /// WITHOUT silently losing the whole early context. Deterministic (no brain
+    /// call, so it never blocks or depends on a base); the base still sees the
+    /// recent turns verbatim + a labelled digest of what came before.
+    fn slash_compact(&mut self) -> Action {
+        let before = self.conversation.len();
+        if before <= 4 {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "compact.too_short"),
+            );
+            return Action::None;
+        }
+        // Keep the most-recent quarter (at least 4) verbatim; fold the rest.
+        let keep = (before / 4).max(4).min(before);
+        let split = before - keep;
+        let folded: Vec<umadev_runtime::Message> = self.conversation.drain(0..split).collect();
+        // Build a compact, role-tagged digest of the folded prefix, capped so the
+        // summary itself can't reintroduce the bloat we just removed.
+        let mut digest = String::new();
+        for m in &folded {
+            let line: String = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let snippet = match line.char_indices().nth(160) {
+                Some((i, _)) => format!("{}…", &line[..i]),
+                None => line,
+            };
+            if !snippet.is_empty() {
+                digest.push_str(&format!("- {}: {snippet}\n", m.role));
+            }
+        }
+        let summary = umadev_i18n::tf(
+            self.lang,
+            "compact.summary",
+            &[&folded.len().to_string(), &digest],
+        );
+        // Prepend the summary as a `user`-role context note (the base treats it as
+        // grounding it must honour, like a recap). Then re-bound to the cap.
+        self.conversation.insert(
+            0,
+            umadev_runtime::Message {
+                role: "user".to_string(),
+                content: summary,
+            },
+        );
+        self.trim_conversation();
+        self.persist_chat();
+        let after = self.conversation.len();
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(
+                self.lang,
+                "compact.done",
+                &[&before.to_string(), &after.to_string()],
+            ),
+        );
+        Action::None
     }
 
     fn slash_backend(&mut self, backend: Option<&str>) -> Action {
@@ -5772,6 +6105,53 @@ impl App {
 /// validates the format). Entropy mixes wall-clock nanoseconds, a per-process
 /// atomic counter, and the pid, so two ids minted back-to-back in the same
 /// process still differ. No external crate (UmaDev stays dependency-light).
+/// A persisted chat session (Wave 5 / G11) — the on-disk mirror of
+/// [`App::conversation`], one JSON file per saved chat under `.umadev/chat/`. The
+/// schema is deliberately small and forward-compatible (`#[serde(default)]` on the
+/// soft fields) so an older file still loads after a field is added.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChatSession {
+    /// Stable chat id (the file stem). Pairs with [`App::chat_id`].
+    pub id: String,
+    /// ISO-8601 UTC timestamp of the last persist — drives most-recent ordering
+    /// in `/sessions` and the launch-time "reopen most recent" pick.
+    #[serde(default)]
+    pub updated_at: String,
+    /// Backend id that produced this chat (advisory; for the listing).
+    #[serde(default)]
+    pub backend: String,
+    /// The conversation transcript, oldest → newest.
+    pub messages: Vec<umadev_runtime::Message>,
+}
+
+/// A best-effort ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) WITHOUT pulling
+/// in `chrono` — the TUI crate stays dependency-light. Derived from the Unix
+/// epoch via a plain civil-date conversion (days-from-epoch → Y/M/D). Used only
+/// for human-facing ordering/labels, so a leap-second-level imprecision is fine.
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let (hh, mm, ss) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch = 1970-01-01. `days` is
+    // small (well under i64::MAX for any plausible clock), so the conversion can't
+    // realistically fail; fall back to 0 on the impossible overflow rather than
+    // panicking — this is a cosmetic timestamp.
+    let z = i64::try_from(days).unwrap_or(0) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
 fn new_chat_session_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6396,8 +6776,11 @@ mod tests {
         };
         // Each test gets a unique workspace dir to avoid file races between
         // parallel tests. The .umadevrc disables auto_approve_gates so
-        // gate-card tests see the manual-approval path.
+        // gate-card tests see the manual-approval path. Remove any leftover dir
+        // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
+        // bleed into a test that expects a clean conversation buffer.
         let workspace = std::path::PathBuf::from(format!("/tmp/sd-test-ws-{id}"));
+        let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&workspace);
         let _ = std::fs::write(
             workspace.join(".umadevrc"),
@@ -6661,6 +7044,151 @@ mod tests {
             app.conversation.last().unwrap().content,
             format!("msg {}", CONVERSATION_CAP * 2 - 1)
         );
+    }
+
+    /// Build an app rooted at a UNIQUE temp dir so the `.umadev/chat/` persistence
+    /// tests don't collide with each other or the shared `/tmp/sd-test-ws-*` dirs.
+    fn temp_app() -> (App, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = UserConfig {
+            backend: Some("claude-code".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        let app = App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        (app, tmp)
+    }
+
+    #[test]
+    fn chat_persists_and_a_restart_reopens_the_conversation() {
+        // Wave 5 / G11: a restart must reopen the SAME dialogue (no goldfish).
+        let (mut app, tmp) = temp_app();
+        app.record_user_turn("我在做一个看板应用");
+        app.record_agentic_done("好的,已经开始搭建。".to_string());
+        let saved_id = app.chat_id.clone();
+        assert_eq!(app.conversation.len(), 2);
+
+        // Simulate a restart: a brand-new App over the SAME project root.
+        let cfg = UserConfig {
+            backend: Some("claude-code".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        let app2 = App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        // The most-recent saved chat is reopened: same id, same transcript.
+        assert_eq!(app2.chat_id, saved_id, "restart reopens the saved chat id");
+        assert_eq!(app2.conversation.len(), 2);
+        assert_eq!(app2.conversation[0].content, "我在做一个看板应用");
+        assert_eq!(app2.conversation[1].role, "assistant");
+        // The restore note is surfaced so the user knows context was kept.
+        assert!(app2
+            .history
+            .iter()
+            .any(|m| m.role == ChatRole::System && m.body.contains("恢复")));
+    }
+
+    #[test]
+    fn slash_sessions_lists_saved_chats_and_resume_reopens_one() {
+        let (mut app, _tmp) = temp_app();
+        // Chat A.
+        app.record_user_turn("第一个对话");
+        app.record_agentic_done("reply A".to_string());
+        let id_a = app.chat_id.clone();
+        // `/clear` starts a FRESH persistent chat (A stays on disk).
+        let _ = app.try_slash_command("/clear");
+        assert_ne!(app.chat_id, id_a, "/clear mints a new chat id");
+        app.record_user_turn("第二个对话");
+        app.record_agentic_done("reply B".to_string());
+
+        // `/sessions` lists BOTH saved chats.
+        let _ = app.try_slash_command("/sessions");
+        assert!(app
+            .history
+            .iter()
+            .any(|m| m.body.contains(&id_a) && m.body.contains("已保存")));
+
+        // `/resume <id_a>` reopens chat A's transcript.
+        let _ = app.try_slash_command(&format!("/resume {id_a}"));
+        assert_eq!(app.chat_id, id_a);
+        assert_eq!(app.conversation[0].content, "第一个对话");
+        // The base session is pinned to the resumed chat so it continues its own.
+        assert_eq!(app.chat_session_id.as_deref(), Some(id_a.as_str()));
+        assert!(app.host_chat_session_active);
+    }
+
+    #[test]
+    fn resume_unknown_id_is_fail_open() {
+        let (mut app, _tmp) = temp_app();
+        app.record_user_turn("hi");
+        let before = app.conversation.clone();
+        let _ = app.try_slash_command("/resume does-not-exist");
+        // The live conversation is untouched; a clear note explains why.
+        assert_eq!(app.conversation, before);
+        assert!(app
+            .history
+            .iter()
+            .any(|m| m.role == ChatRole::System && m.body.contains("没找到")));
+    }
+
+    #[test]
+    fn slash_compact_folds_the_conversation_within_budget() {
+        // Wave 5 / G11: /compact summarize-and-folds instead of FIFO-dropping, so a
+        // long chat shrinks WITHOUT losing the whole early context.
+        let (mut app, _tmp) = temp_app();
+        for i in 0..12 {
+            app.record_user_turn(&format!("user message {i}"));
+            app.record_agentic_done(format!("assistant reply {i}"));
+        }
+        let before = app.conversation.len();
+        let _ = app.try_slash_command("/compact");
+        let after = app.conversation.len();
+        assert!(
+            after < before,
+            "compact must shrink the buffer: {before}->{after}"
+        );
+        // The fold keeps a leading summary message that references the folded count.
+        assert_eq!(app.conversation[0].role, "user");
+        assert!(
+            app.conversation[0].content.contains("摘要"),
+            "first message after compact is the folded summary"
+        );
+        // The most-recent turn is preserved verbatim.
+        assert_eq!(
+            app.conversation.last().unwrap().content,
+            "assistant reply 11"
+        );
+    }
+
+    #[test]
+    fn director_run_finish_hands_session_back_to_chat() {
+        // Wave 5 deliverable 2: a finished `/run` hands its session to chat so the
+        // next chat turn continues the SAME build session.
+        let (mut app, _tmp) = temp_app();
+        app.director_run_in_flight = true;
+        app.record_agentic_done("built the app".to_string());
+        assert!(
+            app.run_session_handed_to_chat,
+            "a finished director run hands its session back to chat"
+        );
+        assert!(
+            !app.director_run_in_flight,
+            "the in-flight marker is cleared"
+        );
+
+        // A PLAIN chat turn does NOT trigger the handoff.
+        app.run_session_handed_to_chat = false;
+        app.record_agentic_done("just chatting".to_string());
+        assert!(!app.run_session_handed_to_chat);
     }
 
     #[test]
