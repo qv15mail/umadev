@@ -177,12 +177,14 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // ── Layer 2: 心法 / anti-slop (work-class only) ──────────────────────────
     if tier.wants_craft() {
         fw.push_block(agentic_engineering_rules());
-        // The full anti-slop law is reserved for a real build (its visual moat is
-        // load-bearing there); a quick edit gets only the compact craft block
-        // above so it stays light.
-        if matches!(tier, FirmwareTier::Full) {
-            fw.push_block(ANTI_SLOP_LAW);
-        }
+        // The full anti-slop / design-system law leads EVERY work turn, not just a
+        // deliberate /run build: a chat-promoted build (the light resident-session
+        // path) writes real UI too, and its visual quality is exactly the "moat" the
+        // user judges. ANTI_SLOP_LAW is a STATIC string (no retrieval / no I/O), so
+        // carrying it on the work-class head costs nothing on latency — the slow
+        // layers are the JIT repo-map + knowledge below, which stay gated. Without
+        // this, a UI built from chat skipped the design system and read as AI-slop.
+        fw.push_block(ANTI_SLOP_LAW);
     }
 
     // The always-on head (identity + craft) is now fully in `buf` and can no longer
@@ -452,9 +454,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_edit_is_craft_tier_no_anti_slop_no_retrieval() {
-        // A fast quick-edit gets the compact craft block (the moat) but NOT the
-        // heavyweight anti-slop law and NOT the JIT retrieval — it stays light.
+    async fn quick_edit_carries_the_full_design_system_but_no_slow_retrieval() {
+        // The design-system / anti-slop law is ALWAYS-ON for any work turn (a
+        // quick-edit or a chat-promoted build writes real UI too — its visual
+        // quality is the moat the user judges). It's a STATIC string, so it costs
+        // nothing on latency. What stays gated is the SLOW JIT retrieval (repo-map /
+        // knowledge / memory) — those do real I/O, so a fast turn skips them and the
+        // base reads what it needs via its own tools.
         let tmp = tempfile::TempDir::new().unwrap();
         let r = route(RouteClass::QuickEdit, Depth::Fast, Vec::new());
         let fw = compose_firmware(tmp.path(), &r, "改个文案").await;
@@ -463,10 +469,10 @@ mod tests {
             "craft present on a work turn"
         );
         assert!(
-            !fw.contains("ANTI-AI-SLOP"),
-            "no heavy anti-slop on a quick edit"
+            fw.contains("ANTI-AI-SLOP"),
+            "the design-system law is always-on for a work turn (every UI must be exquisite)"
         );
-        // No knowledge/memory headers (JIT is Full-tier only).
+        // …but the SLOW JIT retrieval (knowledge / memory) stays gated for speed.
         assert!(!fw.contains("Lessons from prior runs"));
         assert!(!fw.contains("YOUR TEAM'S EXPERIENCE"));
     }
