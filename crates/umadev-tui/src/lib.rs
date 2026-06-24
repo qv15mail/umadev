@@ -461,6 +461,44 @@ fn spawn_block(
 /// event loop. Empty (always `None`) unless the continuous path is enabled.
 type SessionHolder = Arc<tokio::sync::Mutex<Option<Box<dyn umadev_runtime::BaseSession>>>>;
 
+/// A resident chat session parked in the [`ChatSessionHolder`], tagged with whether
+/// it has taken a turn yet. The distinction is load-bearing for the FIRST directive:
+/// a **warm** session (the background pre-load just spawned it, or a fresh lazy-open)
+/// has the firmware injected but has seen NO user turn, so the first message must
+/// front-load the conversation transcript (and re-prefix firmware for a non-claude
+/// base); a **primed** session already took a turn, so its own native memory carries
+/// the dialogue and the next message is sent bare.
+enum ResidentChat {
+    /// Spawned + firmware-injected, but no turn taken yet (pre-loaded or lazy-opened).
+    /// Carries the firmware so the first directive can re-prefix it for a base with
+    /// no native system slot (codex / opencode); claude already has it natively.
+    Warm(WarmChatSession),
+    /// Already drove at least one turn — reuse it bare (native memory holds context).
+    Primed(Box<dyn umadev_runtime::BaseSession>),
+}
+
+impl ResidentChat {
+    /// End the underlying base session (best-effort), whichever state it is in. Used
+    /// on `/clear` / a backend switch / quit / cancel to release the subprocess.
+    async fn end(self) {
+        let mut session = match self {
+            ResidentChat::Warm(w) => w.session,
+            ResidentChat::Primed(s) => s,
+        };
+        let _ = session.end().await;
+    }
+}
+
+/// The RESIDENT chat session holder — ONE base session kept alive across the whole
+/// conversation on the host-CLI chat path (the latency fix). A `tokio::sync::Mutex`
+/// so a spawned turn task can take it across `.await`; shared `Arc` with the event
+/// loop and the background pre-load task. `None` until the pre-load (or the first
+/// turn's lazy-open) lands a [`ResidentChat::Warm`]; parked back as
+/// [`ResidentChat::Primed`] after every turn so the next message reuses the SAME
+/// process. Distinct type from [`SessionHolder`] (the director-run session) because
+/// chat tracks the warm/primed state the director path does not need.
+type ChatSessionHolder = Arc<tokio::sync::Mutex<Option<ResidentChat>>>;
+
 /// Decide whether the TUI's `run` intent flows through the **continuous
 /// long-session path** (one persistent director session) or the legacy per-phase
 /// single-shot path. The continuous path is now the DEFAULT (mirrors
@@ -1087,28 +1125,12 @@ fn light_default_route() -> RoutePlan {
     }
 }
 
-/// The intent card shown for a chat turn the MOMENT it is dispatched — before the
-/// base has done anything, so the only honest signal is "this is conversation".
-/// Derived from behaviour, not a pre-classification: a turn that turns out to
-/// write files is re-surfaced as a build by the reactive detector in
-/// [`drive_agentic_stream`] (which emits a fresh `Build` intent card then). This
-/// keeps the firmware default ([`light_default_route`]) decoupled from what the
-/// user SEES (a `QuickEdit` firmware tier should not read as "small change" on the
-/// card when the turn is, so far, just a reply).
-#[must_use]
-fn chat_intent_route() -> RoutePlan {
-    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
-    RoutePlan {
-        class: RouteClass::Chat,
-        kind: TaskKind::Light,
-        depth: Depth::Fast,
-        team: Vec::new(),
-        scope: Vec::new(),
-        needs_clarify: None,
-        est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
-        confidence: 0.5,
-    }
-}
+// NOTE: there is intentionally NO "chat intent card" route any more. A chat turn
+// at t=0 emits no intent card at all (the user asked to remove the "this is
+// conversation — replying directly" card — pure noise). The ONLY intent card the
+// chat surface shows is the behaviour-derived "构建中" (`reactive_build_route`)
+// surfaced the instant the base writes its first real file. So a pure reply shows
+// no card; a turn that turns out to build re-surfaces a `Build` card reactively.
 
 /// The `Build` intent card surfaced REACTIVELY the first time the base writes a
 /// real file on the light chat path — the behaviour-derived "构建中" signal. A
@@ -1919,6 +1941,7 @@ async fn drive_agentic_stream(
 /// input and matches the prior behaviour.
 fn fire_agentic(
     app: &mut App,
+    chat_session: &ChatSessionHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     task: String,
@@ -1952,31 +1975,53 @@ fn fire_agentic(
     app.agentic_in_flight = true;
     // A drained queued turn is light (never a director build) → no hand-back.
     app.director_run_in_flight = false;
-    let handle = spawn_agentic(
-        AgenticTurn {
-            task,
-            spec,
-            continue_session,
-            session_id,
-            fallback_model: app.effective_model(),
-            project_root: app.project_root.clone(),
-            // The queued-drain turn is always light — a fresh message classifies via
-            // `run_routed_turn`; a parked one does not re-consult the brain.
-            director_build: false,
-            host_cli,
-            // No brain consult on the drain → `route: None`. `run_agentic` resolves
-            // it to a deterministic Tier-0 floor route so the firmware is still sized
-            // proportionally (chat = identity only) without a second base call.
-            route: None,
-            conversation,
-        },
-        sink.clone(),
-        route_tx.clone(),
-    );
+    let mode = app.effective_trust_mode();
+    let fallback_model = app.effective_model();
+    let project_root = app.project_root.clone();
     if host_cli {
         app.host_chat_session_active = true;
     }
-    handle
+    // Host CLI: drain a parked turn over the SAME resident chat session (the latency
+    // fix) — `send_turn` into the already-loaded process, no cold start. The session
+    // is already primed (a queued turn always follows at least one prior turn), so
+    // the transcript is belt-and-suspenders only. Offline: the legacy light path.
+    if host_cli {
+        let autonomous = mode.gates_auto_approve();
+        tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
+            text: task,
+            backend: spec.label(),
+            model: fallback_model,
+            project_root,
+            conversation,
+            mode,
+            autonomous,
+            chat_session: chat_session.clone(),
+            sink: sink.clone(),
+            route_tx: route_tx.clone(),
+        }))
+    } else {
+        spawn_agentic(
+            AgenticTurn {
+                task,
+                spec,
+                continue_session,
+                session_id,
+                fallback_model,
+                project_root,
+                // The queued-drain turn is always light — a fresh message classifies
+                // via `run_routed_turn`; a parked one does not re-consult the brain.
+                director_build: false,
+                host_cli,
+                // No brain consult on the drain → `route: None`. `run_agentic`
+                // resolves it to a deterministic Tier-0 floor route so the firmware is
+                // still sized proportionally without a second base call.
+                route: None,
+                conversation,
+            },
+            sink.clone(),
+            route_tx.clone(),
+        )
+    }
 }
 
 /// Everything the chat dispatcher ([`run_routed_turn`]) needs, all snapshotted from
@@ -2007,6 +2052,11 @@ struct RoutedTurnInputs {
     fallback_model: String,
     /// Project root the base subprocess runs in.
     project_root: PathBuf,
+    /// Trust tier for this turn — drives the persistent-session approval floor
+    /// (the `NeedApproval` gate) and the autonomy flag the session opens with.
+    /// An irreversible action is always confirmed regardless of tier (the
+    /// always-on floor); the tier only governs the *reversible* gate posture.
+    mode: umadev_agent::TrustMode,
 }
 
 /// Dispatch ONE free-text chat turn by driving the persistent session **once** on
@@ -2044,10 +2094,12 @@ struct RoutedTurnInputs {
 /// instantly and the UI keeps redrawing the "thinking…" state from `engine_rx`.
 ///
 /// **Fail-open throughout:** the session failing to open / a streaming error is a
-/// terminal `Failed` inside [`run_agentic`]; a reactive isolation that can't run
-/// leaves the turn in place. The shell never wedges.
+/// terminal `Failed` (the held session is dropped so the next turn re-opens a fresh
+/// one); a reactive isolation that can't run leaves the turn in place. The shell
+/// never wedges.
 async fn run_routed_turn(
     inputs: RoutedTurnInputs,
+    chat_session: ChatSessionHolder,
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
@@ -2060,19 +2112,39 @@ async fn run_routed_turn(
         session_id,
         fallback_model,
         project_root,
+        mode,
     } = inputs;
 
-    // The behaviour-derived intent card at t=0: the only honest signal before the
-    // base acts is "this is conversation". A turn that goes on to write files
-    // re-surfaces a `Build` card from `react_to_first_write` the instant it does.
-    sink.emit(EngineEvent::intent_decided(&chat_intent_route()));
+    // ── Host CLI: the PERSISTENT chat-session path (the latency fix). ──────────
+    // A real host CLI keeps ONE base session resident across the whole
+    // conversation: the base is spawned once, its 7 MCP servers load once, and
+    // UmaDev's firmware is injected once (`--append-system-prompt`). Every later
+    // chat message only feeds `send_turn` + drains the stream — no per-message
+    // `claude --print` cold start (which re-loaded all MCP servers each time and
+    // was the ~30-60s first-reply latency). See [`drive_chat_session_turn`].
+    if host_cli {
+        let autonomous = mode.gates_auto_approve();
+        drive_chat_session_turn(ChatSessionTurn {
+            text,
+            backend: spec.label(),
+            model: fallback_model,
+            project_root,
+            conversation,
+            mode,
+            autonomous,
+            chat_session,
+            sink,
+            route_tx,
+        })
+        .await;
+        return;
+    }
 
-    // Drive the light streaming path ONCE — `director_build: false` (the base, not a
-    // pre-classifier, decides by acting), the proportional default firmware route
-    // ([`light_default_route`]: identity + craft + repo-map), and reactive build
-    // ENABLED (the first write flips this into a build). The terminal `AgenticDone`
-    // carries the EFFECTIVE build-ness (false for a pure chat; true if a write was
-    // seen), driving the Wave-5 session hand-back exactly as a classified build would.
+    // ── Offline / non-host brain: the legacy LIGHT path (unchanged). ───────────
+    // An offline runtime owns no `BaseSession` (no resident process to keep), so
+    // it stays on the single-shot streaming path. The behaviour-derived intent
+    // card is dropped here too — the user asked to remove the chat intent card,
+    // and the offline path never reactively builds (it writes nothing real).
     run_agentic(
         AgenticTurn {
             task: text,
@@ -2092,6 +2164,450 @@ async fn run_routed_turn(
     .await;
 }
 
+/// Everything one persistent-session chat turn needs, snapshotted so the spawned
+/// task never touches `&mut App`. Bundled to keep the driver's signature sane.
+struct ChatSessionTurn {
+    /// The user's free-text turn (already recorded into conversation memory).
+    text: String,
+    /// Backend id of the host CLI driving the resident session.
+    backend: String,
+    /// Fallback model id (the session uses the base's own configured model).
+    model: String,
+    /// Project root the resident base subprocess runs in.
+    project_root: PathBuf,
+    /// UmaDev's OWN bounded conversation transcript (Wave 5 / G11) — front-loaded
+    /// onto the FIRST directive of a freshly-opened session so the resident base
+    /// inherits the prior dialogue even across a restart / switched base; the
+    /// session's own native memory carries later turns.
+    conversation: Vec<Message>,
+    /// Trust tier — the persistent-session approval floor (the `NeedApproval` gate).
+    mode: umadev_agent::TrustMode,
+    /// Whether the session opens autonomous (`auto` tier writes unattended) — the
+    /// base still raises a `NeedApproval` for an irreversible action regardless.
+    autonomous: bool,
+    /// The resident chat session, held across the whole conversation. `None` until
+    /// the pre-load (or the first turn's lazy-open) lands it; parked back after each
+    /// `TurnDone`.
+    chat_session: ChatSessionHolder,
+    /// Live event sink (the same `WorkerStream` render path the director uses).
+    sink: Arc<ChannelSink>,
+    /// Terminal-decision channel back to the event loop.
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+}
+
+/// The path token of a tool call's raw input — the human-readable target shown in
+/// the tool row (file path / command / url / pattern). A self-contained mirror of
+/// the agent crate's internal `tool_call_target` (kept local so this TUI boundary
+/// does not reach into `umadev-agent` internals). Pure + fail-open: an input with
+/// none of the known keys renders an empty target.
+fn session_tool_target(input: &serde_json::Value) -> String {
+    for key in ["file_path", "path", "command", "url", "pattern"] {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Pull the next [`SessionEvent`], bounding the wait by `idle` so a base that HANGS
+/// (stops emitting but never exits) can't block the drain forever — pure silence
+/// past the window settles the turn instead of wedging `thinking`. ANY event resets
+/// the clock (a long compile/test turn survives as long as it emits SOMETHING). The
+/// local analogue of the agent crate's idle watchdog. `Ok(None)` = session ended,
+/// `Err(())` = idle-timed-out (caller settles), `Ok(Some(ev))` = a real event.
+#[allow(clippy::result_unit_err)]
+async fn next_chat_event_idle(
+    session: &mut dyn umadev_runtime::BaseSession,
+    idle: Duration,
+) -> Result<Option<umadev_runtime::SessionEvent>, ()> {
+    match tokio::time::timeout(idle, session.next_event()).await {
+        Ok(ev) => Ok(ev),
+        Err(_) => Err(()),
+    }
+}
+
+/// Idle ceiling for one persistent-session chat turn — the same generous window the
+/// director loop uses, so a long agentic turn (deep web research, a big build) is
+/// never killed while it is still streaming, but a true silent hang settles.
+const CHAT_SESSION_IDLE: Duration = Duration::from_secs(300);
+
+/// A WARM resident chat session: the live base process paired with the firmware it
+/// was opened with (kept so a non-claude base — which has no native system slot —
+/// can re-prefix that firmware onto its FIRST directive). The session is spawned,
+/// its MCP servers loaded, and (for claude) the firmware injected natively via
+/// `--append-system-prompt`, but it has NOT yet seen any user turn — it is the
+/// pre-loaded brain a chat message just `send_turn`s into.
+struct WarmChatSession {
+    /// The live base session, parked into the holder until the first turn.
+    session: Box<dyn umadev_runtime::BaseSession>,
+    /// The firmware the session was opened with (`None` when empty / composed to
+    /// nothing). Re-prefixed onto the first directive ONLY for a non-claude base —
+    /// claude already got it natively, so it is never restated there.
+    firmware: Option<String>,
+}
+
+/// Open a WARM resident chat session — spawn the base, load its MCP servers, and
+/// inject UmaDev's firmware ONCE — WITHOUT sending any turn. This is the work the
+/// background pre-load does at launch (so the cold start is paid while the user
+/// reads the welcome screen / types) and also the lazy-open the first chat turn
+/// falls back to if the pre-load hasn't landed yet.
+///
+/// Composes the firmware ONCE (identity + craft + a one-time repo-map slice via the
+/// light route — NOT re-retrieved per turn) and injects it natively via
+/// `session_for`'s `--append-system-prompt`. The conversation transcript is NOT
+/// folded in here — a warm session carries no turn yet; the first real turn
+/// front-loads history onto its own `send_turn` (see [`first_chat_directive`]).
+///
+/// Returns the warm session (process + firmware), or the open error (the caller
+/// maps it to an honest terminal `Failed`, or — on the pre-load path — simply drops
+/// it so the first turn lazily re-opens). Fail-open by contract.
+async fn open_warm_chat_session(
+    backend: &str,
+    model: &str,
+    project_root: &std::path::Path,
+    autonomous: bool,
+) -> Result<WarmChatSession, umadev_runtime::SessionError> {
+    // The firmware is keyed off the project + the light route only — NOT the user's
+    // message — so it is identical whether composed at pre-load (no message yet) or
+    // at lazy-open. Empty query is fine: the light route pulls identity + craft +
+    // repo-map, none of which depend on the requirement text.
+    let route = light_default_route();
+    let firmware = umadev_agent::compose_firmware(project_root, &route, "").await;
+    let firmware = (!firmware.trim().is_empty()).then_some(firmware);
+    let session = umadev_host::session_for(
+        backend,
+        project_root,
+        model,
+        autonomous,
+        firmware.as_deref(),
+    )
+    .await?;
+    Ok(WarmChatSession { session, firmware })
+}
+
+/// Build the FIRST directive sent into a freshly-opened warm session: front-load
+/// UmaDev's bounded conversation transcript so the new session inherits the prior
+/// dialogue (across a restart / switched base), and — for codex / opencode, which
+/// have no native system slot — prefix the firmware onto this first directive too
+/// (the universal fail-open path). For claude the firmware is already native, so
+/// the directive carries only the history, never restating it.
+///
+/// `firmware` is the warm session's firmware (the same value `open_warm_chat_session`
+/// returned); `None` / claude → history only.
+fn first_chat_directive(
+    firmware: Option<&str>,
+    backend: &str,
+    conversation: &[Message],
+    text: &str,
+) -> String {
+    let with_history = director_directive_with_history(conversation, text, text.to_string());
+    match firmware {
+        Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{with_history}"),
+        _ => with_history,
+    }
+}
+
+/// Spawn a BACKGROUND pre-load of the resident chat session — the core of the
+/// latency fix. Called the instant UmaDev lands on the chat surface with a host CLI
+/// configured (at launch, and after the picker / a `/backend` switch resolves a
+/// base), so the base is spawned, its MCP servers loaded, and the firmware injected
+/// WHILE the user reads the welcome screen and types — not on the critical path of
+/// the first message. By the time the user sends, the holder already has a `Warm`
+/// session and the first reply is just `send_turn` + drain (≈ as fast as later
+/// turns), instead of paying a full `claude --print` cold start (the ~30-60s reload
+/// of all MCP servers + firmware that was the first-reply latency).
+///
+/// Snapshots the backend / model / root / autonomy on the UI thread (the caller),
+/// then opens the warm session off-thread and parks it into the holder. **Fully
+/// fail-open + idempotent:**
+/// - a non-host (offline) brain is a no-op (nothing resident to keep);
+/// - if the holder is ALREADY populated (a prior pre-load landed, or a live turn is
+///   mid-flight having taken it), the freshly-opened warm session is dropped — never
+///   replacing a live/primed session or racing two opens into one slot;
+/// - an open error simply leaves the holder empty, so the first chat turn lazily
+///   re-opens exactly as before. The pre-load can NEVER wedge the shell or surface
+///   an error — it only ever makes the first turn faster.
+fn spawn_chat_session_preload(
+    backend: Option<&str>,
+    model: String,
+    project_root: PathBuf,
+    autonomous: bool,
+    holder: ChatSessionHolder,
+) {
+    // Only a real host CLI keeps a resident session (offline owns no process). The
+    // authoritative id list is `umadev_host::BACKEND_IDS` (the three first-class
+    // bases); anything else (offline / unknown) is a no-op.
+    let Some(backend) = backend.filter(|b| umadev_host::BACKEND_IDS.contains(b)) else {
+        return;
+    };
+    let backend = backend.to_string();
+    tokio::spawn(async move {
+        // Open OUTSIDE the lock so the (slow) MCP/firmware load never holds the
+        // mutex a live turn might need — then take the lock only to park it.
+        // Fail-open: a failed open is dropped here (the `if let` skips it), leaving
+        // the holder empty so the first turn lazily re-opens. No error surfaced.
+        if let Ok(mut warm) =
+            open_warm_chat_session(&backend, &model, &project_root, autonomous).await
+        {
+            let mut guard = holder.lock().await;
+            // Don't clobber a session that arrived first (another pre-load) or a live
+            // turn that already took the slot — close the extra one instead.
+            if guard.is_some() {
+                drop(guard);
+                let _ = warm.session.end().await;
+            } else {
+                *guard = Some(ResidentChat::Warm(warm));
+            }
+        }
+    });
+}
+
+/// Drive ONE chat turn over the **resident** base session — the latency fix.
+///
+/// Opens the session lazily on the FIRST turn (firmware composed ONCE and injected
+/// natively via `session_for`'s `--append-system-prompt`; the conversation
+/// transcript front-loaded onto this first directive), then REUSES it on every
+/// later turn: each turn is just `send_turn` + a drain of [`SessionEvent`]s. The
+/// base is spawned once, its MCP servers load once, the firmware is injected once —
+/// removing the per-message `claude --print` cold start.
+///
+/// The drain mirrors the director loop's [`SessionEvent`] → [`EngineEvent`] mapping
+/// (the SAME `WorkerStream` render path), so tool calls + text stream live exactly
+/// as before. Three behaviours ride the drain, all fail-open:
+/// - **Reactive build** — the first `Write`/`Edit`-family `ToolCall` flips the turn
+///   into a build (run-lock + branch isolation + a `Build` intent card), with NO
+///   up-front classification (the base decides by ACTING);
+/// - **Trust gate** — a `NeedApproval` is answered by the always-on irreversible
+///   floor (`requires_confirmation`): an irreversible action is denied with a note,
+///   everything else allowed (so a guarded turn isn't wedged headless);
+/// - **Settle** — `TurnDone` ends the drain, parks the LIVE session back into the
+///   holder for the next turn, runs the post-turn fact line + the source hard-gate
+///   (for a reactively-promoted build), and sends the terminal `AgenticDone`.
+///
+/// **Fail-open by contract:** a session that can't open, a `send_turn` that fails,
+/// or a session that dies mid-drain is an honest terminal `Failed` — the holder is
+/// cleared so the NEXT turn re-opens a fresh session. It never panics, and the
+/// conversation transcript UmaDev holds re-primes a fresh session after a loss.
+async fn drive_chat_session_turn(turn: ChatSessionTurn) {
+    let ChatSessionTurn {
+        text,
+        backend,
+        model,
+        project_root,
+        conversation,
+        mode,
+        autonomous,
+        chat_session,
+        sink,
+        route_tx,
+    } = turn;
+
+    // Pre-turn git snapshot (fail-open: git missing → None → the fact line is
+    // skipped). Used after the turn to report the real changed-file set.
+    let before = git_status_porcelain(&project_root);
+
+    // Take the resident session, or lazily open a fresh one. Three cases:
+    //   - `Primed`: a session that already drove a turn — reuse it BARE (its own
+    //     native memory carries the dialogue; firmware + MCP loaded long ago);
+    //   - `Warm`: a session the background pre-load (or an earlier lazy-open)
+    //     spawned but never turned — send its FIRST directive (front-load the
+    //     transcript + re-prefix firmware for a non-claude base);
+    //   - empty holder: lazily open a warm session NOW (the pre-load missed / a
+    //     prior session was closed), then send its first directive.
+    // The pre-load is what removes the first-reply latency: by the time the user
+    // sends, the holder usually already has a `Warm` session (MCP + firmware loaded
+    // off the hot path), so this turn is just `send_turn` + drain.
+    let mut guard = chat_session.lock().await;
+    let (mut session, first_directive) = match guard.take() {
+        Some(ResidentChat::Primed(s)) => (s, text.clone()),
+        Some(ResidentChat::Warm(w)) => {
+            let directive =
+                first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
+            (w.session, directive)
+        }
+        None => match open_warm_chat_session(&backend, &model, &project_root, autonomous).await {
+            Ok(w) => {
+                let directive =
+                    first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
+                (w.session, directive)
+            }
+            Err(e) => {
+                drop(guard);
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                    "continuous.tui_session_unavailable",
+                    &[&e.to_string()],
+                )));
+                return;
+            }
+        },
+    };
+    drop(guard);
+
+    // Send the directive into the resident session. A send error means the session
+    // is dead — drop it (so the next turn re-opens) and report an honest failure.
+    if let Err(e) = session.send_turn(first_directive).await {
+        let _ = session.end().await;
+        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+            "route.failed",
+            &[&backend, &e.to_string()],
+        )));
+        return;
+    }
+
+    // Reactive build: the FIRST workspace write flips this turn into a build. Built
+    // host-on (a host session writes real files); fires its side-effects once.
+    let reactive = Arc::new(ReactiveBuild::new(true));
+    let mut text_acc = String::new();
+
+    // Drain the turn. ANY event resets the idle clock; pure silence past the window
+    // settles (the base hung). A `None` / a `Failed` status is an honest terminal.
+    // The loop breaks with whether the finish was truncated (mid-stream cut-off).
+    let truncated = loop {
+        let ev = match next_chat_event_idle(session.as_mut(), CHAT_SESSION_IDLE).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => {
+                // Session ended mid-turn (process dead / EOF) — drop it, report.
+                let _ = session.end().await;
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                    "route.failed",
+                    &[&backend, "base session ended mid-turn"],
+                )));
+                return;
+            }
+            Err(()) => {
+                // Idle hang — interrupt + drop the session, settle honestly.
+                let _ = session.interrupt().await;
+                let _ = session.end().await;
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                    "route.failed",
+                    &[&backend, "base session idle"],
+                )));
+                return;
+            }
+        };
+        match ev {
+            umadev_runtime::SessionEvent::TextDelta(delta) => {
+                text_acc.push_str(&delta);
+                sink.emit(EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::Text { delta },
+                });
+            }
+            umadev_runtime::SessionEvent::ToolCall { name, input } => {
+                // The FIRST workspace write flips the turn into a build (one-shot,
+                // fail-open). The base decides chat-vs-build by ACTING.
+                if is_workspace_write_tool(&name) {
+                    react_to_first_write(Some(&reactive), &project_root, &sink);
+                }
+                let detail = session_tool_target(&input);
+                sink.emit(EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::ToolUse { name, detail },
+                });
+            }
+            umadev_runtime::SessionEvent::ToolResult { ok, summary } => {
+                sink.emit(EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            umadev_runtime::SessionEvent::NeedApproval {
+                req_id,
+                action,
+                target,
+            } => {
+                // Always-on irreversible floor — the SAME gate the director loop
+                // applies: deny an irreversible action (with a note), allow the rest
+                // so a guarded chat turn isn't wedged waiting on a human headlessly.
+                let decision = if umadev_agent::requires_confirmation(mode, &action, &target) {
+                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "continuous.dangerous_action_denied",
+                        &[&action, &target],
+                    )));
+                    umadev_runtime::ApprovalDecision::Deny
+                } else {
+                    umadev_runtime::ApprovalDecision::Allow
+                };
+                if let Err(e) = session.respond(&req_id, decision).await {
+                    let _ = session.end().await;
+                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                        "route.failed",
+                        &[&backend, &e.to_string()],
+                    )));
+                    return;
+                }
+            }
+            umadev_runtime::SessionEvent::TurnDone { status } => match status {
+                umadev_runtime::TurnStatus::Completed => break false,
+                // Truncated → the turn ended early (rate limit / retry / cut-off);
+                // accept what landed but flag the "may be incomplete" caveat below.
+                umadev_runtime::TurnStatus::Truncated => break true,
+                umadev_runtime::TurnStatus::Interrupted => {
+                    // ESC / abort. The session is still alive and primed — park it
+                    // back so the next turn reuses it, and settle this turn as a
+                    // (non-build) chat so `thinking` clears.
+                    *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                    let _ = route_tx.send(RouteDecision::AgenticDone {
+                        reply: String::new(),
+                        director_build: false,
+                    });
+                    return;
+                }
+                umadev_runtime::TurnStatus::Failed(reason) => {
+                    let _ = session.end().await;
+                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                        "route.failed",
+                        &[&backend, &reason],
+                    )));
+                    return;
+                }
+            },
+        }
+    };
+
+    // The turn finished cleanly. Park the LIVE session back into the holder as
+    // `Primed` so the next chat message reuses it BARE (resident base, MCP +
+    // firmware already loaded, native memory carries the dialogue).
+    *chat_session.lock().await = Some(ResidentChat::Primed(session));
+
+    // Post-turn reality fact line — the real changed-file set, plus a `[warn]` when
+    // the base CLAIMED changes the working tree does not show (fail-open: skipped if
+    // git was unavailable for either snapshot). The SAME guard the light path runs.
+    let changed = match (before.as_deref(), git_status_porcelain(&project_root)) {
+        (Some(b), Some(a)) => Some(changed_files_between(b, &a)),
+        _ => None,
+    };
+    if let Some(line) = agentic_fact_line(changed.as_deref(), claims_code_changes(&text_acc)) {
+        sink.emit(EngineEvent::Note(line));
+    }
+
+    // Truncation honesty — a truncated finish gets the "may be incomplete" caveat so
+    // it does not read as a clean, fully-flushed success.
+    let mut reply = text_acc;
+    if truncated {
+        if !reply.is_empty() {
+            reply.push('\n');
+        }
+        reply.push_str(
+            "[warn] 本轮可能未完成或未全部落盘(底座中途告警/截断),请核对实际文件状态 \
+             / turn may be incomplete or not fully written — verify the working tree",
+        );
+    }
+
+    // The turn's EFFECTIVE build-ness: a pure-reply chat is false; a turn the
+    // reactive detector promoted (the base wrote a file) is true — driving the
+    // source hard-gate + the Wave-5 session hand-back.
+    let became_build = reactive
+        .became_build
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if became_build {
+        if let Some(note) = director_source_hardgate(&project_root, &reply) {
+            sink.emit(EngineEvent::Note(note));
+        }
+    }
+    let _ = route_tx.send(RouteDecision::AgenticDone {
+        reply,
+        director_build: became_build,
+    });
+}
+
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
 /// the user parked while the route was in flight, keeping same-session routing
 /// serial. Returns `true` if a parked turn was dispatched.
@@ -2102,11 +2618,12 @@ async fn run_routed_turn(
 /// in-flight handle so the caller can park it in `run_task` for Ctrl-C.
 fn drain_next_queued_chat(
     app: &mut App,
+    chat_session: &ChatSessionHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let text = app.take_next_queued_chat()?;
-    Some(fire_agentic(app, sink, route_tx, text))
+    Some(fire_agentic(app, chat_session, sink, route_tx, text))
 }
 
 fn route_model_for_spec(_spec: &BrainSpec, fallback_model: String) -> String {
@@ -2466,6 +2983,30 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // path is enabled; a parked session here is what makes a `Continue` block
     // resume the SAME session rather than re-prime a fresh one.
     let session_holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    // The RESIDENT chat session — ONE base session kept alive across the whole
+    // conversation on the host-CLI chat path (the latency fix). A BACKGROUND pre-load
+    // (`spawn_chat_session_preload`, fired below at launch + after a backend switch)
+    // lands a `Warm` session here while the user reads the welcome screen / types, so
+    // the FIRST message is just `send_turn` + drain (no cold start). Parked back as
+    // `Primed` after every turn so the next message reuses the SAME process instead of
+    // cold-starting `claude --print`. Closed + cleared on cancel / quit / `/clear` /
+    // a backend switch (see those arms). Distinct from `session_holder` (the
+    // director-run continuous session) — chat and `/run` keep separate brains.
+    let chat_session_holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    // Pre-load the resident chat session NOW if we launched straight into chat with a
+    // host CLI already configured (a returning user — first launch lands on the
+    // picker, which fires the pre-load on `Action::BackendChanged` once a base is
+    // chosen). Fail-open + idempotent: a non-host brain / an open failure is a silent
+    // no-op, leaving the first turn to lazily open exactly as before.
+    if matches!(app.mode, crate::app::AppMode::Chat) {
+        spawn_chat_session_preload(
+            app.backend.as_deref(),
+            app.effective_model(),
+            app.project_root.clone(),
+            continuous_autonomous(app.effective_trust_mode()),
+            chat_session_holder.clone(),
+        );
+    }
     // Whether the in-flight run is on the continuous path, so the `Continue`
     // (gate-approve) + auto-continue blocks resume the SAME persistent session
     // (via `spawn_continuous_block`) rather than spawning a fresh single-shot
@@ -2487,7 +3028,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // handle is parked in `run_task` so Ctrl-C can abort it.
                     Some(RouteDecision::AgenticDone { reply, director_build }) => {
                         app.record_agentic_done(reply, director_build);
-                        run_task = drain_next_queued_chat(app, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
                     }
                     // The turn produced no usable reply (base init / stream error).
                     // `record_route_failed` clears `thinking`; then fire the next
@@ -2495,7 +3036,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // typed behind it.
                     Some(RouteDecision::Failed(note)) => {
                         app.record_route_failed(note);
-                        run_task = drain_next_queued_chat(app, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
                     }
                     None => {}
                 }
@@ -2623,9 +3164,31 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         match app.apply_key_with_mods(key.code, key.modifiers) {
                             Action::Quit => break,
-                            Action::None | Action::BackendChanged => {
-                                // BackendChanged only affects later spawns;
-                                // no immediate side-effect on running tasks.
+                            Action::None => {}
+                            Action::BackendChanged => {
+                                // A base was just chosen — either first-launch picker
+                                // completion (the `None`→host case) or a `/backend`
+                                // switch (both set `chat_session_dirty`). Close any
+                                // stale resident session pinned to the OLD base, clear
+                                // the dirty flag (so the bottom-of-loop close doesn't
+                                // also fire), and PRE-LOAD a fresh warm session against
+                                // the NEW base so the next chat message is hot. All
+                                // best-effort / fail-open: a switch mid-turn can't reach
+                                // here (rejected upstream), so this only closes a
+                                // parked/idle session.
+                                app.chat_session_dirty = false;
+                                if let Some(stale) =
+                                    chat_session_holder.lock().await.take()
+                                {
+                                    stale.end().await;
+                                }
+                                spawn_chat_session_preload(
+                                    app.backend.as_deref(),
+                                    app.effective_model(),
+                                    app.project_root.clone(),
+                                    continuous_autonomous(app.effective_trust_mode()),
+                                    chat_session_holder.clone(),
+                                );
                             }
                             Action::Reconfigure => {
                                 // Re-opened the first-run guide — re-probe the
@@ -2671,6 +3234,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         }
                                     }
                                     continuous_run_active = false;
+                                }
+                                // ESC / Ctrl-C on a chat turn: the aborted task OWNED
+                                // the resident chat session (it `take()`s it from the
+                                // holder for the turn), so `h.abort()` already dropped
+                                // it — the subprocess dies with the task. Best-effort
+                                // close + clear ANY session still parked in the holder
+                                // (the idle case, or a turn that hadn't taken it yet) so
+                                // a wedged session never lingers; the next chat message
+                                // re-opens a fresh one. `try_lock` so cancel never blocks.
+                                let parked = chat_session_holder
+                                    .try_lock()
+                                    .ok()
+                                    .and_then(|mut g| g.take());
+                                if let Some(s) = parked {
+                                    s.end().await;
                                 }
                                 // Drain any events the aborted task already
                                 // queued (e.g. a buffered PipelineStarted /
@@ -2894,16 +3472,20 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     session_id,
                                     fallback_model: app.effective_model(),
                                     project_root: app.project_root.clone(),
+                                    mode: app.effective_trust_mode(),
                                 };
                                 // Resuming the chat session means the NEXT turn must also
                                 // `--continue` it — set this now (the light path used to set
                                 // it after spawning); a director build hands its session back
-                                // via the terminal decision instead.
+                                // via the terminal decision instead. (On the host-CLI path the
+                                // RESIDENT `chat_session_holder` IS the live memory; this flag
+                                // still gates the offline / `--continue` fallback.)
                                 if host_cli {
                                     app.host_chat_session_active = true;
                                 }
                                 run_task = Some(tokio::spawn(run_routed_turn(
                                     inputs,
+                                    chat_session_holder.clone(),
                                     sink.clone(),
                                     route_tx.clone(),
                                 )));
@@ -3112,6 +3694,32 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 };
                             }
                         }
+                        // The conversation context just changed (`/clear` set
+                        // `chat_session_dirty`; a backend switch is handled inline in the
+                        // `BackendChanged` arm, which clears the flag): close the RESIDENT
+                        // chat session so the next chat turn opens a fresh one against the
+                        // new context instead of carrying a stale live process. Best-effort
+                        // `try_lock` so this never blocks the UI; fail-open. A chat turn
+                        // that is mid-flight OWNS the session (holder is `None`), so this
+                        // only closes a parked/idle one. Same base after `/clear`, so we
+                        // PRE-LOAD a fresh warm session so the next message stays hot.
+                        if app.chat_session_dirty {
+                            app.chat_session_dirty = false;
+                            let parked = chat_session_holder
+                                .try_lock()
+                                .ok()
+                                .and_then(|mut g| g.take());
+                            if let Some(s) = parked {
+                                s.end().await;
+                            }
+                            spawn_chat_session_preload(
+                                app.backend.as_deref(),
+                                app.effective_model(),
+                                app.project_root.clone(),
+                                continuous_autonomous(app.effective_trust_mode()),
+                                chat_session_holder.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -3121,6 +3729,15 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         if app.should_quit {
             break;
         }
+    }
+    // Quit / app teardown: close the resident chat session so its base subprocess
+    // doesn't outlive the TUI. Best-effort; fail-open — never block the exit.
+    let parked = chat_session_holder
+        .try_lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    if let Some(s) = parked {
+        s.end().await;
     }
     Ok(())
 }
@@ -5050,6 +5667,466 @@ mod tests {
         assert!(
             !saw_isolated,
             "no isolation note when reactive build is off"
+        );
+    }
+
+    // ── Persistent chat-session path (the latency fix) ────────────────────────
+
+    /// A scripted fake [`umadev_runtime::BaseSession`] for the resident chat path.
+    /// Pre-loaded into the holder so [`drive_chat_session_turn`] REUSES it (never
+    /// calls `session_for`), and records every directive + how often it was opened
+    /// so a test can assert "one base, reused" + "firmware/transcript once".
+    struct FakeChatSession {
+        /// One event-batch per upcoming turn, consumed front-to-back.
+        turns: std::collections::VecDeque<Vec<umadev_runtime::SessionEvent>>,
+        /// The currently-draining batch.
+        current: std::collections::VecDeque<umadev_runtime::SessionEvent>,
+        /// Every directive this session received, in order (asserted by tests).
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Bumped on `interrupt()` / `end()` so a test can assert lifecycle.
+        ended: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeChatSession {
+        fn new(
+            turns: Vec<Vec<umadev_runtime::SessionEvent>>,
+        ) -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<String>>>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    turns: turns.into_iter().collect(),
+                    current: std::collections::VecDeque::new(),
+                    sent: Arc::clone(&sent),
+                    ended: Arc::clone(&ended),
+                },
+                sent,
+                ended,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for FakeChatSession {
+        async fn send_turn(
+            &mut self,
+            directive: String,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            self.sent.lock().unwrap().push(directive);
+            self.current = self
+                .turns
+                .pop_front()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            self.current.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn chat_turn(
+        text: &str,
+        chat_session: ChatSessionHolder,
+        sink: Arc<ChannelSink>,
+        route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+        project_root: std::path::PathBuf,
+    ) -> ChatSessionTurn {
+        ChatSessionTurn {
+            text: text.to_string(),
+            backend: "claude-code".to_string(),
+            model: "m".to_string(),
+            project_root,
+            conversation: Vec::new(),
+            mode: umadev_agent::TrustMode::Guarded,
+            autonomous: false,
+            chat_session,
+            sink,
+            route_tx,
+        }
+    }
+
+    /// The core latency-fix invariant: two chat turns REUSE the one held session
+    /// (never re-open / cold-start), and the session is PARKED back after each turn
+    /// for the next message. A reused session gets the BARE user directive (no
+    /// per-turn firmware/transcript re-injection — that is a one-time open cost).
+    #[tokio::test]
+    async fn chat_reuses_one_resident_session_across_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Two scripted turns: each a plain text reply then a clean TurnDone.
+        let (fake, sent, ended) = FakeChatSession::new(vec![
+            vec![
+                umadev_runtime::SessionEvent::TextDelta("hi there".into()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                },
+            ],
+            vec![
+                umadev_runtime::SessionEvent::TextDelta("still here".into()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                },
+            ],
+        ]);
+        // Pre-load the holder with a PRIMED session → `drive_chat_session_turn` takes
+        // it on the bare-reuse path, so `session_for` is NEVER called (no cold start)
+        // and the directive is the bare user turn (no firmware/transcript prefix).
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        // Turn 1.
+        drive_chat_session_turn(chat_turn(
+            "你好",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        // The live session was parked back for reuse.
+        assert!(
+            holder.lock().await.is_some(),
+            "session must be parked back after a clean turn"
+        );
+        // First turn settles as a pure chat (not a build).
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone {
+                reply,
+                director_build,
+            }) => {
+                assert_eq!(reply, "hi there");
+                assert!(!director_build, "a pure reply is a chat, never a build");
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+
+        // Turn 2 — the SAME held session is reused (no re-open).
+        drive_chat_session_turn(chat_turn(
+            "再说一句",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        assert!(holder.lock().await.is_some(), "session parked again");
+
+        // The ONE session saw BOTH user turns, bare (no firmware/transcript prefix
+        // re-injected on the reuse path — the session is already primed).
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "both turns went to the SAME session");
+        assert_eq!(sent[0], "你好");
+        assert_eq!(sent[1], "再说一句");
+        // It was never ended/interrupted (it lives on across the conversation).
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "a resident chat session is not closed between turns"
+        );
+
+        // No chat intent card was ever emitted (the user removed it) — only worker
+        // stream text, no `IntentDecided`.
+        let mut saw_intent = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if matches!(ev, EngineEvent::IntentDecided { .. }) {
+                saw_intent = true;
+            }
+        }
+        assert!(
+            !saw_intent,
+            "a pure chat turn emits NO intent card (chat card removed)"
+        );
+    }
+
+    /// Reactive build on the resident path: the FIRST `Write` tool call flips the
+    /// turn into a build — a `Build` intent card is surfaced and the terminal
+    /// decision carries `director_build: true` (driving the source hard-gate +
+    /// Wave-5 hand-back), exactly as the light path did.
+    #[tokio::test]
+    async fn chat_session_reacts_to_first_write_as_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({ "file_path": "src/main.rs" }),
+            },
+            umadev_runtime::SessionEvent::TextDelta("created the file".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "建个 main",
+            holder,
+            sink.clone(),
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // The terminal decision is a build (the base wrote a file).
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+                assert!(
+                    director_build,
+                    "a write reactively promotes the turn to a build"
+                );
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+        // A `Build` intent card was surfaced (the behaviour-derived "构建中" signal)
+        // and the write streamed live as a WorkerStream tool row.
+        let mut saw_build_card = false;
+        let mut saw_write = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            match ev {
+                EngineEvent::IntentDecided { class, .. } if class == "build" => {
+                    saw_build_card = true;
+                }
+                EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::ToolUse { name, .. },
+                } if name == "Write" => saw_write = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_build_card,
+            "the first write surfaces a Build intent card"
+        );
+        assert!(saw_write, "the write tool call streams live");
+    }
+
+    /// An interrupted turn (ESC reflected by the base as `TurnStatus::Interrupted`)
+    /// PARKS the still-alive session back for reuse and settles `thinking` via a
+    /// (non-build) terminal decision — it does NOT close the resident session.
+    #[tokio::test]
+    async fn chat_session_interrupt_parks_session_for_reuse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (fake, _sent, ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("partial".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Interrupted,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "停",
+            holder.clone(),
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        assert!(
+            holder.lock().await.is_some(),
+            "an interrupted turn parks the live session back for reuse"
+        );
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "interrupt does NOT close the resident session"
+        );
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+                assert!(!director_build, "an interrupted turn settles as a chat");
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+    }
+
+    /// A PRE-LOADED warm session (the latency fix): the holder already carries a
+    /// `Warm` session by the time the user sends, so the FIRST turn does NOT
+    /// cold-start (`session_for` is never called) — it only sends the first directive
+    /// into the already-resident base and parks it back PRIMED for reuse. The first
+    /// directive front-loads the bounded conversation transcript so the warm session
+    /// inherits the prior dialogue.
+    #[tokio::test]
+    async fn preloaded_warm_session_is_used_without_a_cold_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (fake, sent, ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("warm reply".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+            },
+        ]]);
+        // Park a WARM session (claude → no firmware prefix on the first directive)
+        // exactly as the background pre-load would have.
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Warm(WarmChatSession {
+                session: Box::new(fake),
+                firmware: None,
+            }),
+        )));
+
+        // Drive a turn whose snapshot carries a one-line prior conversation so we can
+        // assert the FIRST directive front-loads it (the warm session is fresh memory).
+        let mut turn = chat_turn(
+            "继续",
+            holder.clone(),
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        );
+        turn.conversation = vec![
+            umadev_runtime::Message {
+                role: "user".into(),
+                content: "之前的问题".into(),
+            },
+            umadev_runtime::Message {
+                role: "assistant".into(),
+                content: "之前的回答".into(),
+            },
+        ];
+        drive_chat_session_turn(turn).await;
+
+        // The warm session was consumed and re-parked as `Primed` (alive, reusable).
+        assert!(
+            matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+            "a warm session becomes primed after its first turn"
+        );
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the warm session is reused, never closed, after the first turn"
+        );
+        // The FIRST directive front-loaded the prior dialogue (warm session has no
+        // native memory of it yet) — so it is NOT the bare user turn.
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "exactly one directive into the warm session");
+        assert!(
+            sent[0].contains("继续") && sent[0].contains("之前的回答"),
+            "first directive front-loads the transcript onto the warm session: {:?}",
+            sent[0]
+        );
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone {
+                reply,
+                director_build,
+            }) => {
+                assert_eq!(reply, "warm reply");
+                assert!(!director_build);
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+    }
+
+    /// The first directive for a warm session: claude gets history ONLY (firmware is
+    /// native via `--append-system-prompt`); a non-claude base (no native system
+    /// slot) gets the firmware re-prefixed onto the directive too.
+    #[test]
+    fn first_chat_directive_prefixes_firmware_only_for_non_claude() {
+        let convo: Vec<Message> = Vec::new();
+        // claude: firmware present but NEVER restated on the directive.
+        let claude = first_chat_directive(Some("FW-BLOCK"), "claude-code", &convo, "做个登录页");
+        assert!(
+            !claude.contains("FW-BLOCK"),
+            "claude firmware is native — never re-prefixed: {claude:?}"
+        );
+        assert!(claude.contains("做个登录页"));
+        // codex: no native system slot → firmware is prefixed onto the directive.
+        let codex = first_chat_directive(Some("FW-BLOCK"), "codex", &convo, "做个登录页");
+        assert!(
+            codex.starts_with("FW-BLOCK"),
+            "non-claude firmware is front-loaded onto the first directive: {codex:?}"
+        );
+        assert!(codex.contains("做个登录页"));
+        // No firmware → bare goal regardless of base.
+        let bare = first_chat_directive(None, "opencode", &convo, "做个登录页");
+        assert_eq!(bare, "做个登录页");
+    }
+
+    /// The background pre-load is a NO-OP for a non-host (offline) brain — there is no
+    /// resident process to keep, so the holder stays empty and the first chat turn
+    /// lazily opens exactly as before. (Hermetic: an offline id never spawns a base.)
+    #[tokio::test]
+    async fn preload_is_a_noop_for_a_non_host_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+        spawn_chat_session_preload(
+            Some("offline"),
+            String::new(),
+            tmp.path().to_path_buf(),
+            false,
+            holder.clone(),
+        );
+        // Also a `None` backend (no base configured) — both must leave the holder empty.
+        spawn_chat_session_preload(
+            None,
+            String::new(),
+            tmp.path().to_path_buf(),
+            false,
+            holder.clone(),
+        );
+        // Give any (wrongly-)spawned task a chance to run, then assert nothing landed.
+        tokio::task::yield_now().await;
+        assert!(
+            holder.lock().await.is_none(),
+            "a non-host / unconfigured pre-load never lands a session"
+        );
+    }
+
+    /// `ResidentChat::end` releases the underlying base in BOTH states (warm + primed)
+    /// — the cleanup the cancel / `/clear` / backend-switch / quit paths rely on.
+    #[tokio::test]
+    async fn resident_chat_end_closes_warm_and_primed() {
+        let (warm_fake, _s, warm_ended) = FakeChatSession::new(vec![]);
+        ResidentChat::Warm(WarmChatSession {
+            session: Box::new(warm_fake),
+            firmware: None,
+        })
+        .end()
+        .await;
+        assert!(
+            warm_ended.load(std::sync::atomic::Ordering::SeqCst),
+            "ending a warm resident closes its base"
+        );
+        let (primed_fake, _s2, primed_ended) = FakeChatSession::new(vec![]);
+        ResidentChat::Primed(Box::new(primed_fake)).end().await;
+        assert!(
+            primed_ended.load(std::sync::atomic::Ordering::SeqCst),
+            "ending a primed resident closes its base"
         );
     }
 }

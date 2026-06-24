@@ -441,6 +441,16 @@ pub struct App {
     /// Reset (to `None`) at the same points as [`Self::host_chat_session_active`].
     pub chat_session_id: Option<String>,
 
+    /// One-shot signal that the **resident chat session** (the host-CLI base process
+    /// the event loop keeps alive across the conversation — `lib.rs`'s
+    /// `chat_session_holder`) must be CLOSED before the next turn: the conversation
+    /// context broke (`/clear`) or the driving base changed (a `/backend` switch), so
+    /// the live session — built against the OLD context / base — is no longer valid.
+    /// Set here, consumed (drained) by the event loop, which `end()`s and clears the
+    /// holder so the next chat message opens a FRESH resident session. Fail-open: a
+    /// missed signal at worst keeps a stale-but-harmless session one extra turn.
+    pub(crate) chat_session_dirty: bool,
+
     /// **Persistent chat id** (Wave 5 / G11) — the stable id of the on-disk
     /// `.umadev/chat/<id>.json` that mirrors [`Self::conversation`] so a restart
     /// reopens the same dialogue instead of amnesia. Distinct from
@@ -741,6 +751,7 @@ impl App {
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
+            chat_session_dirty: false,
             // A fresh persistent-chat id; `load_chat_for_launch` below may replace
             // it with the most-recent saved chat so a restart reopens the dialogue.
             chat_id: new_chat_session_id(),
@@ -3324,6 +3335,10 @@ impl App {
                 self.host_chat_session_active = false;
                 self.chat_session_id = None;
                 self.run_session_handed_to_chat = false;
+                // The RESIDENT chat session held by the event loop predates the
+                // cleared conversation — flag it for close so the next turn opens a
+                // fresh one instead of carrying the old dialogue's live process.
+                self.chat_session_dirty = true;
                 // Wave 5 / G11: `/clear` starts a FRESH persistent chat — mint a new
                 // id so the prior saved chat stays on disk (resumable via /resume)
                 // and the next turn persists under the new id.
@@ -3766,6 +3781,9 @@ impl App {
         }
         let id = backend.unwrap_or("offline").to_string();
         self.commit_backend(backend.map(str::to_string));
+        // The resident chat session is pinned to the OLD base — flag it for close so
+        // the next chat turn opens a fresh session on the newly-selected base.
+        self.chat_session_dirty = true;
         self.push(
             ChatRole::System,
             umadev_i18n::tf(self.lang, "backend.switched", &[&id]),
