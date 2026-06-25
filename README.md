@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="docs/assets/umadev-logo.png" alt="umadev" width="760">
+<img src="docs/assets/umadev-logo-en.png" alt="umadev" width="760">
 
 ### A project-director agent for the coding CLI you already use.
 
@@ -187,8 +187,8 @@ flowchart LR
 - **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the director owns the plan, not the base.
 - **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`. There is no weaker chat path.
 - **Ships a delivery proof.** PRD, architecture, and UI/UX docs, a scorecard, and a proof pack — scaled to the task, so a one-page change doesn't get an enterprise dossier.
-- **Carries engineering standards into the base.** 418 curated knowledge files — commercial-grade engineering standards, design rules, and a map of your existing code — are compiled into the binary and injected into the base on every working turn. Zero config.
-- **Learns from each run.** Recurring mistakes are recorded and recalled into later work so the same pitfall isn't repeated.
+- **Carries engineering standards into the base — with a fully-local dual-channel RAG.** 418 curated knowledge files (commercial-grade engineering standards, design rules) plus a map of your existing code are compiled into the binary and retrieved on every working turn by a two-channel hybrid engine: pure-Rust BM25 + a local vector model (`multilingual-e5-small`, f16, via candle) fused with RRF, HyDE query expansion on top. No API key, no network, millisecond recall over your own standards and business docs. Zero config.
+- **Self-evolving memory — it learns from each run.** Mistakes the base hits are recorded with a frequency signal to a local store; a genuine recurrence triggers a higher-level corrective *reflection*. Both are recalled into later prompts, so the same pitfall isn't repeated — umadev gets better on your codebase the more you use it.
 - **A real terminal UI.** Markdown, syntax-highlighted code, live diff cards as files change (word-level highlighting), folding tool rows, a build-completion card with a clickable preview URL, and slash commands throughout.
 - **Governance you can audit.** A trust dial (`plan` / `guarded` / `auto`), irreversible actions always confirm on every tier, an MCP server (`umadev mcp serve`) that exposes the governor to other tools, and compliance mapping (SOC 2 / ISO 27001 / EU AI Act).
 - **Goal-until-met builds.** `/goal <objective>` drives the base to keep working until the objective is met — native `/goal` on all three bases; `UMADEV_NO_GOAL_MODE=1` opts out.
@@ -448,13 +448,20 @@ Retrieval flow:
 ```mermaid
 flowchart LR
     A["Requirement + phase"] --> B["Tokenizer<br/>CJK bigram + English"]
-    B --> C["BM25 index"]
-    B --> D["Vector embeddings<br/>(optional, OPENAI_EMBED_KEY)"]
+    B --> C["BM25 lexical<br/>(pure Rust)"]
+    B --> D["Vector embeddings<br/>(local candle, f16, offline)"]
+    A --> H["HyDE query expansion"]
+    H --> C
+    H --> D
     C --> E["RRF fusion"]
     D --> E
     E --> F["Top-k chunks"]
     F --> G["Injected into base system prompt<br/>alongside repo-map slice + recalled pitfalls"]
 ```
+
+**Two-channel hybrid retrieval, fully local.** Lexical BM25 (pure Rust, CJK-aware) and dense vector search run as two channels fused with Reciprocal Rank Fusion, with a HyDE-style query expansion widening recall first. The vector channel runs a small bilingual model (`multilingual-e5-small`, f16) **locally via candle** — bundled with the install, no API key, no network, millisecond recall over your own project standards and business docs. It degrades to BM25-only if the model is ever absent (fail-open). No cloud embedding service is required or used.
+
+**It learns from each run.** Mistakes the base hits during a build are recorded with a frequency signal to a local store; on a genuine recurrence umadev asks the base for a higher-level corrective strategy (a *reflection*). Both are recalled into later prompts, so the same pitfall isn't repeated — the longer you use it on a codebase, the less it stumbles on the same thing twice.
 
 Add your own knowledge:
 
@@ -719,7 +726,7 @@ flowchart TB
 | `umadev-agent` | The director engine. Router (typed `RoutePlan`, base-model intent triage), plan state (owned `Plan`/`PlanStep` DAG → `.umadev/plan.json`), firmware builder (`compose_firmware` — identity, standards, knowledge chunks, pitfall recall, repo-map slice), director loop (step drive, verify, bounded self-correct, finalize), critics (nine role seats, parallel forked sessions, structured `RoleVerdict`), trust tiers, lessons store (frequency-signal pitfall recall, HyDE query expansion, BM25+vector RRF fusion). |
 | `umadev-runtime` | `Runtime` trait + `OfflineRuntime` + `RuntimeKind`. The three host drivers implement this trait; umadev owns no model endpoint. |
 | `umadev-host` | `HostDriver` trait for the three bases: `claude`, `codex`, `opencode`. Each implements `umadev_runtime::Runtime`. `BACKEND_IDS` is the authoritative ID list, locked by tests. |
-| `umadev-knowledge` | Structured retrieval over the bundled knowledge corpus. Markdown-aware chunker, pure-Rust BM25 + CJK-bigram tokenizer, optional vector embeddings (`OPENAI_EMBED_KEY`), RRF fusion, mtime-cached BM25 index. Also `repomap`: per-language regex symbol scan, degree-centrality ranked, intent-personalized, token-budgeted, mtime-cached. |
+| `umadev-knowledge` | Structured retrieval over the bundled knowledge corpus. Markdown-aware chunker, pure-Rust BM25 + CJK-bigram tokenizer, a **local vector channel** (`multilingual-e5-small`, f16, via candle — bundled, offline; a remote endpoint via `OPENAI_EMBED_KEY` is an optional override), HyDE query expansion, RRF fusion, mtime-cached BM25 index. Also `repomap`: per-language regex symbol scan, degree-centrality ranked, intent-personalized, token-budgeted, mtime-cached. |
 | `umadev-contract` | Machine-verifiable frontend↔backend API contract. Parses the architecture doc's API table into a typed `ApiSpec`, renders `openapi.{json,yaml}`, extracts frontend `fetch`/`axios` calls, cross-validates. Self-contained OpenAPI subset. |
 | `umadev-tui` | ratatui terminal app over the engine event stream. Markdown rendering, syntax-highlighted code, live word-level diff cards, folding tool rows, build-completion card with clickable preview URL. |
 | `umadev-i18n` | Trilingual (zh-CN / zh-TW / en) string catalogs and system-locale detection for all user-facing text. |
