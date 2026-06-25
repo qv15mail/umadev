@@ -3684,7 +3684,9 @@ fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: boo
     }
     let n = chars.len();
     let period = n + 4; // a short pause after the band leaves the word
-    let head = (tick as usize) % period;
+    // Advance the band every 4th tick so the shimmer sweeps calmly (~320ms/step at
+    // the ~80ms spinner tick) instead of strobing across the word.
+    let head = (tick as usize / 4) % period;
     chars
         .into_iter()
         .enumerate()

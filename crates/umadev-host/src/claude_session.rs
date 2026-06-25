@@ -317,6 +317,15 @@ pub fn session_args(
         "stream-json".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        // Stream incremental text. WITHOUT this, claude buffers the whole assistant
+        // text and emits it as a SINGLE `assistant` block only when generation
+        // completes — so a pure-text chat reply produces ZERO events until the end,
+        // the 60s stall fires, the spinner goes red + freezes, and the answer floods
+        // in at once. With it, claude emits `stream_event` content_block_delta frames
+        // we surface as `TextDelta`s, so the reply renders token-by-token and the
+        // stall clock keeps resetting. (The final aggregate `assistant` text block is
+        // then suppressed in `block_to_event` to avoid doubling the text.)
+        "--include-partial-messages".to_string(),
         "--verbose".to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
@@ -360,6 +369,10 @@ pub fn fork_session_args(main_session_id: &str, fork_session_id: &str) -> Vec<St
         "stream-json".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        // Stream incremental text here too (a critic fork's verdict text must arrive
+        // as deltas, not buffered — see `session_args`). Keeps `block_to_event`'s
+        // text-suppression invariant: text always comes via `stream_event` deltas.
+        "--include-partial-messages".to_string(),
         "--verbose".to_string(),
         // Branch off the main conversation; the new branch gets its own id.
         "--resume".to_string(),
@@ -404,14 +417,39 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         return vec![]; // not JSON (a stray log line) → skip
     };
     match v.get("type").and_then(Value::as_str) {
+        // Incremental text deltas (we launch with `--include-partial-messages`), so
+        // a reply streams token-by-token instead of arriving all at once.
+        Some("stream_event") => parse_stream_event(&v),
         Some("assistant") => parse_assistant(&v),
         Some("user") => parse_user_tool_results(&v),
         Some("result") => vec![parse_result(&v)],
         Some("control_request") => parse_control_request(&v),
-        // system/init, keep_alive, stream_event (no --include-partial-messages),
-        // status, tool_progress, … → not turned into events here.
+        // system/init, keep_alive, status, tool_progress, … → not events.
         _ => vec![],
     }
+}
+
+/// A `stream_event` frame (present with `--include-partial-messages`) → a
+/// `TextDelta` for each `content_block_delta` carrying a `text_delta`. Thinking
+/// deltas, tool-arg (`input_json_delta`) deltas, and the start/stop frames are
+/// ignored — tool calls are surfaced from the final aggregate `assistant` block.
+fn parse_stream_event(v: &Value) -> Vec<SessionEvent> {
+    let Some(event) = v.get("event") else {
+        return vec![];
+    };
+    if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+        return vec![];
+    }
+    let delta = event.get("delta");
+    if delta.and_then(|d| d.get("type")).and_then(Value::as_str) != Some("text_delta") {
+        return vec![]; // thinking_delta / input_json_delta → not displayed text
+    }
+    delta
+        .and_then(|d| d.get("text"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(|t| vec![SessionEvent::TextDelta(t.to_string())])
+        .unwrap_or_default()
 }
 
 /// Assistant content blocks → text deltas + tool calls.
@@ -419,8 +457,11 @@ fn parse_assistant(v: &Value) -> Vec<SessionEvent> {
     let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
         return vec![];
     };
-    if let Some(t) = content.as_str() {
-        return vec![SessionEvent::TextDelta(t.to_string())];
+    // A plain-string content would be the WHOLE buffered text — skip it: the text
+    // already streamed via `stream_event` text deltas, so re-emitting it here would
+    // double the reply.
+    if content.is_string() {
+        return vec![];
     }
     content
         .as_array()
@@ -428,14 +469,13 @@ fn parse_assistant(v: &Value) -> Vec<SessionEvent> {
         .unwrap_or_default()
 }
 
-/// One assistant content block → an event (text / tool_use), or `None`
-/// (thinking / unknown / empty text).
+/// One assistant content block → a tool-call event, or `None`. TEXT blocks are
+/// intentionally skipped: with `--include-partial-messages` the text already
+/// arrived as `stream_event` `TextDelta`s, so emitting the final aggregate text
+/// block here would double the reply. Only tool calls (which we read from the
+/// assembled block) are surfaced.
 fn block_to_event(block: &Value) -> Option<SessionEvent> {
     match block.get("type").and_then(Value::as_str) {
-        Some("text") => {
-            let t = block.get("text").and_then(Value::as_str)?;
-            (!t.is_empty()).then(|| SessionEvent::TextDelta(t.to_string()))
-        }
         Some("tool_use") => {
             let name = block
                 .get("name")
@@ -670,7 +710,7 @@ mod tests {
         let fake = write_fake_claude(
             &tmp,
             "#!/bin/sh\nread _line\n\
-             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"accepts\\\":true}\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"accepts\\\":true}\"}}}'\n\
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
              cat >/dev/null\n",
         );
@@ -701,22 +741,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_assistant_yields_text_then_toolcall() {
+    fn parse_assistant_yields_toolcall_only_text_streams_separately() {
+        // The text block is suppressed here — it already streamed as `stream_event`
+        // deltas (see `parse_stream_event_yields_text_delta`). Only the tool call
+        // surfaces from the assembled assistant block, so the reply isn't doubled.
         let line = r#"{"type":"assistant","message":{"content":[
             {"type":"text","text":"writing the page"},
             {"type":"tool_use","name":"Write","input":{"file_path":"src/App.tsx"}}
         ]}}"#;
         let evs = parse_stdout_line(line);
-        assert_eq!(evs.len(), 2);
-        assert_eq!(
-            evs[0],
-            SessionEvent::TextDelta("writing the page".to_string())
-        );
-        let SessionEvent::ToolCall { name, input } = &evs[1] else {
-            panic!("expected ToolCall, got {:?}", evs[1]);
+        assert_eq!(evs.len(), 1, "text suppressed, only the tool call: {evs:?}");
+        let SessionEvent::ToolCall { name, input } = &evs[0] else {
+            panic!("expected ToolCall, got {:?}", evs[0]);
         };
         assert_eq!(name, "Write");
         assert_eq!(input["file_path"], "src/App.tsx");
+    }
+
+    #[test]
+    fn parse_stream_event_yields_text_delta() {
+        // `--include-partial-messages` makes claude stream text as content_block_delta
+        // frames — the fix for the 60s-stall freeze on a plain chat reply.
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#;
+        assert_eq!(
+            parse_stdout_line(line),
+            vec![SessionEvent::TextDelta("Hello".to_string())]
+        );
+        // A thinking / tool-arg delta is NOT surfaced as displayed text.
+        let think = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
+        assert!(parse_stdout_line(think).is_empty());
+        // The session is actually launched with the flag (both main + fork).
+        assert!(session_args("sid", None, false)
+            .iter()
+            .any(|a| a == "--include-partial-messages"));
+        assert!(fork_session_args("m", "f")
+            .iter()
+            .any(|a| a == "--include-partial-messages"));
     }
 
     #[test]
@@ -817,6 +877,7 @@ mod tests {
             &tmp,
             "#!/bin/sh\nread _line\n\
              printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"x\"}'\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}}'\n\
              printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"},{\"type\":\"tool_use\",\"name\":\"Write\",\"input\":{\"file_path\":\"App.tsx\"}}]}}'\n\
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
              cat >/dev/null\n",
@@ -859,7 +920,7 @@ mod tests {
         let fake = write_fake_claude(
             &tmp,
             "#!/bin/sh\nread _line\n\
-             printf '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\\n' \"$UMADEV_GOVERN_ROOT\"\n\
+             printf '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"%s\"}}}\\n' \"$UMADEV_GOVERN_ROOT\"\n\
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
              cat >/dev/null\n",
         );

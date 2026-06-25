@@ -641,6 +641,9 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
     let mut byte_stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut data_lines: Vec<String> = Vec::new();
+    // Per-text-part emitted length, so a cumulative text update only forwards its
+    // new suffix (see `translate_part`). Lives for the whole subscription.
+    let mut text_lens: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     while let Some(chunk) = byte_stream.next().await {
         let Ok(bytes) = chunk else {
             break; // stream error -> fall through to terminal Failed
@@ -656,7 +659,7 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
                 if !data_lines.is_empty() {
                     let payload = data_lines.join("\n");
                     data_lines.clear();
-                    for ev in translate_frame(&payload, &session_id) {
+                    for ev in translate_frame_tracked(&payload, &session_id, &mut text_lens) {
                         if tx.send(ev).await.is_err() {
                             return; // consumer dropped
                         }
@@ -683,14 +686,31 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
 /// more normalized [`SessionEvent`]s, scoped to `session_id`. Unknown / off-
 /// session / malformed frames yield nothing (fail-open). Mirrors opencode's own
 /// consumer in `cli/cmd/run.ts`.
+#[must_use]
 pub fn translate_frame(payload: &str, session_id: &str) -> Vec<SessionEvent> {
+    // Fresh tracker — correct for a single, standalone frame (the whole text IS the
+    // suffix). The streaming pump uses `translate_frame_tracked` with a persistent
+    // tracker so multi-update text parts only forward their new suffix.
+    translate_frame_tracked(payload, session_id, &mut std::collections::HashMap::new())
+}
+
+/// Like [`translate_frame`] but threads a persistent `text_lens` tracker so a
+/// cumulative text part (opencode resends the whole accumulated text each update)
+/// only forwards its NEW suffix.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn translate_frame_tracked(
+    payload: &str,
+    session_id: &str,
+    text_lens: &mut std::collections::HashMap<String, usize>,
+) -> Vec<SessionEvent> {
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return Vec::new();
     };
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     let props = v.get("properties").cloned().unwrap_or(Value::Null);
     match kind {
-        "message.part.updated" => translate_part(&props, session_id),
+        "message.part.updated" => translate_part(&props, session_id, text_lens),
         "session.error" => translate_error(&props, session_id),
         "permission.asked" => translate_permission(&props, session_id),
         "session.status" => translate_status(&props, session_id),
@@ -701,8 +721,14 @@ pub fn translate_frame(payload: &str, session_id: &str) -> Vec<SessionEvent> {
 
 /// `message.part.updated` -> `ToolCall`/`ToolResult` (for `part.type=="tool"`)
 /// or `TextDelta` (for `part.type=="text"`). Tool input/output schema:
-/// `core/src/v1/session.ts ToolPart`/`ToolState`.
-fn translate_part(props: &Value, session_id: &str) -> Vec<SessionEvent> {
+/// `core/src/v1/session.ts ToolPart`/`ToolState`. `text_lens` tracks how much of
+/// each text part we have already emitted, so a cumulative text update only emits
+/// its NEW suffix (opencode resends the whole accumulated text every update).
+fn translate_part(
+    props: &Value,
+    session_id: &str,
+    text_lens: &mut std::collections::HashMap<String, usize>,
+) -> Vec<SessionEvent> {
     let Some(part) = props.get("part") else {
         return Vec::new();
     };
@@ -748,12 +774,38 @@ fn translate_part(props: &Value, session_id: &str) -> Vec<SessionEvent> {
                 _ => Vec::new(),
             }
         }
-        Some("text") => part
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(|t| vec![SessionEvent::TextDelta(t.to_string())])
-            .unwrap_or_default(),
+        Some("text") => {
+            let Some(full) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+            else {
+                return Vec::new();
+            };
+            // opencode resends the FULL accumulated text of the part on every
+            // update; emit only the NEW suffix since we last saw THIS part (by id)
+            // so the consumer's append doesn't pile up 'H','He','Hel',… Without
+            // this the reply is duplicated and grows quadratically.
+            let id = part
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let prev = text_lens.get(&id).copied().unwrap_or(0);
+            // Cumulative growth → suffix; a non-monotonic / replaced part (shorter,
+            // or `prev` not a char boundary) re-emits the whole current text.
+            let suffix = if full.len() >= prev && full.is_char_boundary(prev) {
+                &full[prev..]
+            } else {
+                full
+            };
+            text_lens.insert(id, full.len());
+            if suffix.is_empty() {
+                Vec::new()
+            } else {
+                vec![SessionEvent::TextDelta(suffix.to_string())]
+            }
+        }
         _ => Vec::new(),
     }
 }
@@ -1122,6 +1174,41 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cumulative_text_part_emits_only_the_new_suffix() {
+        // opencode resends the WHOLE accumulated text of a part on every update.
+        // With a persistent tracker, each update must forward only its new suffix —
+        // otherwise the consumer's append duplicates ('H','He','Hel',…).
+        let mut lens = std::collections::HashMap::new();
+        let part = |text: &str| {
+            serde_json::json!({
+                "type": "message.part.updated",
+                "properties": { "part": {
+                    "id": "prt_1", "sessionID": "ses_abc", "type": "text", "text": text
+                }}
+            })
+            .to_string()
+        };
+        let e1 = translate_frame_tracked(&part("Hello"), "ses_abc", &mut lens);
+        assert_eq!(e1, vec![SessionEvent::TextDelta("Hello".to_string())]);
+        // Next update carries the FULL text again ("Hello world") → only " world".
+        let e2 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut lens);
+        assert_eq!(e2, vec![SessionEvent::TextDelta(" world".to_string())]);
+        // No growth → nothing emitted (not a duplicate).
+        let e3 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut lens);
+        assert!(e3.is_empty(), "no new text → no delta: {e3:?}");
+        // Reassembling the suffixes equals the final cumulative text.
+        let joined: String = [e1, e2, e3]
+            .concat()
+            .into_iter()
+            .map(|e| match e {
+                SessionEvent::TextDelta(t) => t,
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(joined, "Hello world");
     }
 
     #[test]
