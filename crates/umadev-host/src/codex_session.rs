@@ -796,23 +796,52 @@ fn parse_codex_usage(payload: &Value) -> Option<Usage> {
     })
 }
 
-/// Find the object that actually holds the token-count fields, probing the
-/// nestings codex has used across versions. Fail-open: `None` if none match.
+/// Find the object that actually holds the token-count fields. **Prefers the
+/// PER-TURN delta (`last_token_usage`) over the cumulative `total_token_usage`**:
+/// the consumer appends every turn's usage to `usage.jsonl` and `/usage` SUMS the
+/// rows, so recording the cumulative each turn would overcount (~O(N²) across N
+/// turns). Verified against a real `~/.codex` rollout — codex nests the counts
+/// under `info.{last,total}_token_usage`, each `{input_tokens, cached_input_tokens,
+/// output_tokens, reasoning_output_tokens, total_tokens}`; the old probe read
+/// `tokenUsage`/`usage` DIRECTLY and so saw zero token fields → always estimated.
+/// Fail-open: `None` if nothing usable matches → the consumer estimates.
 fn codex_usage_object(payload: &Value) -> Option<&Value> {
-    // Direct candidates, in priority order.
+    // The per-turn delta object, across the spellings codex has used.
+    fn per_turn(obj: &Value) -> Option<&Value> {
+        obj.get("last_token_usage")
+            .or_else(|| obj.get("lastTokenUsage"))
+            .or_else(|| obj.get("last"))
+    }
+    // A flat object that carries the token fields directly (legacy / `codex exec`).
+    fn is_flat(v: &Value) -> bool {
+        v.get("input_tokens").is_some() || v.get("inputTokens").is_some()
+    }
+    // 1) Per-turn delta: at the params root, then under a wrapper.
+    if let Some(u) = per_turn(payload) {
+        return Some(u);
+    }
+    for parent in ["usage", "info", "turn", "tokenUsage", "token_usage"] {
+        if let Some(u) = payload.get(parent).and_then(per_turn) {
+            return Some(u);
+        }
+    }
+    // 2) Legacy flat fallback — only an object that truly has token fields, so a
+    //    `{last,total}` wrapper is never mistaken for a flat usage object.
     for key in ["usage", "tokenUsage", "token_usage"] {
         if let Some(u) = payload.get(key) {
-            return Some(u);
+            if is_flat(u) {
+                return Some(u);
+            }
         }
     }
-    // One level down (`info.usage`, `turn.usage`).
     for parent in ["info", "turn"] {
         if let Some(u) = payload.get(parent).and_then(|p| p.get("usage")) {
-            return Some(u);
+            if is_flat(u) {
+                return Some(u);
+            }
         }
     }
-    // The payload itself may BE the usage object (token fields at the root).
-    if payload.get("input_tokens").is_some() || payload.get("inputTokens").is_some() {
+    if is_flat(payload) {
         return Some(payload);
     }
     None
@@ -1537,7 +1566,9 @@ mod tests {
         let latest_usage = empty_usage();
         let (tx, mut rx) = chan();
 
-        let usage_note = r#"{"method":"thread/tokenUsage/updated","params":{"usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4}}}"#;
+        // Real codex wire shape (verified against a ~/.codex rollout): the counts
+        // are nested under `info.{last,total}_token_usage`, NOT flat on `usage`.
+        let usage_note = r#"{"method":"thread/tokenUsage/updated","params":{"info":{"last_token_usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4,"total_tokens":22678},"total_token_usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4,"total_tokens":22678}}}}"#;
         dispatch_line(
             usage_note,
             &pending,
@@ -1570,6 +1601,48 @@ mod tests {
             next.is_none(),
             "stale usage must not leak into the next turn"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_line_records_per_turn_last_usage_not_cumulative_total() {
+        // The consumer APPENDS each turn's usage to usage.jsonl and `/usage` SUMS
+        // the rows, so each TurnDone must carry the PER-TURN delta (`last_*`), never
+        // the running cumulative (`total_*`) — else N turns overcount ~O(N²). Drive
+        // two turns where `total` accumulates but `last` differs, and assert each
+        // TurnDone reports its own turn's `last`, summing to the final `total`.
+        let pending = empty_pending();
+        let approvals = empty_approvals();
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
+        let (tx, mut rx) = chan();
+        let done =
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t","status":"completed"}}}"#;
+
+        // Turn 1: last == total (first turn).
+        let u1 = r#"{"method":"thread/tokenUsage/updated","params":{"info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#;
+        dispatch_line(u1, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { usage: Some(a), .. } = rx.recv().await.unwrap() else {
+            panic!("turn 1 usage");
+        };
+
+        // Turn 2: total accumulated to 150/15, but THIS turn's delta is 50/5.
+        let u2 = r#"{"method":"thread/tokenUsage/updated","params":{"info":{"last_token_usage":{"input_tokens":50,"output_tokens":5},"total_token_usage":{"input_tokens":150,"output_tokens":15}}}}"#;
+        dispatch_line(u2, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { usage: Some(b), .. } = rx.recv().await.unwrap() else {
+            panic!("turn 2 usage");
+        };
+
+        assert_eq!((a.input_tokens, a.output_tokens), (100, 10), "turn 1 = its own last");
+        assert_eq!(
+            (b.input_tokens, b.output_tokens),
+            (50, 5),
+            "turn 2 must be the PER-TURN delta (50/5), not the cumulative total (150/15)"
+        );
+        // The per-turn rows sum to the final cumulative total — no overcount.
+        assert_eq!(a.input_tokens + b.input_tokens, 150);
+        assert_eq!(a.output_tokens + b.output_tokens, 15);
     }
 
     #[tokio::test]

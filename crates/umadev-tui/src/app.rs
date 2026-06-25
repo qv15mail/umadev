@@ -2635,6 +2635,7 @@ impl App {
                 // A fresh block clears any prior aborted terminal state — this
                 // run is live again.
                 self.aborted = false;
+                self.stream_chars = 0; // fresh run → reset the progress counter on every turn-start path
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
                     ChatRole::UmaDev,
