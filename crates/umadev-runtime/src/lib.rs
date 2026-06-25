@@ -553,6 +553,15 @@ pub enum SessionEvent {
     TurnDone {
         /// How the turn ended.
         status: TurnStatus,
+        /// REAL token usage reported by the base for this turn, when the base's
+        /// live protocol carries it (claude's stream-json `result` line; codex's
+        /// `turn/completed` / `thread/tokenUsage/updated` notification). `None`
+        /// when the base does not report per-turn usage on its live stream
+        /// (opencode's SSE carries none) — the consumer then falls back to a
+        /// deterministic `chars/4` estimate so `/usage` stays non-empty but
+        /// honest. **Fail-open:** an unparseable usage payload yields `None`,
+        /// never a wrong number and never a panic.
+        usage: Option<Usage>,
     },
 }
 

@@ -808,10 +808,12 @@ mod tests {
                     .push_back(SessionEvent::TextDelta(self.fork_reply.clone()));
                 self.queue.push_back(SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 });
             } else {
                 self.queue.push_back(SessionEvent::TurnDone {
                     status: self.status.clone(),
+                    usage: None,
                 });
             }
             Ok(())

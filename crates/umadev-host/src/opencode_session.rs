@@ -621,6 +621,9 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
             let _ = tx
                 .send(SessionEvent::TurnDone {
                     status: TurnStatus::Failed(format!("event stream: HTTP {}", r.status())),
+                    // opencode's SSE carries no token usage → always None; the
+                    // consumer estimates (chars/4) so `/usage` stays honest (F3).
+                    usage: None,
                 })
                 .await;
             return;
@@ -629,6 +632,7 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
             let _ = tx
                 .send(SessionEvent::TurnDone {
                     status: TurnStatus::Failed(format!("event stream connect: {e}")),
+                    usage: None,
                 })
                 .await;
             return;
@@ -641,9 +645,11 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
     let mut byte_stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut data_lines: Vec<String> = Vec::new();
-    // Per-text-part emitted length, so a cumulative text update only forwards its
-    // new suffix (see `translate_part`). Lives for the whole subscription.
-    let mut text_lens: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Per-part streaming state (text suffix lengths + which tools already emitted a
+    // ToolCall), so a cumulative text update forwards only its new suffix and a
+    // tool that skipped its `running` frame still gets a back-filled ToolCall (F6).
+    // Lives for the whole subscription.
+    let mut tracker = PartTracker::default();
     while let Some(chunk) = byte_stream.next().await {
         let Ok(bytes) = chunk else {
             break; // stream error -> fall through to terminal Failed
@@ -659,7 +665,7 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
                 if !data_lines.is_empty() {
                     let payload = data_lines.join("\n");
                     data_lines.clear();
-                    for ev in translate_frame_tracked(&payload, &session_id, &mut text_lens) {
+                    for ev in translate_frame_tracked(&payload, &session_id, &mut tracker) {
                         if tx.send(ev).await.is_err() {
                             return; // consumer dropped
                         }
@@ -678,8 +684,23 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
     let _ = tx
         .send(SessionEvent::TurnDone {
             status: TurnStatus::Failed("event stream ended".to_string()),
+            usage: None,
         })
         .await;
+}
+
+/// Per-subscription state the streaming pump threads across SSE frames.
+///
+/// - `text_lens`: how much of each cumulative TEXT part has already been emitted,
+///   so a resent full-text update forwards only its NEW suffix.
+/// - `tools_called`: the tool part ids for which a [`SessionEvent::ToolCall`] has
+///   already been emitted, so the `completed`/`error` branch can BACK-FILL a
+///   missing `ToolCall` when a fast / SSE-merged tool skipped its `running` frame
+///   (F6) — without double-emitting for the normal `running → completed` path.
+#[derive(Default)]
+pub struct PartTracker {
+    text_lens: std::collections::HashMap<String, usize>,
+    tools_called: std::collections::HashSet<String>,
 }
 
 /// Translate one SSE frame's JSON payload (`{id,type,properties}`) into zero or
@@ -691,18 +712,18 @@ pub fn translate_frame(payload: &str, session_id: &str) -> Vec<SessionEvent> {
     // Fresh tracker — correct for a single, standalone frame (the whole text IS the
     // suffix). The streaming pump uses `translate_frame_tracked` with a persistent
     // tracker so multi-update text parts only forward their new suffix.
-    translate_frame_tracked(payload, session_id, &mut std::collections::HashMap::new())
+    translate_frame_tracked(payload, session_id, &mut PartTracker::default())
 }
 
-/// Like [`translate_frame`] but threads a persistent `text_lens` tracker so a
+/// Like [`translate_frame`] but threads a persistent [`PartTracker`] so a
 /// cumulative text part (opencode resends the whole accumulated text each update)
-/// only forwards its NEW suffix.
+/// only forwards its NEW suffix, and a tool that skipped its `running` frame still
+/// gets a back-filled `ToolCall` (F6).
 #[must_use]
-#[allow(clippy::implicit_hasher)]
 pub fn translate_frame_tracked(
     payload: &str,
     session_id: &str,
-    text_lens: &mut std::collections::HashMap<String, usize>,
+    tracker: &mut PartTracker,
 ) -> Vec<SessionEvent> {
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return Vec::new();
@@ -710,7 +731,7 @@ pub fn translate_frame_tracked(
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     let props = v.get("properties").cloned().unwrap_or(Value::Null);
     match kind {
-        "message.part.updated" => translate_part(&props, session_id, text_lens),
+        "message.part.updated" => translate_part(&props, session_id, tracker),
         "session.error" => translate_error(&props, session_id),
         "permission.asked" => translate_permission(&props, session_id),
         "session.status" => translate_status(&props, session_id),
@@ -768,11 +789,7 @@ fn normalize_tool_input(mut input: Value) -> Value {
 /// `core/src/v1/session.ts ToolPart`/`ToolState`. `text_lens` tracks how much of
 /// each text part we have already emitted, so a cumulative text update only emits
 /// its NEW suffix (opencode resends the whole accumulated text every update).
-fn translate_part(
-    props: &Value,
-    session_id: &str,
-    text_lens: &mut std::collections::HashMap<String, usize>,
-) -> Vec<SessionEvent> {
+fn translate_part(props: &Value, session_id: &str, tracker: &mut PartTracker) -> Vec<SessionEvent> {
     let Some(part) = props.get("part") else {
         return Vec::new();
     };
@@ -780,48 +797,7 @@ fn translate_part(
         return Vec::new();
     }
     match part.get("type").and_then(Value::as_str) {
-        Some("tool") => {
-            // Normalize opencode's tool shape to the claude-shaped names + input
-            // keys the agent-side consumers (diff card, audit, governance,
-            // tool-row detail) recognize. opencode emits lowercase `write`/`edit`
-            // and camelCase `filePath`/`oldString`/`newString`; without this an
-            // opencode edit renders NO diff card and its audit/path attribution is
-            // blank (it only matches `file_path` + capitalized `Write`/`Edit`).
-            let name = normalize_tool_name(
-                part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
-            );
-            let state = part.get("state").cloned().unwrap_or(Value::Null);
-            let status = state.get("status").and_then(Value::as_str).unwrap_or("");
-            let input = normalize_tool_input(state.get("input").cloned().unwrap_or(Value::Null));
-            match status {
-                // running = the tool actually started (input now finalized,
-                // incl. the write path) — surface as the ToolCall truth.
-                "running" => vec![SessionEvent::ToolCall { name, input }],
-                "completed" => {
-                    let summary = state
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .or_else(|| state.get("output").and_then(Value::as_str))
-                        .unwrap_or("")
-                        .chars()
-                        .take(200)
-                        .collect();
-                    vec![SessionEvent::ToolResult { ok: true, summary }]
-                }
-                "error" => {
-                    let summary = state
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool error")
-                        .chars()
-                        .take(200)
-                        .collect();
-                    vec![SessionEvent::ToolResult { ok: false, summary }]
-                }
-                // pending = queued, no finalized input yet -> wait for running.
-                _ => Vec::new(),
-            }
-        }
+        Some("tool") => translate_tool_part(part, tracker),
         Some("text") => {
             let Some(full) = part
                 .get("text")
@@ -839,7 +815,7 @@ fn translate_part(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let prev = text_lens.get(&id).copied().unwrap_or(0);
+            let prev = tracker.text_lens.get(&id).copied().unwrap_or(0);
             // Cumulative growth → suffix; a non-monotonic / replaced part (shorter,
             // or `prev` not a char boundary) re-emits the whole current text.
             let suffix = if full.len() >= prev && full.is_char_boundary(prev) {
@@ -847,7 +823,7 @@ fn translate_part(
             } else {
                 full
             };
-            text_lens.insert(id, full.len());
+            tracker.text_lens.insert(id, full.len());
             if suffix.is_empty() {
                 Vec::new()
             } else {
@@ -855,6 +831,113 @@ fn translate_part(
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Translate a `part.type=="tool"` update into `ToolCall` / `ToolResult` events,
+/// tracking emission so a tool that SKIPPED its `running` frame still surfaces.
+///
+/// opencode normally streams a tool as `pending → running → completed`, and we
+/// emit the `ToolCall` truth on `running` (input finalized, incl. the write
+/// path). But a fast tool, or coalesced SSE frames, can deliver `pending →
+/// completed` with NO standalone `running` frame — and the old code then emitted
+/// ONLY a `ToolResult`, so that write never entered the audit trail and rendered
+/// no tool row / diff (F6). Now, on `completed`/`error`, if this part never
+/// emitted a `ToolCall` and we have a usable input, we BACK-FILL the `ToolCall`
+/// (normalized name + input) before the `ToolResult`. The `tools_called` set keeps
+/// the normal `running → completed` path from double-emitting.
+fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEvent> {
+    // Normalize opencode's tool shape to the claude-shaped names + input keys the
+    // agent-side consumers (diff card, audit, governance, tool-row detail)
+    // recognize. opencode emits lowercase `write`/`edit` and camelCase
+    // `filePath`/`oldString`/`newString`; without this an opencode edit renders NO
+    // diff card and its audit/path attribution is blank.
+    let name = normalize_tool_name(part.get("tool").and_then(Value::as_str).unwrap_or("tool"));
+    let state = part.get("state").cloned().unwrap_or(Value::Null);
+    let status = state.get("status").and_then(Value::as_str).unwrap_or("");
+    let input = normalize_tool_input(state.get("input").cloned().unwrap_or(Value::Null));
+    // A stable id for THIS tool part so back-fill is per-part (fail-open to the
+    // call id, else the empty string → a single anonymous part, still correct for
+    // the common single-tool frame).
+    let part_id = part
+        .get("id")
+        .or_else(|| part.get("callID"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match status {
+        // running = the tool actually started (input now finalized) — the ToolCall
+        // truth. Mark the part so a later `completed` doesn't re-emit it.
+        "running" => {
+            tracker.tools_called.insert(part_id);
+            vec![SessionEvent::ToolCall { name, input }]
+        }
+        "completed" => {
+            let summary = state
+                .get("title")
+                .and_then(Value::as_str)
+                .or_else(|| state.get("output").and_then(Value::as_str))
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect();
+            backfilled_tool_events(
+                tracker,
+                &part_id,
+                &name,
+                &input,
+                SessionEvent::ToolResult { ok: true, summary },
+            )
+        }
+        "error" => {
+            let summary = state
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("tool error")
+                .chars()
+                .take(200)
+                .collect();
+            backfilled_tool_events(
+                tracker,
+                &part_id,
+                &name,
+                &input,
+                SessionEvent::ToolResult { ok: false, summary },
+            )
+        }
+        // pending = queued, no finalized input yet -> wait for running/completed.
+        _ => Vec::new(),
+    }
+}
+
+/// Build the events for a terminal (`completed` / `error`) tool frame, BACK-FILLING
+/// a `ToolCall` first if this part never emitted one and it carries a usable input
+/// (F6). The `result` event is always emitted. Marks the part as called so a
+/// duplicate terminal frame can't re-emit the `ToolCall`.
+fn backfilled_tool_events(
+    tracker: &mut PartTracker,
+    part_id: &str,
+    name: &str,
+    input: &Value,
+    result: SessionEvent,
+) -> Vec<SessionEvent> {
+    let already_called = tracker.tools_called.contains(part_id);
+    // Only back-fill when we have a real input object — a terminal frame with no
+    // recoverable input can't be a faithful ToolCall (fail-open: just the result,
+    // exactly as before). A non-null object (even `{}`) is enough: the consumer
+    // keys off the tool NAME for the audit/diff, and a `{}` still attributes it.
+    let have_input = !input.is_null();
+    if !already_called && have_input {
+        tracker.tools_called.insert(part_id.to_string());
+        vec![
+            SessionEvent::ToolCall {
+                name: name.to_string(),
+                input: input.clone(),
+            },
+            result,
+        ]
+    } else {
+        vec![result]
     }
 }
 
@@ -879,6 +962,8 @@ fn translate_error(props: &Value, session_id: &str) -> Vec<SessionEvent> {
         .to_string();
     vec![SessionEvent::TurnDone {
         status: TurnStatus::Failed(msg),
+        // opencode's SSE reports no token usage (F3) → estimate downstream.
+        usage: None,
     }]
 }
 
@@ -930,6 +1015,8 @@ fn translate_status(props: &Value, session_id: &str) -> Vec<SessionEvent> {
     if idle {
         vec![SessionEvent::TurnDone {
             status: TurnStatus::Completed,
+            // opencode's SSE reports no token usage (F3) → estimate downstream.
+            usage: None,
         }]
     } else {
         Vec::new()
@@ -1248,7 +1335,7 @@ mod tests {
         // opencode resends the WHOLE accumulated text of a part on every update.
         // With a persistent tracker, each update must forward only its new suffix —
         // otherwise the consumer's append duplicates ('H','He','Hel',…).
-        let mut lens = std::collections::HashMap::new();
+        let mut tracker = PartTracker::default();
         let part = |text: &str| {
             serde_json::json!({
                 "type": "message.part.updated",
@@ -1258,13 +1345,13 @@ mod tests {
             })
             .to_string()
         };
-        let e1 = translate_frame_tracked(&part("Hello"), "ses_abc", &mut lens);
+        let e1 = translate_frame_tracked(&part("Hello"), "ses_abc", &mut tracker);
         assert_eq!(e1, vec![SessionEvent::TextDelta("Hello".to_string())]);
         // Next update carries the FULL text again ("Hello world") → only " world".
-        let e2 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut lens);
+        let e2 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut tracker);
         assert_eq!(e2, vec![SessionEvent::TextDelta(" world".to_string())]);
         // No growth → nothing emitted (not a duplicate).
-        let e3 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut lens);
+        let e3 = translate_frame_tracked(&part("Hello world"), "ses_abc", &mut tracker);
         assert!(e3.is_empty(), "no new text → no delta: {e3:?}");
         // Reassembling the suffixes equals the final cumulative text.
         let joined: String = [e1, e2, e3]
@@ -1279,7 +1366,10 @@ mod tests {
     }
 
     #[test]
-    fn translate_tool_completed_and_error_are_toolresults() {
+    fn translate_tool_completed_and_error_carry_a_toolresult() {
+        // A terminal tool frame always yields a ToolResult (the LAST event). With a
+        // fresh tracker (no prior `running`), F6 ALSO back-fills a leading ToolCall —
+        // asserted separately below; here we lock the result event itself.
         let done = serde_json::json!({
             "type": "message.part.updated",
             "properties": { "part": {
@@ -1287,12 +1377,12 @@ mod tests {
                 "state": { "status": "completed", "input": {}, "output": "ok", "title": "ran npm test" }
             }}
         }).to_string();
-        match &translate_frame(&done, "ses_abc")[0] {
-            SessionEvent::ToolResult { ok, summary } => {
+        match translate_frame(&done, "ses_abc").last() {
+            Some(SessionEvent::ToolResult { ok, summary }) => {
                 assert!(ok);
                 assert_eq!(summary, "ran npm test");
             }
-            other => panic!("expected ok ToolResult, got {other:?}"),
+            other => panic!("expected ok ToolResult last, got {other:?}"),
         }
 
         let err = serde_json::json!({
@@ -1303,13 +1393,121 @@ mod tests {
             }}
         })
         .to_string();
-        match &translate_frame(&err, "ses_abc")[0] {
-            SessionEvent::ToolResult { ok, summary } => {
+        match translate_frame(&err, "ses_abc").last() {
+            Some(SessionEvent::ToolResult { ok, summary }) => {
                 assert!(!ok);
                 assert_eq!(summary, "exit 1");
             }
-            other => panic!("expected failed ToolResult, got {other:?}"),
+            other => panic!("expected failed ToolResult last, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn running_then_completed_emits_one_toolcall_then_a_result() {
+        // The NORMAL path: a tool streams `running → completed`. The ToolCall fires
+        // on `running`; the `completed` frame must NOT re-emit it (the back-fill is
+        // suppressed because this part already emitted a ToolCall). F6 regression.
+        let mut tracker = PartTracker::default();
+        let frame = |status: &str| {
+            serde_json::json!({
+                "type": "message.part.updated",
+                "properties": { "part": {
+                    "id": "prt_w", "sessionID": "ses_abc", "type": "tool", "tool": "write",
+                    "state": {
+                        "status": status,
+                        "input": { "filePath": "src/app.ts", "content": "export const x = 1;" },
+                        "title": "wrote src/app.ts"
+                    }
+                }}
+            })
+            .to_string()
+        };
+        let running = translate_frame_tracked(&frame("running"), "ses_abc", &mut tracker);
+        assert_eq!(
+            running.len(),
+            1,
+            "running → exactly one ToolCall: {running:?}"
+        );
+        match &running[0] {
+            SessionEvent::ToolCall { name, input } => {
+                assert_eq!(name, "Write");
+                // camelCase input key was normalized to snake_case for the consumer.
+                assert_eq!(input["file_path"], "src/app.ts");
+            }
+            other => panic!("expected a Write ToolCall, got {other:?}"),
+        }
+        // The completion now yields ONLY a ToolResult (no duplicate ToolCall).
+        let completed = translate_frame_tracked(&frame("completed"), "ses_abc", &mut tracker);
+        assert_eq!(
+            completed,
+            vec![SessionEvent::ToolResult {
+                ok: true,
+                summary: "wrote src/app.ts".to_string()
+            }],
+            "completed after running must not re-emit the ToolCall"
+        );
+    }
+
+    #[test]
+    fn merged_tool_frame_backfills_a_toolcall_so_the_write_is_audited() {
+        // F6: a fast / SSE-merged tool jumps `pending → completed` with NO standalone
+        // `running` frame. The old code emitted ONLY a ToolResult, so the write never
+        // entered the audit trail and rendered no tool row / diff. Now the terminal
+        // frame BACK-FILLS the ToolCall (normalized name + input) before the result.
+        let mut tracker = PartTracker::default();
+        let merged = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "id": "prt_m", "sessionID": "ses_abc", "type": "tool", "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": "src/new.ts", "content": "export const y = 2;" },
+                    "title": "wrote src/new.ts"
+                }
+            }}
+        })
+        .to_string();
+        let evs = translate_frame_tracked(&merged, "ses_abc", &mut tracker);
+        assert_eq!(evs.len(), 2, "merged tool → ToolCall + ToolResult: {evs:?}");
+        match &evs[0] {
+            SessionEvent::ToolCall { name, input } => {
+                assert_eq!(name, "Write", "back-filled call uses the normalized name");
+                assert_eq!(
+                    input["file_path"], "src/new.ts",
+                    "back-filled call carries the normalized input (so audit + diff work)"
+                );
+            }
+            other => panic!("expected a back-filled Write ToolCall first, got {other:?}"),
+        }
+        assert!(
+            matches!(&evs[1], SessionEvent::ToolResult { ok: true, .. }),
+            "the ToolResult still follows: {:?}",
+            evs[1]
+        );
+    }
+
+    #[test]
+    fn merged_tool_frame_with_no_input_degrades_to_result_only() {
+        // Fail-open: a terminal frame with NO recoverable input can't be a faithful
+        // ToolCall → just the ToolResult (exactly as before F6), never a bogus call.
+        let mut tracker = PartTracker::default();
+        let no_input = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "id": "prt_n", "sessionID": "ses_abc", "type": "tool", "tool": "bash",
+                "state": { "status": "completed", "title": "ok" }
+            }}
+        })
+        .to_string();
+        let evs = translate_frame_tracked(&no_input, "ses_abc", &mut tracker);
+        assert_eq!(
+            evs,
+            vec![SessionEvent::ToolResult {
+                ok: true,
+                summary: "ok".to_string()
+            }],
+            "no input → result only (no spurious ToolCall): {evs:?}"
+        );
     }
 
     #[test]
@@ -1335,7 +1533,7 @@ mod tests {
         })
         .to_string();
         match &translate_frame(&frame, "ses_abc")[0] {
-            SessionEvent::TurnDone { status } => assert_eq!(*status, TurnStatus::Completed),
+            SessionEvent::TurnDone { status, .. } => assert_eq!(*status, TurnStatus::Completed),
             other => panic!("expected TurnDone(Completed), got {other:?}"),
         }
         // A `busy` status carries no turn semantics.
@@ -1381,7 +1579,7 @@ mod tests {
         })
         .to_string();
         match &translate_frame(&frame, "ses_abc")[0] {
-            SessionEvent::TurnDone { status } => {
+            SessionEvent::TurnDone { status, .. } => {
                 assert_eq!(*status, TurnStatus::Failed("rate limited".to_string()));
             }
             other => panic!("expected TurnDone(Failed), got {other:?}"),
@@ -1521,7 +1719,7 @@ mod tests {
             "expected an ok ToolResult: {got:?}"
         );
         assert!(
-            matches!(got.last(), Some(SessionEvent::TurnDone { status }) if *status == TurnStatus::Completed),
+            matches!(got.last(), Some(SessionEvent::TurnDone { status, .. }) if *status == TurnStatus::Completed),
             "last event must be a clean idle TurnDone: {got:?}"
         );
 
@@ -1714,7 +1912,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(pump_sse(http, "ses_dead".to_string(), tx));
         match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-            Ok(Some(SessionEvent::TurnDone { status })) => {
+            Ok(Some(SessionEvent::TurnDone { status, .. })) => {
                 assert!(matches!(status, TurnStatus::Failed(_)));
             }
             other => panic!("expected a Failed TurnDone, got {other:?}"),

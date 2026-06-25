@@ -788,6 +788,7 @@ mod tests {
                 SessionEvent::TextDelta("{\"steps\":[]}".into()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
             ],
             false,

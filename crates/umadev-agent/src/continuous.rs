@@ -493,7 +493,7 @@ async fn drive_phase(
                     return PhaseResult::Failed(format!("respond: {e}"));
                 }
             }
-            SessionEvent::TurnDone { status } => {
+            SessionEvent::TurnDone { status, .. } => {
                 return finish_turn(options, events, phase, status)
             }
         }
@@ -1727,9 +1727,15 @@ async fn drive_rework_turn_with_idle(
                     };
                 }
             }
-            SessionEvent::TurnDone { status } => {
-                // Record this turn's estimated usage on the DEFAULT loop (fail-open).
-                crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
+            SessionEvent::TurnDone { status, usage } => {
+                // Record this turn's usage on the DEFAULT loop (fail-open). F3:
+                // prefer the base's REAL reported usage (claude/codex), falling
+                // back to the chars/4 estimate (opencode, or any base that didn't
+                // report). Mirrors `director_loop::drive_one_turn`.
+                crate::director_loop::record_estimated_usage(
+                    &options.backend,
+                    crate::director_loop::real_or_estimated_tokens(usage, est_tokens),
+                );
                 // Completed / Truncated → accept and re-review; Interrupted /
                 // Failed → stop reworking (fail-open, advisory).
                 return ReworkTurn {
@@ -2168,6 +2174,7 @@ mod tests {
                 SessionEvent::TextDelta(verdict.to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
             ]])
         }
@@ -2209,6 +2216,7 @@ mod tests {
             let batch = if self.turns.is_empty() {
                 vec![SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 }]
             } else {
                 self.turns.remove(0)
@@ -2265,6 +2273,7 @@ mod tests {
     fn done() -> SessionEvent {
         SessionEvent::TurnDone {
             status: TurnStatus::Completed,
+            usage: None,
         }
     }
 
@@ -2427,6 +2436,7 @@ mod tests {
         let (events, _rec) = sink();
         let fail = SessionEvent::TurnDone {
             status: TurnStatus::Failed("base crashed".to_string()),
+            usage: None,
         };
         let mut session = FakeBaseSession::new(vec![vec![fail]]);
 
@@ -2520,6 +2530,7 @@ mod tests {
         // research clean, docs TRUNCATED (no files written).
         let trunc = SessionEvent::TurnDone {
             status: TurnStatus::Truncated,
+            usage: None,
         };
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![trunc]]);
 
@@ -2553,6 +2564,7 @@ mod tests {
         let (events, rec) = sink();
         let trunc = SessionEvent::TurnDone {
             status: TurnStatus::Truncated,
+            usage: None,
         };
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![trunc]]);
 

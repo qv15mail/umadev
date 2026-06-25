@@ -91,7 +91,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus};
+use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus, Usage};
 
 use crate::director::{self, ReviewResult, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
@@ -1298,16 +1298,18 @@ async fn drive_one_turn(
                 // BaseSession contract, treat as a failed turn — fail-open, no panic.
                 // LOW #2: an interrupted/dead turn still consumed tokens (the directive
                 // + whatever streamed before the cut) — record the estimate so `/usage`
-                // is honest about cost on a failed turn, not just a clean one.
-                record_turn_usage(options, est_tokens);
+                // is honest about cost on a failed turn, not just a clean one. No
+                // `TurnDone` arrived → no real usage available, so estimate (F3).
+                record_turn_usage(options, None, est_tokens);
                 return Err("base session ended mid-turn".to_string());
             }
             IdleEvent::IdleTimedOut => {
                 // No event within the idle window → the base is hung. Settle as a
                 // Failed outcome so the loop ends and `thinking` clears, rather than
                 // blocking forever (the interrupt was already issued, bounded).
-                // LOW #2: record the tokens spent up to the hang (fail-open).
-                record_turn_usage(options, est_tokens);
+                // LOW #2: record the tokens spent up to the hang (fail-open). The
+                // turn hung with no `TurnDone` → estimate (no real usage). F3.
+                record_turn_usage(options, None, est_tokens);
                 return Err(idle_reason(idle));
             }
         };
@@ -1367,31 +1369,34 @@ async fn drive_one_turn(
                 };
                 if let Err(e) = session.respond(&req_id, decision).await {
                     // LOW #2: a turn that dies on the approval round-trip still spent
-                    // its tokens — record the estimate (fail-open) before bailing.
-                    record_turn_usage(options, est_tokens);
+                    // its tokens — record the estimate (fail-open) before bailing. No
+                    // `TurnDone` yet → estimate (F3).
+                    record_turn_usage(options, None, est_tokens);
                     return Err(format!("session respond: {e}"));
                 }
             }
-            SessionEvent::TurnDone { status } => match status {
+            SessionEvent::TurnDone { status, usage } => match status {
                 // Completed / Truncated → accept the turn (the deterministic floor
                 // downstream is the real stop signal; forcing a fail here would
                 // hard-stop a build that may have produced usable output).
                 TurnStatus::Completed | TurnStatus::Truncated => {
                     // Wave 2 deliverable 4: record usage + distil pitfalls on the
-                    // DEFAULT loop, for every base. Both fail-open.
-                    record_turn_usage(options, est_tokens);
+                    // DEFAULT loop, for every base. Both fail-open. F3: prefer the
+                    // base's REAL reported usage, fall back to the chars/4 estimate.
+                    record_turn_usage(options, usage, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
                     return Ok(TurnResult { text });
                 }
                 // LOW #2: an Interrupted/Failed turn still consumed tokens — record the
-                // estimate on these paths too (not just Completed/Truncated), so
-                // `/usage` reflects the real cost of a turn that didn't finish clean.
+                // usage on these paths too (not just Completed/Truncated), so `/usage`
+                // reflects the real cost of a turn that didn't finish clean. F3: a
+                // Failed/Interrupted `TurnDone` may still carry real usage — use it.
                 TurnStatus::Interrupted => {
-                    record_turn_usage(options, est_tokens);
+                    record_turn_usage(options, usage, est_tokens);
                     return Err("director turn interrupted".to_string());
                 }
                 TurnStatus::Failed(reason) => {
-                    record_turn_usage(options, est_tokens);
+                    record_turn_usage(options, usage, est_tokens);
                     return Err(reason);
                 }
             },
@@ -1422,11 +1427,30 @@ pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
     );
 }
 
-/// Record one director turn's estimated token usage to `~/.umadev/usage.jsonl` so
-/// `/usage` is real on the default loop for all three bases. Fail-open: a zero
-/// estimate / a write error is a no-op. Mirrors [`crate::runner::record_usage`].
-fn record_turn_usage(options: &RunOptions, est_tokens: u64) {
-    record_estimated_usage(&options.backend, est_tokens);
+/// The token count to record for one turn: the base's REAL usage when its live
+/// stream reported it on `TurnDone` (F3 — claude's `result` line, codex's
+/// `thread/tokenUsage/updated` / inline `turn/completed`), else the `chars/4`
+/// estimate. opencode's SSE carries no usage → it always estimates (honest).
+///
+/// "Tokens" here is `input + output` (the same single-number convention
+/// `record_usage` already uses). Fail-open: a `None` usage simply yields the
+/// estimate; the real path can never make `/usage` read lower than honest.
+pub(crate) fn real_or_estimated_tokens(usage: Option<Usage>, est_tokens: u64) -> u64 {
+    match usage {
+        Some(u) => u64::from(u.input_tokens) + u64::from(u.output_tokens),
+        None => est_tokens,
+    }
+}
+
+/// Record one director turn's token usage to `~/.umadev/usage.jsonl` so `/usage`
+/// is real on the default loop for all three bases — preferring the base's REAL
+/// reported usage and falling back to the `chars/4` estimate (F3). Fail-open: a
+/// zero count / a write error is a no-op. Mirrors [`crate::runner::record_usage`].
+fn record_turn_usage(options: &RunOptions, usage: Option<Usage>, est_tokens: u64) {
+    record_estimated_usage(
+        &options.backend,
+        real_or_estimated_tokens(usage, est_tokens),
+    );
 }
 
 /// Record one base tool call to the audit trail (UD-EVID-002) on the default loop.
@@ -1931,6 +1955,7 @@ mod tests {
                     SessionEvent::TextDelta(self.fork_reply.clone()),
                     SessionEvent::TurnDone {
                         status: TurnStatus::Completed,
+                        usage: None,
                     },
                 ]
                 .into_iter()
@@ -1944,6 +1969,7 @@ mod tests {
                 .unwrap_or_else(|| {
                     vec![SessionEvent::TurnDone {
                         status: TurnStatus::Completed,
+                        usage: None,
                     }]
                 })
                 .into_iter()
@@ -1973,6 +1999,22 @@ mod tests {
             SessionEvent::TextDelta(s.to_string()),
             SessionEvent::TurnDone {
                 status: TurnStatus::Completed,
+                usage: None,
+            },
+        ]
+    }
+
+    /// A turn that ends with REAL reported usage (F3) — for asserting the
+    /// consumer prefers the base's reported usage over the chars/4 estimate.
+    fn text_turn_with_usage(s: &str, input: u32, output: u32) -> Vec<SessionEvent> {
+        vec![
+            SessionEvent::TextDelta(s.to_string()),
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: Some(Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                }),
             },
         ]
     }
@@ -1981,6 +2023,47 @@ mod tests {
     /// moves on to build/test + review (instead of stopping at the hard floor).
     fn seed_source(root: &std::path::Path) {
         std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
+    }
+
+    #[test]
+    fn real_usage_is_preferred_over_the_estimate() {
+        // F3: when the base reports REAL per-turn usage on `TurnDone`, the consumer
+        // records input+output, NOT the chars/4 estimate. When it doesn't (None,
+        // e.g. opencode), it falls back to the estimate — so `/usage` stays honest.
+        let real = Some(Usage {
+            input_tokens: 1500,
+            output_tokens: 450,
+        });
+        // Estimate (99) is ignored when real usage is present.
+        assert_eq!(real_or_estimated_tokens(real, 99), 1950);
+        // No reported usage → the estimate stands (opencode path / failed parse).
+        assert_eq!(real_or_estimated_tokens(None, 99), 99);
+        // A reported zero-usage turn records zero (honest), not the estimate.
+        assert_eq!(real_or_estimated_tokens(Some(Usage::default()), 99), 0);
+    }
+
+    #[tokio::test]
+    async fn turn_done_real_usage_flows_through_drive_one_turn() {
+        // F3 end-to-end on the DEFAULT loop: a turn whose `TurnDone` carries real
+        // usage drives cleanly to completion (the real-usage path must not change
+        // loop control, only what `/usage` records). The recorded number lands in
+        // ~/.umadev (HOME) so we assert the turn SUCCEEDS rather than the file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let turns = vec![text_turn_with_usage("done, real usage attached", 1200, 300)];
+        let mut sess = FakeSession::new(turns, false, "");
+        let out = drive_one_turn(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        match out {
+            Ok(r) => assert_eq!(r.text, "done, real usage attached"),
+            Err(e) => panic!("a turn with real usage must complete cleanly: {e}"),
+        }
     }
 
     // ── The USB-model loop: base builds end to end → UmaDev auto-QC → bounded fix ──
@@ -3380,6 +3463,7 @@ mod tests {
             },
             SessionEvent::TurnDone {
                 status: TurnStatus::Completed,
+                usage: None,
             },
         ]];
         let mut sess = FakeSession::new(turns, false, "");

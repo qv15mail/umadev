@@ -41,7 +41,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus};
+use umadev_runtime::{
+    ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus, Usage,
+};
 
 use crate::spawn_parts;
 
@@ -277,6 +279,7 @@ async fn pump_stdout(stdout: ChildStdout, tx: mpsc::Sender<SessionEvent>) {
     let _ = tx
         .send(SessionEvent::TurnDone {
             status: TurnStatus::Failed("base session ended unexpectedly".to_string()),
+            usage: None,
         })
         .await;
 }
@@ -532,7 +535,34 @@ fn parse_result(v: &Value) -> SessionEvent {
             TurnStatus::Failed(reason)
         }
     };
-    SessionEvent::TurnDone { status }
+    // F3: surface the REAL per-turn token usage off the `result` line so `/usage`
+    // is truthful on the DEFAULT continuous loop (claude reports it; previously
+    // only the legacy single-shot `claude.rs` path read it). Fail-open: a result
+    // line with no `usage` object yields `None` → the consumer estimates instead.
+    SessionEvent::TurnDone {
+        status,
+        usage: parse_result_usage(v),
+    }
+}
+
+/// Extract the per-turn token usage from a stream-json `result` envelope.
+///
+/// The `{"type":"result", "usage":{"input_tokens":…, "output_tokens":…,
+/// "cache_read_input_tokens":…, "cache_creation_input_tokens":…}, …}` line carries
+/// real usage. We fold cache reads/writes into input (they ARE consumed input) so
+/// the count matches the legacy single-shot driver ([`crate::claude`]'s
+/// `extract_usage`). Returns `None` (→ estimate) when no `usage` object is present.
+fn parse_result_usage(v: &Value) -> Option<Usage> {
+    let u = v.get("usage")?;
+    let field = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let input = field("input_tokens")
+        + field("cache_read_input_tokens")
+        + field("cache_creation_input_tokens");
+    let output = field("output_tokens");
+    Some(Usage {
+        input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
+        output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+    })
 }
 
 /// A `control_request{can_use_tool}` → a NeedApproval the orchestrator answers.
@@ -786,23 +816,56 @@ mod tests {
         assert_eq!(
             done,
             vec![SessionEvent::TurnDone {
-                status: TurnStatus::Completed
+                status: TurnStatus::Completed,
+                // No `usage` object on this line → None (the consumer estimates).
+                usage: None,
             }]
         );
         let trunc = parse_stdout_line(r#"{"type":"result","subtype":"error_max_turns"}"#);
         assert_eq!(
             trunc,
             vec![SessionEvent::TurnDone {
-                status: TurnStatus::Truncated
+                status: TurnStatus::Truncated,
+                usage: None,
             }]
         );
         let failed = parse_stdout_line(r#"{"type":"result","subtype":"error_during_execution"}"#);
         assert!(matches!(
             failed.as_slice(),
             [SessionEvent::TurnDone {
-                status: TurnStatus::Failed(_)
+                status: TurnStatus::Failed(_),
+                ..
             }]
         ));
+    }
+
+    #[test]
+    fn parse_result_reads_real_usage_off_the_result_line() {
+        // F3: the stream-json `result` line carries REAL per-turn token usage. The
+        // continuous session must surface it on `TurnDone` so `/usage` is truthful
+        // on the DEFAULT loop, not just the legacy single-shot path.
+        let line = r#"{"type":"result","subtype":"success","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"output_tokens":450},"total_cost_usd":0.02}"#;
+        let evs = parse_stdout_line(line);
+        match evs.as_slice() {
+            [SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: Some(u),
+            }] => {
+                // cache_read folds into input (consumed input), mirroring claude.rs.
+                assert_eq!(u.input_tokens, 1500);
+                assert_eq!(u.output_tokens, 450);
+            }
+            other => panic!("expected TurnDone(Completed) with real usage, got {other:?}"),
+        }
+        // A result line with no usage object → None (fail-open: estimate downstream).
+        let bare = parse_stdout_line(r#"{"type":"result","subtype":"success"}"#);
+        assert_eq!(
+            bare,
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }]
+        );
     }
 
     #[test]
@@ -903,7 +966,8 @@ mod tests {
         assert_eq!(
             got.last().unwrap(),
             &SessionEvent::TurnDone {
-                status: TurnStatus::Completed
+                status: TurnStatus::Completed,
+                usage: None,
             }
         );
         let _ = s.end().await;
@@ -970,7 +1034,8 @@ mod tests {
         assert!(matches!(
             last,
             Some(SessionEvent::TurnDone {
-                status: TurnStatus::Failed(_)
+                status: TurnStatus::Failed(_),
+                ..
             })
         ));
     }

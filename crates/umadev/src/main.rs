@@ -4801,6 +4801,7 @@ mod tests {
                 SessionEvent::TextDelta("I implemented the login page".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
             ]
             .into_iter()
@@ -4843,6 +4844,7 @@ mod tests {
                 ),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
                 // Turn 2 — the build writes a real source file.
                 SessionEvent::ToolCall {
@@ -4852,6 +4854,7 @@ mod tests {
                 SessionEvent::TextDelta("Created App.tsx with the login form".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
             ]
             .into_iter()
@@ -4915,6 +4918,7 @@ mod tests {
                 SessionEvent::TextDelta("Here is my read of the goal.".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
+                    usage: None,
                 },
             ]
             .into_iter()

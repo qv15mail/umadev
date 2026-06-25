@@ -65,6 +65,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -72,7 +73,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus};
+use umadev_runtime::{
+    ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus, Usage,
+};
 
 use crate::spawn_parts;
 
@@ -88,12 +91,30 @@ fn codex_app_server_subcmd() -> String {
     std::env::var("UMADEV_CODEX_APP_SERVER_SUBCMD").unwrap_or_else(|_| "app-server".to_string())
 }
 
+/// How long [`interrupt`](CodexSession::interrupt) waits for the turn id to be
+/// assigned (by the `turn/started` notification) before giving up, so an ESC that
+/// races the turn-start handshake is honored rather than silently dropped (F5).
+/// Bounded so an interrupt never blocks the host for long; `kill_on_drop` is the
+/// final cancellation if the id never lands.
+const INTERRUPT_TURN_ID_WAIT: Duration = Duration::from_millis(500);
+
+/// Poll interval while waiting for the turn id in [`await_turn_id`].
+const TURN_ID_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Shared map of outstanding client request ids → their result oneshot.
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 /// Shared map of approval `req_id` (string form) → the raw JSON-RPC id to echo.
 type ApprovalMap = Arc<Mutex<HashMap<String, Value>>>;
 /// Shared in-flight turn id (set by `turn/started`, cleared by `turn/completed`).
 type TurnId = Arc<Mutex<Option<String>>>;
+/// Shared latest REAL token usage seen on the live stream (F3).
+///
+/// codex streams per-turn usage in a SEPARATE `thread/tokenUsage/updated`
+/// notification (and some versions inline it on `turn/completed`); the reader
+/// stashes the most-recent parse here, and `emit_turn_done` drains it onto the
+/// `TurnDone` so `/usage` is truthful on the DEFAULT loop. `None` until the base
+/// reports usage → the consumer estimates instead (fail-open).
+type LatestUsage = Arc<Mutex<Option<Usage>>>;
 /// Sender half for translated session events.
 type EventTx = mpsc::UnboundedSender<SessionEvent>;
 
@@ -181,6 +202,7 @@ impl CodexSession {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Reader task: the single owner of stdout. Splits every line into
@@ -190,6 +212,7 @@ impl CodexSession {
             Arc::clone(&pending),
             Arc::clone(&approvals),
             Arc::clone(&turn_id),
+            latest_usage,
             event_tx,
         ));
 
@@ -238,12 +261,14 @@ impl CodexSession {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         tokio::spawn(reader_loop(
             stdout,
             Arc::clone(&pending),
             Arc::clone(&approvals),
             Arc::clone(&turn_id),
+            latest_usage,
             event_tx,
         ));
         let session = Self {
@@ -318,6 +343,14 @@ impl CodexSession {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Return the in-flight turn id, waiting up to `budget` for the `turn/started`
+    /// notification to assign it (F5). Returns immediately if the id is already
+    /// known; returns `None` if the window elapses with no id. Bounded + fail-open:
+    /// this never blocks longer than `budget`, so an interrupt can't wedge.
+    async fn await_turn_id(&self, budget: Duration) -> Option<String> {
+        await_turn_id_in(&self.turn_id, budget).await
+    }
+
     /// Write a single JSON value as one newline-delimited line to the child's
     /// stdin. The `"jsonrpc"` member is intentionally omitted (the app-server
     /// expects it absent on the wire).
@@ -367,17 +400,41 @@ impl CodexSession {
         self.write_line(&json!({ "method": method, "params": params }))
             .await
     }
+}
 
-    /// Adopt the turn id from a `turn/start` result, unless one is already set
-    /// (the `turn/started` notification may have raced ahead).
-    async fn adopt_turn_id(&self, result: &Value) {
-        let Some(id) = turn_id_of(result) else {
-            return;
-        };
-        let mut guard = self.turn_id.lock().await;
-        if guard.is_none() {
-            *guard = Some(id);
+/// Adopt the turn id from a `turn/start` result into the shared slot, unless one
+/// is already set (the `turn/started` notification may have raced ahead). A free
+/// function (not a method) so the F4 background adopt-task can run it without
+/// borrowing the session. Fail-open: a result with no `turn.id` is a no-op.
+async fn adopt_turn_id_into(turn_id: &TurnId, result: &Value) {
+    let Some(id) = turn_id_of(result) else {
+        return;
+    };
+    let mut guard = turn_id.lock().await;
+    if guard.is_none() {
+        *guard = Some(id);
+    }
+}
+
+/// Poll the shared turn-id slot for up to `budget`, returning the id the moment it
+/// appears (set by the `turn/started` notification) or `None` if the window
+/// elapses (F5). A free function so it is unit-testable without a live session.
+/// Bounded + fail-open: never blocks longer than `budget`.
+async fn await_turn_id_in(turn_id: &TurnId, budget: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(id) = turn_id.lock().await.clone() {
+            return Some(id);
         }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        // The reader task sets `turn_id` on `turn/started`; poll for it rather than
+        // block on a channel we don't own here. Cap each sleep at the remaining time
+        // so we never overshoot the budget.
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(TURN_ID_POLL_INTERVAL.min(remaining)).await;
     }
 }
 
@@ -503,16 +560,26 @@ async fn reader_loop(
     pending: PendingMap,
     approvals: ApprovalMap,
     turn_id: TurnId,
+    latest_usage: LatestUsage,
     event_tx: EventTx,
 ) {
     let mut reader = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = reader.next_line().await {
-        dispatch_line(&line, &pending, &approvals, &turn_id, &event_tx).await;
+        dispatch_line(
+            &line,
+            &pending,
+            &approvals,
+            &turn_id,
+            &latest_usage,
+            &event_tx,
+        )
+        .await;
     }
     // EOF or a read error → the app-server is gone. Tell any in-flight turn it
     // failed (fail-open) and wake every pending request so no caller hangs.
     let _ = event_tx.send(SessionEvent::TurnDone {
         status: TurnStatus::Failed("codex app-server stdout closed".to_string()),
+        usage: None,
     });
     let mut guard = pending.lock().await;
     for (_, tx) in guard.drain() {
@@ -556,6 +623,7 @@ async fn dispatch_line(
     pending: &PendingMap,
     approvals: &ApprovalMap,
     turn_id: &TurnId,
+    latest_usage: &LatestUsage,
     event_tx: &EventTx,
 ) {
     let trimmed = line.trim();
@@ -573,7 +641,7 @@ async fn dispatch_line(
     } else if has_method && has_id {
         handle_server_request(&v, approvals, event_tx).await;
     } else if has_method {
-        handle_notification(&v, turn_id, event_tx).await;
+        handle_notification(&v, turn_id, latest_usage, event_tx).await;
     }
 }
 
@@ -660,7 +728,12 @@ fn first_change_field(value: &Value, field: &str) -> String {
 }
 
 /// Translate a notification (no id) into zero or more [`SessionEvent`]s.
-async fn handle_notification(v: &Value, turn_id: &TurnId, event_tx: &EventTx) {
+async fn handle_notification(
+    v: &Value,
+    turn_id: &TurnId,
+    latest_usage: &LatestUsage,
+    event_tx: &EventTx,
+) {
     let method = v.get("method").and_then(Value::as_str).unwrap_or("");
     let params = v.get("params").cloned().unwrap_or(Value::Null);
     match method {
@@ -670,12 +743,79 @@ async fn handle_notification(v: &Value, turn_id: &TurnId, event_tx: &EventTx) {
         "item/agentMessage/delta" => emit_text_delta(&params, event_tx),
         // A completed item — the SOURCE OF TRUTH for produced work.
         "item/completed" => emit_completed_item(&params, event_tx),
+        // F3: codex streams per-turn token usage in this dedicated notification
+        // (kept separate from `turn/completed` so the protocol shape stays stable).
+        // Stash the latest parse so `emit_turn_done` can attach the REAL usage.
+        "thread/tokenUsage/updated" => capture_usage(&params, latest_usage).await,
         // The turn ended — the authoritative phase-done boundary.
-        "turn/completed" => emit_turn_done(&params, turn_id, event_tx).await,
+        "turn/completed" => emit_turn_done(&params, turn_id, latest_usage, event_tx).await,
         // turn/diff/updated, thread/started, item/started, fs/changed, … carry
         // no event we surface — ignored (fail-open).
         _ => {}
     }
+}
+
+/// Stash the REAL token usage from a `thread/tokenUsage/updated` notification so
+/// the next `turn/completed` can carry it. Fail-open: an unparseable payload is a
+/// no-op (the prior value, if any, stands; absent → the consumer estimates).
+async fn capture_usage(params: &Value, latest_usage: &LatestUsage) {
+    if let Some(u) = parse_codex_usage(params) {
+        *latest_usage.lock().await = Some(u);
+    }
+}
+
+/// Parse a codex token-usage payload into [`Usage`], defensively.
+///
+/// codex's app-server protocol is not pinned here and its versions have moved the
+/// usage object around / between snake_case and camelCase, so we probe the likely
+/// nestings (`usage`, `info.usage`, `turn.usage`, `tokenUsage`, the payload root)
+/// and fold cached input into input + reasoning output into output (mirroring the
+/// legacy [`crate::codex`] `extract_codex_usage`). `None` when nothing usable is
+/// found → the consumer falls back to a `chars/4` estimate (fail-open).
+fn parse_codex_usage(payload: &Value) -> Option<Usage> {
+    let obj = codex_usage_object(payload)?;
+    // Accept both snake_case and camelCase field spellings.
+    let field = |snake: &str, camel: &str| -> u64 {
+        obj.get(snake)
+            .or_else(|| obj.get(camel))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let input =
+        field("input_tokens", "inputTokens") + field("cached_input_tokens", "cachedInputTokens");
+    let output = field("output_tokens", "outputTokens")
+        + field("reasoning_output_tokens", "reasoningOutputTokens");
+    // A payload that matched a candidate object but carried no recognizable token
+    // field is not real usage → estimate instead of recording a spurious zero.
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(Usage {
+        input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
+        output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+    })
+}
+
+/// Find the object that actually holds the token-count fields, probing the
+/// nestings codex has used across versions. Fail-open: `None` if none match.
+fn codex_usage_object(payload: &Value) -> Option<&Value> {
+    // Direct candidates, in priority order.
+    for key in ["usage", "tokenUsage", "token_usage"] {
+        if let Some(u) = payload.get(key) {
+            return Some(u);
+        }
+    }
+    // One level down (`info.usage`, `turn.usage`).
+    for parent in ["info", "turn"] {
+        if let Some(u) = payload.get(parent).and_then(|p| p.get("usage")) {
+            return Some(u);
+        }
+    }
+    // The payload itself may BE the usage object (token fields at the root).
+    if payload.get("input_tokens").is_some() || payload.get("inputTokens").is_some() {
+        return Some(payload);
+    }
+    None
 }
 
 /// Overwrite the shared turn id (used on `turn/started`).
@@ -875,15 +1015,34 @@ fn added_lines_of_diff(diff: &str) -> String {
 
 /// Emit a [`SessionEvent::TurnDone`] from a `turn/completed` payload and clear
 /// the in-flight turn id.
-async fn emit_turn_done(params: &Value, turn_id: &TurnId, event_tx: &EventTx) {
+///
+/// F3: attach the REAL per-turn token usage so `/usage` is truthful on the
+/// DEFAULT loop. Prefer usage inlined on the `turn/completed` params (some codex
+/// versions carry it there); otherwise drain the latest `thread/tokenUsage/updated`
+/// value. The accumulator is reset to `None` either way so a stale count can't
+/// leak into the NEXT turn. Fail-open: no usage anywhere → `None` (estimate).
+async fn emit_turn_done(
+    params: &Value,
+    turn_id: &TurnId,
+    latest_usage: &LatestUsage,
+    event_tx: &EventTx,
+) {
     let status = params
         .get("turn")
         .and_then(|t| t.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("completed");
     *turn_id.lock().await = None;
+    // Inline usage on the completion wins; else take (and clear) the streamed one.
+    let inline = parse_codex_usage(params);
+    let usage = {
+        let mut guard = latest_usage.lock().await;
+        let streamed = guard.take();
+        inline.or(streamed)
+    };
     let _ = event_tx.send(SessionEvent::TurnDone {
         status: map_turn_status(status, params),
+        usage,
     });
 }
 
@@ -958,7 +1117,7 @@ impl BaseSession for CodexSession {
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
         // turn/start {threadId, input:[{type:"text", text}]}. Same thread =
         // context flows from the previous phase. We send it as a request so a
-        // transport failure surfaces immediately, then capture the turn id.
+        // transport failure on the WRITE surfaces immediately.
         let id = self.alloc_id();
         let rx = self.register(id).await;
         let msg = rpc_request(
@@ -967,11 +1126,20 @@ impl BaseSession for CodexSession {
             &turn_start_params(&self.thread_id, &directive),
         );
         self.write_line(&msg).await?;
-        // Capture the turn id from the start result (also surfaced via the
-        // `turn/started` notification — whichever lands first wins).
-        if let Ok(Ok(result)) = rx.await {
-            self.adopt_turn_id(&result).await;
-        }
+        // F4: do NOT inline-await the `turn/start` RESULT here — that coupled the
+        // send latency to the server's response timing (claude / opencode return
+        // from `send_turn` immediately). The turn id is captured the moment the
+        // `turn/started` notification lands (see `set_turn_id`); we still adopt it
+        // from the start RESULT too (whichever arrives first wins) on a background
+        // task so the registered `pending` oneshot is consumed (never leaked) and
+        // `send_turn` returns at once. Fail-open: a dropped sender / missing id is
+        // a silent no-op — the notification path already set the id.
+        let turn_id = Arc::clone(&self.turn_id);
+        tokio::spawn(async move {
+            if let Ok(Ok(result)) = rx.await {
+                adopt_turn_id_into(&turn_id, &result).await;
+            }
+        });
         Ok(())
     }
 
@@ -996,10 +1164,18 @@ impl BaseSession for CodexSession {
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
-        // turn/interrupt {threadId, turnId}. No turn in flight → nothing to do
-        // (fail-open).
-        let turn = self.turn_id.lock().await.clone();
-        let Some(turn) = turn else {
+        // turn/interrupt {threadId, turnId}.
+        //
+        // F5: an early ESC (after `send_turn`, but BEFORE the `turn/started`
+        // notification has assigned a turn id) used to be SILENTLY swallowed —
+        // `turn_id == None` → `Ok(())` no-op — so the user's interrupt was lost
+        // and the turn ran on (claude / opencode interrupt unconditionally). Now
+        // we make a best-effort attempt: briefly wait for the turn id to appear
+        // (the reader sets it the instant `turn/started` lands), then interrupt.
+        // Bounded + fail-open: if no id arrives within the window we give up and
+        // return Ok (the session's `kill_on_drop` is the final cancellation), but
+        // we no longer drop an interrupt that races the turn-start handshake.
+        let Some(turn) = self.await_turn_id(INTERRUPT_TURN_ID_WAIT).await else {
             return Ok(());
         };
         self.notify("turn/interrupt", interrupt_params(&self.thread_id, &turn))
@@ -1329,10 +1505,11 @@ mod tests {
         let pending = empty_pending();
         let approvals = empty_approvals();
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
         let (tx, mut rx) = chan();
 
         let delta = r#"{"method":"item/agentMessage/delta","params":{"delta":"hello"}}"#;
-        dispatch_line(delta, &pending, &approvals, &turn_id, &tx).await;
+        dispatch_line(delta, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
         let SessionEvent::TextDelta(t) = rx.recv().await.unwrap() else {
             panic!("expected TextDelta");
         };
@@ -1340,11 +1517,78 @@ mod tests {
 
         let done =
             r#"{"method":"turn/completed","params":{"turn":{"id":"turn_1","status":"completed"}}}"#;
-        dispatch_line(done, &pending, &approvals, &turn_id, &tx).await;
-        let SessionEvent::TurnDone { status } = rx.recv().await.unwrap() else {
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { status, usage } = rx.recv().await.unwrap() else {
             panic!("expected TurnDone");
         };
         assert_eq!(status, TurnStatus::Completed);
+        // No usage notification arrived → None (the consumer estimates). F3.
+        assert!(usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_line_attaches_streamed_usage_to_turn_done() {
+        // F3: codex streams real usage in a SEPARATE `thread/tokenUsage/updated`
+        // notification; the next `turn/completed` must carry it onto TurnDone so
+        // `/usage` is truthful on the DEFAULT loop.
+        let pending = empty_pending();
+        let approvals = empty_approvals();
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
+        let (tx, mut rx) = chan();
+
+        let usage_note = r#"{"method":"thread/tokenUsage/updated","params":{"usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4}}}"#;
+        dispatch_line(
+            usage_note,
+            &pending,
+            &approvals,
+            &turn_id,
+            &latest_usage,
+            &tx,
+        )
+        .await;
+        // The usage notification surfaces no SessionEvent on its own.
+
+        let done =
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t","status":"completed"}}}"#;
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { status, usage } = rx.recv().await.unwrap() else {
+            panic!("expected TurnDone");
+        };
+        assert_eq!(status, TurnStatus::Completed);
+        let u = usage.expect("real usage attached to TurnDone");
+        // cached input folds into input; reasoning output folds into output.
+        assert_eq!(u.input_tokens, 17162 + 5504);
+        assert_eq!(u.output_tokens, 6 + 4);
+
+        // The accumulator was drained → a NEXT turn with no usage carries None.
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { usage: next, .. } = rx.recv().await.unwrap() else {
+            panic!("expected TurnDone");
+        };
+        assert!(
+            next.is_none(),
+            "stale usage must not leak into the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_line_prefers_inline_usage_on_turn_completed() {
+        // Some codex versions inline usage on `turn/completed` itself — that wins.
+        let pending = empty_pending();
+        let approvals = empty_approvals();
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
+        let (tx, mut rx) = chan();
+
+        let done = r#"{"method":"turn/completed","params":{"turn":{"id":"t","status":"completed"},"usage":{"inputTokens":100,"outputTokens":20}}}"#;
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { usage, .. } = rx.recv().await.unwrap() else {
+            panic!("expected TurnDone");
+        };
+        let u = usage.expect("inline usage attached");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 20);
     }
 
     #[tokio::test]
@@ -1352,6 +1596,7 @@ mod tests {
         let pending = empty_pending();
         let approvals = empty_approvals();
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
         let (tx, _rx) = chan();
 
         // A result response completes the oneshot with Ok.
@@ -1362,6 +1607,7 @@ mod tests {
             &pending,
             &approvals,
             &turn_id,
+            &latest_usage,
             &tx,
         )
         .await;
@@ -1376,6 +1622,7 @@ mod tests {
             &pending,
             &approvals,
             &turn_id,
+            &latest_usage,
             &tx,
         )
         .await;
@@ -1390,10 +1637,11 @@ mod tests {
         let pending = empty_pending();
         let approvals = empty_approvals();
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
         let (tx, mut rx) = chan();
 
         let req = r#"{"id":100,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf x"}}"#;
-        dispatch_line(req, &pending, &approvals, &turn_id, &tx).await;
+        dispatch_line(req, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
         let SessionEvent::NeedApproval {
             req_id,
             action,
@@ -1414,11 +1662,28 @@ mod tests {
         let pending = empty_pending();
         let approvals = empty_approvals();
         let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
         let (tx, mut rx) = chan();
         // Garbage must not panic and must not produce an event.
-        dispatch_line("not json", &pending, &approvals, &turn_id, &tx).await;
-        dispatch_line("{broken", &pending, &approvals, &turn_id, &tx).await;
-        dispatch_line("", &pending, &approvals, &turn_id, &tx).await;
+        dispatch_line(
+            "not json",
+            &pending,
+            &approvals,
+            &turn_id,
+            &latest_usage,
+            &tx,
+        )
+        .await;
+        dispatch_line(
+            "{broken",
+            &pending,
+            &approvals,
+            &turn_id,
+            &latest_usage,
+            &tx,
+        )
+        .await;
+        dispatch_line("", &pending, &approvals, &turn_id, &latest_usage, &tx).await;
         assert!(rx.try_recv().is_err());
     }
 
@@ -1430,6 +1695,73 @@ mod tests {
     /// An empty `ApprovalMap` for dispatch tests.
     fn empty_approvals() -> ApprovalMap {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// An empty `LatestUsage` accumulator for dispatch tests (F3).
+    fn empty_usage() -> LatestUsage {
+        Arc::new(Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn await_turn_id_returns_immediately_when_already_set() {
+        // The common case: the id is already known → no waiting at all.
+        let turn_id: TurnId = Arc::new(Mutex::new(Some("turn_x".to_string())));
+        let got = await_turn_id_in(&turn_id, Duration::from_secs(5)).await;
+        assert_eq!(got.as_deref(), Some("turn_x"));
+    }
+
+    #[tokio::test]
+    async fn await_turn_id_picks_up_a_late_turn_started() {
+        // F5: an early interrupt that arrives BEFORE `turn/started` must not be
+        // dropped — `await_turn_id_in` waits and picks up the id the moment the
+        // `turn/started` notification (here simulated by `set_turn_id`) lands.
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let writer = Arc::clone(&turn_id);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            set_turn_id(&writer, Some("turn_late".to_string())).await;
+        });
+        let got = await_turn_id_in(&turn_id, Duration::from_secs(2)).await;
+        assert_eq!(
+            got.as_deref(),
+            Some("turn_late"),
+            "an early interrupt must adopt the turn id once turn/started arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_turn_id_times_out_failopen_when_no_turn_starts() {
+        // Fail-open: if the id never lands within the budget, return None (the
+        // caller then no-ops; kill_on_drop is the final cancellation) — bounded,
+        // never a wedge.
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let start = tokio::time::Instant::now();
+        let got = await_turn_id_in(&turn_id, Duration::from_millis(50)).await;
+        assert!(got.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the wait must be bounded by the budget, not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_turn_id_into_is_a_noop_once_set() {
+        // F4 background adopt: the `turn/start` RESULT must not overwrite an id the
+        // `turn/started` notification already set (whichever lands first wins).
+        let turn_id: TurnId = Arc::new(Mutex::new(Some("turn_from_notify".to_string())));
+        adopt_turn_id_into(&turn_id, &v(r#"{"turn":{"id":"turn_from_result"}}"#)).await;
+        assert_eq!(
+            turn_id.lock().await.clone().as_deref(),
+            Some("turn_from_notify"),
+            "the notification-set id must not be clobbered by the start result"
+        );
+        // But it DOES adopt when nothing is set yet.
+        let empty: TurnId = Arc::new(Mutex::new(None));
+        adopt_turn_id_into(&empty, &v(r#"{"turn":{"id":"turn_from_result"}}"#)).await;
+        assert_eq!(
+            empty.lock().await.clone().as_deref(),
+            Some("turn_from_result")
+        );
     }
 
     // ---------- end-to-end against a fake `codex app-server` (unix only) ----------
@@ -1462,7 +1794,7 @@ mod tests {
                 seen.write = true;
                 assert_eq!(input["file_path"], "src/main.rs");
             }
-            SessionEvent::TurnDone { status } => seen.done = Some(status),
+            SessionEvent::TurnDone { status, .. } => seen.done = Some(status),
             _ => {}
         }
     }
@@ -1546,6 +1878,78 @@ done
             seen.done,
             Some(TurnStatus::Completed),
             "turn/completed → TurnDone"
+        );
+        let _ = session.end().await;
+    }
+
+    /// A fake whose `turn/start` NEVER echoes a response (no `{"id":..,"result"}`
+    /// for the turn) — it only emits the `turn/started` notification then the
+    /// stream. Models a server that's slow / never replies to the start RPC.
+    /// The OLD `send_turn` inline-awaited that response and would BLOCK here; the
+    /// F4 fix must return promptly (the turn id comes from the notification).
+    #[cfg(unix)]
+    const FAKE_APP_SERVER_NO_TURN_RESPONSE: &str = r#"#!/bin/sh
+extract_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"userAgent":"fake"}}\n' "$(extract_id "$line")" ;;
+    *'"method":"initialized"'*) : ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+    *'"method":"turn/start"'*)
+      printf '{"method":"turn/started","params":{"turn":{"id":"turn_test","status":"running"}}}\n'
+      printf '{"method":"item/agentMessage/delta","params":{"delta":"working"}}\n'
+      printf '{"method":"turn/completed","params":{"turn":{"id":"turn_test","status":"completed"}}}\n' ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_turn_returns_promptly_even_if_turn_start_response_never_comes() {
+        // F4: send_turn must not couple to the server's `turn/start` RESPONSE timing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        write_fake_codex(&script, FAKE_APP_SERVER_NO_TURN_RESPONSE);
+
+        let mut session = CodexSession::start_with_program(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            true,
+        )
+        .await
+        .expect("handshake should succeed");
+
+        // The send must complete FAST — bound it so a regression (inline-await of a
+        // response that never arrives) trips the timeout instead of hanging the run.
+        let sent =
+            tokio::time::timeout(Duration::from_secs(2), session.send_turn("go".to_string())).await;
+        assert!(
+            matches!(sent, Ok(Ok(()))),
+            "send_turn must return promptly without awaiting the turn/start response: {sent:?}"
+        );
+
+        // The turn drives to completion via the notification stream. The turn id is
+        // adopted from `turn/started` MID-turn (so interrupt can target it) — assert
+        // it on the first non-done event, before `turn/completed` clears it.
+        let mut done = false;
+        let mut saw_turn_id = false;
+        while let Some(ev) = session.next_event().await {
+            if matches!(ev, SessionEvent::TurnDone { .. }) {
+                done = true;
+                break;
+            }
+            // Before the completion clears it, the id must be the adopted one (F5).
+            if session.turn_id.lock().await.as_deref() == Some("turn_test") {
+                saw_turn_id = true;
+            }
+        }
+        assert!(done, "the turn completes from the notification stream");
+        assert!(
+            saw_turn_id,
+            "the turn id is adopted from turn/started mid-turn (for F5 interrupt)"
         );
         let _ = session.end().await;
     }

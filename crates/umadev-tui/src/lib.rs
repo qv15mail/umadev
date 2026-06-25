@@ -2713,7 +2713,7 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     return;
                 }
             }
-            umadev_runtime::SessionEvent::TurnDone { status } => match status {
+            umadev_runtime::SessionEvent::TurnDone { status, .. } => match status {
                 umadev_runtime::TurnStatus::Completed => break false,
                 // Truncated → the turn ended early (rate limit / retry / cut-off);
                 // accept what landed but flag the "may be incomplete" caveat below.
@@ -6172,12 +6172,14 @@ mod tests {
                 umadev_runtime::SessionEvent::TextDelta("hi there".into()),
                 umadev_runtime::SessionEvent::TurnDone {
                     status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
                 },
             ],
             vec![
                 umadev_runtime::SessionEvent::TextDelta("still here".into()),
                 umadev_runtime::SessionEvent::TurnDone {
                     status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
                 },
             ],
         ]);
@@ -6270,6 +6272,7 @@ mod tests {
             umadev_runtime::SessionEvent::TextDelta("created the file".into()),
             umadev_runtime::SessionEvent::TurnDone {
                 status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
             },
         ]]);
         let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
@@ -6340,6 +6343,7 @@ mod tests {
             umadev_runtime::SessionEvent::TextDelta("built the page".into()),
             umadev_runtime::SessionEvent::TurnDone {
                 status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
             },
         ]]);
         let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
@@ -6403,6 +6407,7 @@ mod tests {
             umadev_runtime::SessionEvent::TextDelta("here is my answer".into()),
             umadev_runtime::SessionEvent::TurnDone {
                 status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
             },
         ]]);
         let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
@@ -6461,6 +6466,7 @@ mod tests {
             umadev_runtime::SessionEvent::TextDelta("partial".into()),
             umadev_runtime::SessionEvent::TurnDone {
                 status: umadev_runtime::TurnStatus::Interrupted,
+                usage: None,
             },
         ]]);
         let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
@@ -6509,6 +6515,7 @@ mod tests {
             umadev_runtime::SessionEvent::TextDelta("warm reply".into()),
             umadev_runtime::SessionEvent::TurnDone {
                 status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
             },
         ]]);
         // Park a WARM session (claude → no firmware prefix on the first directive)
