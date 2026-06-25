@@ -214,32 +214,51 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // an empty slice (no scan past the cached index, no tokens spent). The slice is
     // personalised by `route.scope` (the path hints the router surfaced) so the
     // files the turn is about rank first. Fail-open: empty/unreadable repo → skip.
-    if route_wants_repo_map(route) {
-        let repo_map = repo_map_layer(root, &route.scope);
-        if !repo_map.trim().is_empty() {
-            fw.push_block(&repo_map);
-        }
+    //
+    // ── Layer 4: pitfall memory ── recorded pitfalls matching this project's
+    // tech-stack fingerprint + the requirement ("what bit us here" beats "a
+    // relevant standard"). ── Layer 5: JIT knowledge ── a small top-K digest of
+    // the curated corpus for the requirement (never the whole corpus).
+    //
+    // Layers 3-5 each do BLOCKING fs / regex / BM25 I/O (repo_map can walk
+    // thousands of files; knowledge loads + ranks the corpus). Running them inline
+    // on a Tokio worker stalled that worker — and the first response — for hundreds
+    // of ms to seconds on a cold cache. Hoist all three onto the blocking pool in
+    // ONE `spawn_blocking` so the async runtime stays free. Fail-open: a join error
+    // (panicked layer) collapses to empty layers, never blocking the turn.
+    let want_repo = route_wants_repo_map(route);
+    let want_jit = tier.wants_jit();
+    let root_buf = root.to_path_buf();
+    let scope = route.scope.clone();
+    let req = requirement.to_string();
+    let (repo_map, memory, knowledge) = tokio::task::spawn_blocking(move || {
+        let repo_map = if want_repo {
+            repo_map_layer(&root_buf, &scope)
+        } else {
+            String::new()
+        };
+        let memory = if want_jit {
+            memory_layer(&root_buf, &req)
+        } else {
+            String::new()
+        };
+        let knowledge = if want_jit {
+            knowledge_layer(&root_buf, &req)
+        } else {
+            String::new()
+        };
+        (repo_map, memory, knowledge)
+    })
+    .await
+    .unwrap_or_default();
+    if !repo_map.trim().is_empty() {
+        fw.push_block(&repo_map);
     }
-
-    // ── Layer 4: pitfall memory (JIT, work-class only) ───────────────────────
-    // Recorded pitfalls matching this project's tech-stack fingerprint + the
-    // requirement. Higher priority than fresh knowledge: "what bit us here" is a
-    // sharper signal than "a relevant standard". Fail-open: empty digest → skip.
-    if tier.wants_jit() {
-        let memory = memory_layer(root, requirement);
-        if !memory.trim().is_empty() {
-            fw.push_block(&memory);
-        }
+    if !memory.trim().is_empty() {
+        fw.push_block(&memory);
     }
-
-    // ── Layer 5: JIT knowledge (lowest priority, work-class only) ────────────
-    // A small top-K of the most-relevant curated knowledge for the requirement —
-    // a digest, never the whole corpus. Fail-open: empty digest → skip.
-    if tier.wants_jit() {
-        let knowledge = knowledge_layer(root, requirement);
-        if !knowledge.trim().is_empty() {
-            fw.push_block(&knowledge);
-        }
+    if !knowledge.trim().is_empty() {
+        fw.push_block(&knowledge);
     }
 
     fw.finish()

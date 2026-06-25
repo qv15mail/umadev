@@ -346,7 +346,9 @@ async fn synthesize_and_post_plan(
     // collects the plan SILENTLY with up to a 180s window, so a complex requirement
     // otherwise shows a bare "正在思考" spinner for minutes with no hint of what's
     // happening (user-reported: "到这里没有进度显示了" under a multi-minute build).
-    events.emit(EngineEvent::Note(umadev_i18n::tl("plan.synthesizing").to_string()));
+    events.emit(EngineEvent::Note(
+        umadev_i18n::tl("plan.synthesizing").to_string(),
+    ));
     let plan = plan_state::synthesize_plan(session, options, &options.requirement, route).await?;
     // Persist best-effort; a failed write is ignored (fail-open — never blocks).
     let _ = plan_state::save(&plan, &options.project_root);

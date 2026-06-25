@@ -3955,13 +3955,13 @@ impl App {
             // "settled, route to chat" matches `is_pipeline_active()` exactly.
             self.record_user_turn(&text);
             self.thinking = true; // animated "thinking…" until the base replies
-            // NB: we deliberately do NOT clear `aborted`/`finished` here — the
-            // settled run's terminal state persists until a worker `run` decision
-            // resets it (see `plain_text_after_delivery_routes_to_worker`). The
-            // input placeholder / bottom hint already prioritise the LIVE `thinking`
-            // state over a stale `aborted`/`finished` (ui.rs), so the placeholder
-            // reads "running" while this chat turn streams — without disturbing the
-            // delivered/aborted bookkeeping the routing reset depends on.
+                                  // NB: we deliberately do NOT clear `aborted`/`finished` here — the
+                                  // settled run's terminal state persists until a worker `run` decision
+                                  // resets it (see `plain_text_after_delivery_routes_to_worker`). The
+                                  // input placeholder / bottom hint already prioritise the LIVE `thinking`
+                                  // state over a stale `aborted`/`finished` (ui.rs), so the placeholder
+                                  // reads "running" while this chat turn streams — without disturbing the
+                                  // delivered/aborted bookkeeping the routing reset depends on.
             self.thinking_started = Some(std::time::Instant::now());
             // Fresh chat turn → fresh stall clock (don't inherit a stale time
             // from an earlier phase and flash red immediately).
