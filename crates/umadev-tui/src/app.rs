@@ -2670,6 +2670,13 @@ impl App {
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
+                // A phase is STARTING — the run is demonstrably alive and
+                // progressing, so any prior terminal flag is stale. Clearing it
+                // here keeps the status/placeholder honest if a single block
+                // aborted earlier and the director then recovered into a new phase
+                // (otherwise the run kept advancing under a frozen "本轮已中止").
+                self.aborted = false;
+                self.finished = false;
                 // Fresh phase → fresh stall clock; nothing has stalled yet.
                 self.last_output_at = Some(std::time::Instant::now());
                 self.tool_in_progress = false;
@@ -3735,7 +3742,13 @@ impl App {
             }
 
             // ---- printable char ----
-            KeyCode::Char(c) => {
+            // Guard on `!ctrl && !alt`: without it, every Ctrl/Alt-modified letter
+            // that ISN'T intercepted by a specific arm above (Ctrl+P, Ctrl+X,
+            // Ctrl+V, Ctrl+G, Alt+f, Alt+b, …) fell through here and typed its bare
+            // letter into the input (user-visible: Ctrl+P inserted "p"). Shift is
+            // allowed through — Shift+letter is a normal uppercase char. A modified
+            // combo with no handler now lands on the `_` no-op below.
+            KeyCode::Char(c) if !ctrl && !alt => {
                 self.pending_quit_confirm = false;
                 self.input_history_idx = None;
                 self.insert_at_cursor(c);
@@ -3828,6 +3841,13 @@ impl App {
             // "settled, route to chat" matches `is_pipeline_active()` exactly.
             self.record_user_turn(&text);
             self.thinking = true; // animated "thinking…" until the base replies
+            // NB: we deliberately do NOT clear `aborted`/`finished` here — the
+            // settled run's terminal state persists until a worker `run` decision
+            // resets it (see `plain_text_after_delivery_routes_to_worker`). The
+            // input placeholder / bottom hint already prioritise the LIVE `thinking`
+            // state over a stale `aborted`/`finished` (ui.rs), so the placeholder
+            // reads "running" while this chat turn streams — without disturbing the
+            // delivered/aborted bookkeeping the routing reset depends on.
             self.thinking_started = Some(std::time::Instant::now());
             // Fresh chat turn → fresh stall clock (don't inherit a stale time
             // from an earlier phase and flash red immediately).

@@ -4044,6 +4044,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // Placeholder (Claude Code style: dim hint when empty). Localized.
     let placeholder = if app.active_gate.is_some() {
         umadev_i18n::t(app.lang, "input.gate")
+    } else if app.thinking || app.tool_in_progress {
+        // ACTIVELY working a turn (a chat reply streaming, or a tool running) —
+        // show the interruptible "running" hint. This MUST win over `aborted`
+        // below: a chat turn doesn't fire `PipelineStarted` (only a build does),
+        // so a stale `aborted` from a PRIOR block would otherwise persist and the
+        // placeholder wrongly read "本轮已中止" while the base was replying normally
+        // (user-reported). A live turn is, by definition, not aborted.
+        umadev_i18n::t(app.lang, "input.running")
     } else if app.finished {
         umadev_i18n::t(app.lang, "input.finished")
     } else if app.aborted {
@@ -4143,6 +4151,13 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         umadev_i18n::t(app.lang, "tui.hint.multiline").into()
     } else if !app.input.is_empty() {
         umadev_i18n::t(app.lang, "tui.hint.typed").into()
+    } else if app.thinking || app.tool_in_progress {
+        // ACTIVELY working (a reply streaming / a tool running) — show the
+        // interruptible running hint. Must win over `finished`/`aborted`: a stale
+        // terminal flag from a prior block would otherwise paint "[aborted] 本轮已停止"
+        // under a build that is plainly still reading files and thinking
+        // (user-reported, with a screenshot). A live turn is not aborted.
+        umadev_i18n::t(app.lang, "tui.hint.running").into()
     } else if app.finished {
         umadev_i18n::t(app.lang, "tui.hint.finished").into()
     } else if app.aborted {

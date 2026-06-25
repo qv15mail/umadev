@@ -3484,6 +3484,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             Action::Cancel => {
                                 if let Some(h) = run_task.take() {
                                     h.abort();
+                                    // `abort()` only SCHEDULES cancellation — the base
+                                    // subprocess keeps generating until the task actually
+                                    // unwinds and drops its owned session (Child
+                                    // kill_on_drop) / releases the session_holder lock.
+                                    // AWAIT the handle (bounded) so the work is genuinely
+                                    // stopped BEFORE we show "已中止" and clean up — without
+                                    // this the UI said "aborted" while the base was still
+                                    // running (user-reported), and the continuous-run
+                                    // cleanup below `try_lock`ed against a still-held lock
+                                    // and silently skipped, leaking the session.
+                                    let _ =
+                                        tokio::time::timeout(Duration::from_secs(2), h).await;
                                 }
                                 // A continuous run was just cancelled: close + drop
                                 // the parked director session so the NEXT run opens

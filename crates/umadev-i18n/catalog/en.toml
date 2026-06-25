@@ -133,6 +133,7 @@
 "intent.team" = " · team: {}"
 
 # Wave 1 — live plan checklist + team-review panel
+"plan.synthesizing" = "Planning the delivery — drafting the steps for this requirement (a complex one may take a moment)…"
 "plan.posted" = "Plan posted — {} steps. Track them in the checklist; steer with /plan."
 "plan.panel.title" = "Plan"
 "plan.panel.collapsed" = "Plan {}/{} — /plan to expand"

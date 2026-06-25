@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.9"
+version = "1.0.10"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT"
@@ -111,7 +111,15 @@ lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
-panic = "abort"
+# `unwind`, NOT `abort`: the fail-open contract depends on it. `panic = "abort"`
+# makes `std::panic::catch_unwind` INERT (a panic aborts the process instead of
+# being caught), which silently disabled the three fail-open guards in a release
+# build — the governance hook collapsing a panicking rule to `Decision::pass()`,
+# the critic-review fallback, and the TUI markdown compile. With `abort`, a panic
+# in markdown rendering would CRASH the user's whole session instead of degrading
+# to raw text. The landing-pad cost is negligible at runtime (only paid while
+# actually unwinding); honoring "governance/render never crashes the host" wins.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0

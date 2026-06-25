@@ -174,6 +174,17 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // carries the (short) identity so the base is always "us", never a bare CLI.
     fw.push_block(&identity_layer(route));
 
+    // ── Always-on: OUTPUT LANGUAGE ───────────────────────────────────────────
+    // The base must reply in the user's interface language (the i18n locale), not
+    // default to English. User-reported: a zh-CN user saw English replies like
+    // "This is a monorepo. Let me map it out in depth…". Pushed right after the
+    // identity so it leads every turn (chat AND build); empty for an English locale
+    // (the base's default — no tokens spent).
+    let lang_directive = language_directive();
+    if !lang_directive.is_empty() {
+        fw.push_block(&lang_directive);
+    }
+
     // ── Layer 2: 心法 / anti-slop (work-class only) ──────────────────────────
     if tier.wants_craft() {
         fw.push_block(agentic_engineering_rules());
@@ -238,6 +249,28 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
 /// route names a seat (the first of the convened team), that seat's persona — so
 /// a frontend build opens "you are the director AND a senior frontend engineer".
 /// Generalised (no external source); short by construction.
+/// The always-on output-language directive: the base must answer in the user's
+/// interface language (the i18n locale), not silently default to English. Returns
+/// empty for an English locale (the base's own default — no tokens spent). Naming
+/// the target language in English keeps the instruction reliable for every base;
+/// the native name reinforces it.
+fn language_directive() -> String {
+    use umadev_i18n::Lang;
+    let (english_name, native) = match umadev_i18n::current() {
+        Lang::ZhCn => ("Simplified Chinese", "简体中文"),
+        Lang::ZhTw => ("Traditional Chinese", "繁體中文"),
+        Lang::En => return String::new(),
+    };
+    format!(
+        "## Output language\n\
+         Respond to the user in {english_name} ({native}) — ALL prose: explanations, \
+         plans, summaries, questions, status, and progress notes. Keep source code, \
+         identifiers, file paths, shell commands, and established technical terms in \
+         their original form. {native} is the user's interface language and OVERRIDES \
+         any default to English."
+    )
+}
+
 fn identity_layer(route: &RoutePlan) -> String {
     let mut out = String::from(agentic_team_identity());
     // The route's team is ordered doers-first; the lead seat names the craft the

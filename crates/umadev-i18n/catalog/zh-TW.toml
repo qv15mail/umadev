@@ -133,6 +133,7 @@
 "intent.team" = " · 團隊:{}"
 
 # Wave 1 — 即時計畫清單 + 團隊評審面板
+"plan.synthesizing" = "正在規劃交付計畫——為該需求擬定步驟(複雜需求可能要等一會兒)…"
 "plan.posted" = "計畫已就緒——{} 步。下方清單會即時勾選;用 /plan 調整。"
 "plan.panel.title" = "計畫"
 "plan.panel.collapsed" = "計畫 {}/{} — /plan 展開"
