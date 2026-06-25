@@ -522,8 +522,10 @@ impl FileDiff {
                 // length); a ragged tail on either side stays whole-line.
                 let pairs = (del_end - del_start).min(ins_end - ins_start);
                 for k in 0..pairs {
-                    let (del_text, ins_text) =
-                        (flat[del_start + k].text.clone(), flat[ins_start + k].text.clone());
+                    let (del_text, ins_text) = (
+                        flat[del_start + k].text.clone(),
+                        flat[ins_start + k].text.clone(),
+                    );
                     let (del_ranges, ins_ranges) = word_diff_ranges(&del_text, &ins_text);
                     flat[del_start + k].changed = del_ranges;
                     flat[ins_start + k].changed = ins_ranges;
@@ -11825,11 +11827,15 @@ mod tests {
             }
         }
         assert!(
-            del.changed.iter().any(|&(s, e)| del.text[s..e].contains('旧')),
+            del.changed
+                .iter()
+                .any(|&(s, e)| del.text[s..e].contains('旧')),
             "the changed CJK token is marked on the - side"
         );
         assert!(
-            ins.changed.iter().any(|&(s, e)| ins.text[s..e].contains('新')),
+            ins.changed
+                .iter()
+                .any(|&(s, e)| ins.text[s..e].contains('新')),
             "the changed CJK token is marked on the + side"
         );
     }

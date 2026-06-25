@@ -1634,7 +1634,11 @@ mod tests {
             panic!("turn 2 usage");
         };
 
-        assert_eq!((a.input_tokens, a.output_tokens), (100, 10), "turn 1 = its own last");
+        assert_eq!(
+            (a.input_tokens, a.output_tokens),
+            (100, 10),
+            "turn 1 = its own last"
+        );
         assert_eq!(
             (b.input_tokens, b.output_tokens),
             (50, 5),

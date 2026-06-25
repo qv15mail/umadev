@@ -128,6 +128,26 @@ function modelPresent(dir) {
     }
   });
 }
+// Render one frame of the download progress bar (in place, via \r). Block-glyph
+// bar + percent + downloaded/total + live speed; ANSI-colored only on a TTY so a
+// piped/redirected install stays clean.
+function drawBar(label, got, total, startTime) {
+  const tty = process.stderr.isTTY;
+  const c = (code) => (tty ? '\x1b[' + code + 'm' : '');
+  const w = 22;
+  const ratio = total > 0 ? Math.min(1, got / total) : 0;
+  const fill = Math.round(ratio * w);
+  const bar = c('38;5;45') + '█'.repeat(fill) + c('0') + c('38;5;238') + '░'.repeat(w - fill) + c('0');
+  const pct = String(Math.floor(ratio * 100)).padStart(3);
+  const mb = (got / 1048576).toFixed(1);
+  const tot = (total / 1048576).toFixed(0);
+  const sec = (Date.now() - startTime) / 1000;
+  const spd = sec > 0.3 ? (got / 1048576 / sec).toFixed(1) + ' MB/s' : '…';
+  process.stderr.write(
+    '\r  ' + c('1') + label + c('0') + '  ' + bar + '  ' + c('1') + pct + '%' + c('0') +
+      c('2') + '  ·  ' + mb + '/' + tot + ' MB  ·  ' + spd + c('0') + '   ',
+  );
+}
 // Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
 // progress bar when `withBar`. Resolves on success, rejects on any error.
 function downloadTo(url, dest, withBar, label) {
@@ -149,22 +169,24 @@ function downloadTo(url, dest, withBar, label) {
         const total = parseInt(res.headers['content-length'] || '0', 10);
         let got = 0;
         let lastPct = -1;
+        let lastDraw = 0;
+        const startTime = Date.now();
         const tmp = dest + '.part';
         const out = fs.createWriteStream(tmp);
+        // Draw the bar at 0% the instant the response starts — on a slow link the
+        // first 1% can take a while, and a silent gap reads as "stuck / failed".
+        if (withBar && total > 0) drawBar(label, 0, total, startTime);
         res.on('data', (chunk) => {
           got += chunk.length;
           if (withBar && total > 0) {
+            const now = Date.now();
             const pct = Math.floor((got / total) * 100);
-            if (pct !== lastPct) {
+            // Redraw on each new percent OR every ~250ms — keeps the live speed
+            // ticking even while a single percent of a 224MB file streams in.
+            if (pct !== lastPct || now - lastDraw > 250) {
               lastPct = pct;
-              const w = 24;
-              const fill = Math.round((pct / 100) * w);
-              const bar = '#'.repeat(fill) + '-'.repeat(w - fill);
-              const mb = (got / 1048576).toFixed(0);
-              const tot = (total / 1048576).toFixed(0);
-              process.stderr.write(
-                '\r  ' + label + ' [' + bar + '] ' + pct + '%  (' + mb + '/' + tot + ' MB)',
-              );
+              lastDraw = now;
+              drawBar(label, got, total, startTime);
             }
           }
         });
@@ -177,7 +199,10 @@ function downloadTo(url, dest, withBar, label) {
             } catch (er) {
               return reject(er);
             }
-            if (withBar) process.stderr.write('\n');
+            if (withBar && total > 0) {
+              drawBar(label, total, total, startTime);
+              process.stderr.write('\n');
+            }
             resolve();
           }),
         );
@@ -197,12 +222,15 @@ function releaseBases(version) {
   if (process.env.UMADEV_MODEL_BASE_URL) {
     return [process.env.UMADEV_MODEL_BASE_URL.replace(/\/+$/, '')];
   }
+  // GitHub Release ships the quantized fp16 model (~224MB, smaller). HuggingFace
+  // and its China mirror hf-mirror.com serve the upstream f32 model (~448MB —
+  // bigger, but the candle loader handles either). hf-mirror is the FAST + reliable
+  // source inside mainland China, where github.com's release CDN is slow and the
+  // community GitHub proxies are flaky for release-asset URLs.
   const gh = 'https://github.com/umacloud/umadev/releases/download/v' + version;
-  const mirrors = [
-    'https://ghproxy.net/' + gh,
-    'https://ghfast.top/' + gh,
-    'https://gh-proxy.com/' + gh,
-  ];
+  const ghProxies = ['https://ghproxy.net/' + gh, 'https://ghfast.top/' + gh];
+  const hf = 'https://huggingface.co/intfloat/multilingual-e5-small/resolve/main';
+  const hfMirror = 'https://hf-mirror.com/intfloat/multilingual-e5-small/resolve/main';
   let cn = false;
   try {
     const opts = Intl.DateTimeFormat().resolvedOptions();
@@ -212,9 +240,11 @@ function releaseBases(version) {
       /Shanghai|Chongqing|Urumqi|Harbin|Hong_Kong|Macau/.test(tz) ||
       /zh[_-]?(CN|Hans)/i.test(loc);
   } catch (_) {
-    /* default to direct-first */
+    /* default to international order */
   }
-  return cn ? [...mirrors, gh] : [gh, ...mirrors];
+  // China: hf-mirror first (fast + reliable in CN), then GitHub proxies + direct.
+  // International: GitHub Release first (smaller fp16), then HuggingFace + mirror.
+  return cn ? [hfMirror, ...ghProxies, gh, hf] : [gh, hf, hfMirror, ...ghProxies];
 }
 // Try each base for `name` in order; resolve on first success, throw the last
 // error if all fail. A China mirror can cover a blocked github.com (or vice
@@ -244,13 +274,13 @@ async function ensureModel() {
   try {
     fs.mkdirSync(dir, { recursive: true });
     process.stderr.write(
-      '\n  本地向量检索模型缺失,正在下载 (multilingual-e5-small · fp16 · ~224MB)…\n',
+      '\n  本地向量检索模型缺失,正在下载 multilingual-e5-small(国内自动走镜像)…\n',
     );
     process.stderr.write(
       '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n',
     );
     await downloadFile(bases, 'config.json', path.join(dir, 'config.json'), false, '');
-    await downloadFile(bases, 'tokenizer.json', path.join(dir, 'tokenizer.json'), false, '');
+    await downloadFile(bases, 'tokenizer.json', path.join(dir, 'tokenizer.json'), true, '下载分词器  ');
     await downloadFile(
       bases,
       'model.safetensors',

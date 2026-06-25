@@ -817,7 +817,11 @@ fn truncate_spans(spans: &[Span<'static>], max: usize) -> Vec<Span<'static>> {
             break;
         }
     }
-    out.push(role_span("\u{2026}".to_string(), SynRole::Muted, Modifier::empty()));
+    out.push(role_span(
+        "\u{2026}".to_string(),
+        SynRole::Muted,
+        Modifier::empty(),
+    ));
     out
 }
 
@@ -2739,7 +2743,10 @@ fn diff_to_lines(
                 // Everything not yet rendered, across THIS and the remaining
                 // hunks, folds into the tail count.
                 truncated_remaining = (hunk.lines.len() - li)
-                    + d.hunks[hi + 1..].iter().map(|h| h.lines.len()).sum::<usize>();
+                    + d.hunks[hi + 1..]
+                        .iter()
+                        .map(|h| h.lines.len())
+                        .sum::<usize>();
                 break 'hunks;
             }
             content_rows += 1;
@@ -2881,7 +2888,11 @@ fn diff_content_spans(
             .all(|w| w[0].1 <= w[1].0);
     if !ranges_ok {
         let base = if dl.tag == '-' {
-            vec![role_span(dl.text.clone(), SynRole::DiffDel, Modifier::empty())]
+            vec![role_span(
+                dl.text.clone(),
+                SynRole::DiffDel,
+                Modifier::empty(),
+            )]
         } else {
             highlight_code_line(&dl.text, lang_hint)
         };
@@ -2903,7 +2914,11 @@ fn diff_content_spans(
                 // A deletion's unchanged text stays in the base delete color
                 // (muted), so only the changed token is emphasised — not the
                 // whole line re-coloured.
-                spans.push(role_span(seg.to_string(), SynRole::DiffDel, Modifier::empty()));
+                spans.push(role_span(
+                    seg.to_string(),
+                    SynRole::DiffDel,
+                    Modifier::empty(),
+                ));
             } else {
                 spans.extend(highlight_code_line(seg, lang_hint));
             }
@@ -2920,7 +2935,11 @@ fn diff_content_spans(
     if cursor < dl.text.len() {
         let seg = &dl.text[cursor..];
         if dl.tag == '-' {
-            spans.push(role_span(seg.to_string(), SynRole::DiffDel, Modifier::empty()));
+            spans.push(role_span(
+                seg.to_string(),
+                SynRole::DiffDel,
+                Modifier::empty(),
+            ));
         } else {
             spans.extend(highlight_code_line(seg, lang_hint));
         }
@@ -3003,7 +3022,11 @@ fn render_tool_row(
     }
     if show_collapsed && foldable {
         let hidden = lines.len().saturating_sub(head_n);
-        rendered.push(RenderedRow::spined(fold_summary_line(hidden, lang), 3, spine));
+        rendered.push(RenderedRow::spined(
+            fold_summary_line(hidden, lang),
+            3,
+            spine,
+        ));
     }
 }
 
@@ -3332,7 +3355,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             theme::TEXT(),
             app.animations,
         ));
-        think_spans.push(Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())));
+        think_spans.push(Span::styled(
+            elapsed,
+            Style::default().fg(theme::TEXT_MUTED()),
+        ));
         rendered.push(RenderedRow::plain(Line::from(think_spans), 2));
         // A trailing blank row lifts the indicator one line up off the input box
         // (it was sitting jammed right against the prompt).
@@ -3744,7 +3770,13 @@ fn tool_activity_verb(tool: &str, lang: umadev_i18n::Lang) -> String {
     umadev_i18n::t(lang, key).to_string()
 }
 
-fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: bool) -> Vec<Span<'static>> {
+fn shimmer_spans(
+    word: &str,
+    tick: u8,
+    base: Color,
+    bright: Color,
+    animated: bool,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = word.chars().collect();
     if !animated || chars.is_empty() {
         return vec![Span::styled(
@@ -3754,8 +3786,8 @@ fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: boo
     }
     let n = chars.len();
     let period = n + 4; // a short pause after the band leaves the word
-    // Advance the band every 4th tick so the shimmer sweeps calmly (~320ms/step at
-    // the ~80ms spinner tick) instead of strobing across the word.
+                        // Advance the band every 4th tick so the shimmer sweeps calmly (~320ms/step at
+                        // the ~80ms spinner tick) instead of strobing across the word.
     let head = (tick as usize / 4) % period;
     chars
         .into_iter()
@@ -3764,7 +3796,10 @@ fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: boo
             // A ~2-char band centred on the moving head.
             let lit = head >= i && head <= i + 1;
             let fg = if lit { bright } else { base };
-            Span::styled(c.to_string(), Style::default().fg(fg).add_modifier(Modifier::BOLD))
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            )
         })
         .collect()
 }
@@ -4799,7 +4834,10 @@ mod tests {
     fn markdown_task_list_renders_checkboxes() {
         let md = "- [x] done\n- [ ] todo";
         let txt = md_text(&markdown_to_lines(md, Color::White));
-        assert!(txt.contains("\u{2611}"), "checked box for a done item: {txt}");
+        assert!(
+            txt.contains("\u{2611}"),
+            "checked box for a done item: {txt}"
+        );
         assert!(txt.contains("\u{2610}"), "empty box for a todo item: {txt}");
         // The checkbox replaces the bullet — no stray '•' on a task item.
         assert!(!txt.contains('\u{2022}'), "no bullet on task items: {txt}");
@@ -4807,7 +4845,10 @@ mod tests {
 
     #[test]
     fn markdown_image_surfaces_its_href() {
-        let txt = md_text(&markdown_to_lines("![logo](https://x.test/a.png)", Color::White));
+        let txt = md_text(&markdown_to_lines(
+            "![logo](https://x.test/a.png)",
+            Color::White,
+        ));
         assert!(
             txt.contains("https://x.test/a.png"),
             "image href surfaced (not dropped): {txt}"
@@ -4842,9 +4883,18 @@ mod tests {
                   | alpha | active | bob | some notes here |";
         let txt = md_text(&markdown_to_lines(md, Color::White));
         set_table_width_budget(0);
-        assert!(txt.contains("Name: alpha"), "vertical header:value record: {txt}");
-        assert!(txt.contains("Owner: bob"), "every column becomes a key:value line: {txt}");
-        assert!(!txt.contains('\u{2502}'), "no grid │ separators in vertical mode: {txt}");
+        assert!(
+            txt.contains("Name: alpha"),
+            "vertical header:value record: {txt}"
+        );
+        assert!(
+            txt.contains("Owner: bob"),
+            "every column becomes a key:value line: {txt}"
+        );
+        assert!(
+            !txt.contains('\u{2502}'),
+            "no grid │ separators in vertical mode: {txt}"
+        );
     }
 
     #[test]
@@ -6012,7 +6062,11 @@ mod tests {
         // Not animated → one flat bold span in the base color (no strobe).
         let flat = shimmer_spans("thinking", 3, Color::Blue, Color::White, false);
         assert_eq!(flat.len(), 1, "flat shimmer is a single span");
-        assert_eq!(flat[0].style.fg, Some(Color::Blue), "flat uses the base color");
+        assert_eq!(
+            flat[0].style.fg,
+            Some(Color::Blue),
+            "flat uses the base color"
+        );
     }
 
     #[test]
@@ -6021,7 +6075,10 @@ mod tests {
         // can never overflow.
         let line = Line::from(Span::raw("supercalifragilistic".to_string())); // 20 chars
         let rows = prefold_line(&line, 8, 0, None);
-        assert!(rows.len() >= 3, "a 20-char word at width 8 spans multiple rows");
+        assert!(
+            rows.len() >= 3,
+            "a 20-char word at width 8 spans multiple rows"
+        );
         for r in &rows {
             assert!(line_width(r) <= 8, "no row overflows even mid-word");
         }
@@ -6059,7 +6116,10 @@ mod tests {
         assert!(rows.len() >= 2, "20 cols at width 10 wraps");
         // Row 0 keeps the caller's own prefix (here: none) — no injected spine.
         let first: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!first.starts_with(glyph), "row 0 spine comes from the caller");
+        assert!(
+            !first.starts_with(glyph),
+            "row 0 spine comes from the caller"
+        );
         for r in &rows[1..] {
             let joined: String = r.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
@@ -6079,12 +6139,18 @@ mod tests {
                 .take_while(|&c| c == glyph || c == ' ')
                 .map(char_width)
                 .sum();
-            assert_eq!(indent_cols, GUTTER_W, "indent stays the unified gutter width");
+            assert_eq!(
+                indent_cols, GUTTER_W,
+                "indent stays the unified gutter width"
+            );
         }
         // A `None` spine keeps the legacy plain-space indent (no glyph).
         let plain = prefold_line(&line, 10, GUTTER_W, None);
         let cont: String = plain[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!cont.starts_with(glyph), "no spine glyph when color is None");
+        assert!(
+            !cont.starts_with(glyph),
+            "no spine glyph when color is None"
+        );
     }
 
     // ── Transcript visual skeleton (role spine / full-width bubble / seat
@@ -6232,8 +6298,14 @@ mod tests {
         // different seats — same glyph family, different seat COLOR.
         let (host_marker, host_color) = assistant_marker(ChatRole::Host);
         let (uma_marker, uma_color) = assistant_marker(ChatRole::UmaDev);
-        assert_eq!(host_marker, uma_marker, "same glyph family, both filled circles");
-        assert_ne!(host_color, uma_color, "Host vs UmaDev are different seat colors");
+        assert_eq!(
+            host_marker, uma_marker,
+            "same glyph family, both filled circles"
+        );
+        assert_ne!(
+            host_color, uma_color,
+            "Host vs UmaDev are different seat colors"
+        );
         assert_eq!(uma_color, theme::ACCENT(), "UmaDev director = brand accent");
         assert_eq!(host_color, theme::SUCCESS(), "Host base = teammate success");
         // And the spine bar colors also differ (You/Host/UmaDev/System/Gate).
@@ -6438,8 +6510,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(add_emph, "newName", "only the renamed token is emphasised (+)");
-        assert_eq!(del_emph, "oldName", "only the renamed token is emphasised (−)");
+        assert_eq!(
+            add_emph, "newName",
+            "only the renamed token is emphasised (+)"
+        );
+        assert_eq!(
+            del_emph, "oldName",
+            "only the renamed token is emphasised (−)"
+        );
     }
 
     #[test]
@@ -6519,12 +6597,15 @@ mod tests {
                 saw_full_del = true;
             }
         }
-        assert!(saw_full_add && saw_full_del, "both +/- rows got a full-width tint");
+        assert!(
+            saw_full_add && saw_full_del,
+            "both +/- rows got a full-width tint"
+        );
     }
 
     #[test]
     fn expanded_diff_truncates_with_a_muted_tail() {
-        use crate::app::{FileDiff, DiffHunk, DiffLine};
+        use crate::app::{DiffHunk, DiffLine, FileDiff};
         // Build (by hand) an EXPANDED card whose single hunk exceeds the row cap,
         // so the renderer must stop and emit a `… N more lines` tail. (Building
         // it directly avoids relying on the fold heuristics.)
@@ -6559,9 +6640,16 @@ mod tests {
                     .is_some_and(|s| s.content.as_ref().starts_with('+'))
             })
             .count();
-        assert_eq!(plus_rows, super::DIFF_EXPANDED_ROW_CAP, "renders up to the cap");
+        assert_eq!(
+            plus_rows,
+            super::DIFF_EXPANDED_ROW_CAP,
+            "renders up to the cap"
+        );
         // The muted tail names the elided remainder (25 rows).
-        assert!(joined.contains("25"), "tail names the remaining rows: {joined:?}");
+        assert!(
+            joined.contains("25"),
+            "tail names the remaining rows: {joined:?}"
+        );
         assert!(
             joined.contains("more lines") || joined.contains('行'),
             "tail is the truncation message: {joined:?}"
