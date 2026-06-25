@@ -879,6 +879,34 @@ fn render_table(state: &mut MdState, table: &TableBuf) {
     }
     let indent = " ".repeat(state.list_indent() + 1);
     let empty: Vec<Span<'static>> = Vec::new();
+    // Vertical fallback: when the table has many columns and the budget can't give
+    // each a usable width (so a horizontal grid would be a wall of `…`), render each
+    // data row as a stacked `header: value` block instead — far more readable on a
+    // narrow terminal.
+    if shrunk && cols >= 3 && budget > 0 && budget < cols * 12 && !table.rows.is_empty() {
+        let header = &table.rows[0];
+        let val_w = budget.saturating_sub(indent_w + 2).max(8);
+        for row in table.rows.iter().skip(1) {
+            for c in 0..cols {
+                let key: String = header
+                    .get(c)
+                    .map(|cell| cell.iter().map(|s| s.content.as_ref()).collect())
+                    .unwrap_or_default();
+                let val = row.get(c).unwrap_or(&empty);
+                let mut line: Vec<Span<'static>> = vec![Span::raw(indent.clone())];
+                line.push(role_span(
+                    format!("{key}: "),
+                    SynRole::Heading,
+                    Modifier::BOLD,
+                ));
+                line.extend(truncate_spans(val, val_w));
+                state.lines.push(Line::from(line));
+            }
+            // Blank spacer between records.
+            state.lines.push(Line::from(""));
+        }
+        return;
+    }
     for (r, row) in table.rows.iter().enumerate() {
         let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.clone())];
         for (c, &col_w) in widths.iter().enumerate() {
@@ -3251,22 +3279,22 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             String::new()
         };
         rendered.push(RenderedRow::plain(Line::from(""), 0));
-        rendered.push(RenderedRow::plain(
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", app.spinner()),
-                    Style::default().fg(theme::ACCENT()),
-                ),
-                Span::styled(
-                    umadev_i18n::t(app.lang, "status.thinking").to_string(),
-                    Style::default()
-                        .fg(theme::ACCENT())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())),
-            ]),
-            2,
+        let mut think_spans = vec![Span::styled(
+            format!("{} ", app.spinner()),
+            Style::default().fg(theme::ACCENT()),
+        )];
+        // The "thinking" word shimmers — a bright band sweeps across it so a long
+        // wait reads as alive (and freezes flat when animations are off).
+        let thinking_word = umadev_i18n::t(app.lang, "status.thinking");
+        think_spans.extend(shimmer_spans(
+            thinking_word,
+            app.tick,
+            theme::ACCENT(),
+            theme::TEXT(),
+            app.animations && !app.is_stalled(),
         ));
+        think_spans.push(Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())));
+        rendered.push(RenderedRow::plain(Line::from(think_spans), 2));
     }
     // Pre-fold every logical line to the CURRENT width into the exact visual
     // rows it occupies, then render WITHOUT `Paragraph::wrap`. This is the
@@ -3642,6 +3670,33 @@ fn prefold_line(
 /// bubble instead of a tint that stops at the text and leaves a ragged right
 /// edge. CJK-safe: padding is measured by display columns. Fail-open: `None`
 /// pads nothing and behaves exactly like the old fold.
+/// Render `word` with a soft shimmer: a small bright band (in `bright`) sweeps
+/// across the word over time, driven by the spinner `tick`, the rest in `base`.
+/// When `animated` is false (animations off / non-TTY) the word renders flat in
+/// `base` bold — no per-char strobe. The whole word is always bold.
+fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: bool) -> Vec<Span<'static>> {
+    let chars: Vec<char> = word.chars().collect();
+    if !animated || chars.is_empty() {
+        return vec![Span::styled(
+            word.to_string(),
+            Style::default().fg(base).add_modifier(Modifier::BOLD),
+        )];
+    }
+    let n = chars.len();
+    let period = n + 4; // a short pause after the band leaves the word
+    let head = (tick as usize) % period;
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // A ~2-char band centred on the moving head.
+            let lit = head >= i && head <= i + 1;
+            let fg = if lit { bright } else { base };
+            Span::styled(c.to_string(), Style::default().fg(fg).add_modifier(Modifier::BOLD))
+        })
+        .collect()
+}
+
 /// Append a styled char run onto `cur`, coalescing equal-style chars into one
 /// `Span` so the word-wrap fold doesn't emit one Span per character.
 fn emit_run(cur: &mut Vec<Span<'static>>, run: &[(char, Style)]) {
@@ -4758,6 +4813,20 @@ mod tests {
             md_text(&lines).contains('\u{2026}'),
             "the over-long cell was truncated with an ellipsis"
         );
+    }
+
+    #[test]
+    fn many_column_table_on_a_narrow_budget_goes_vertical() {
+        // 4 wide columns at a tight budget can't form a usable grid → stacked
+        // `header: value` records instead of a wall of `…`.
+        set_table_width_budget(24);
+        let md = "| Name | Status | Owner | Notes |\n|---|---|---|---|\n\
+                  | alpha | active | bob | some notes here |";
+        let txt = md_text(&markdown_to_lines(md, Color::White));
+        set_table_width_budget(0);
+        assert!(txt.contains("Name: alpha"), "vertical header:value record: {txt}");
+        assert!(txt.contains("Owner: bob"), "every column becomes a key:value line: {txt}");
+        assert!(!txt.contains('\u{2502}'), "no grid │ separators in vertical mode: {txt}");
     }
 
     #[test]
@@ -5895,6 +5964,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(back, "hello world foobar");
+    }
+
+    #[test]
+    fn shimmer_animates_a_bright_band_else_flat() {
+        // Animated → per-char spans with at least one bright (band) glyph.
+        let lit = shimmer_spans("thinking", 3, Color::Blue, Color::White, true);
+        assert!(lit.len() > 1, "animated shimmer splits per char");
+        assert!(
+            lit.iter().any(|s| s.style.fg == Some(Color::White)),
+            "a bright band glyph is present"
+        );
+        // Not animated → one flat bold span in the base color (no strobe).
+        let flat = shimmer_spans("thinking", 3, Color::Blue, Color::White, false);
+        assert_eq!(flat.len(), 1, "flat shimmer is a single span");
+        assert_eq!(flat[0].style.fg, Some(Color::Blue), "flat uses the base color");
     }
 
     #[test]
