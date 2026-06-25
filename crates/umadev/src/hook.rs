@@ -75,7 +75,11 @@ fn path_under_root(file_path: &str, root: &Path) -> bool {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
-        cwd.join(p)
+        // Canonicalize the CWD (it exists) so a relative target built on it shares
+        // the canonicalized root's form — on Windows that resolves the 8.3 short
+        // name + real case + `\\?\` prefix, which `current_dir()` may report
+        // differently from `canonicalize(root)`. No-op-ish on Unix.
+        std::fs::canonicalize(&cwd).unwrap_or(cwd).join(p)
     } else {
         return true; // can't resolve → don't relax governance
     };
