@@ -73,70 +73,6 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
   );
 }
 
-function PartnerLogoIcon({ name }: { name: string }) {
-  if (name === "rustcc") {
-    return (
-      <svg viewBox="0 0 100 100" fill="currentColor" width="48" height="48" style={{ color: "var(--cyan)" }}>
-        <circle cx="50" cy="50" r="28" fill="none" stroke="currentColor" strokeWidth="6" />
-        <circle cx="50" cy="50" r="18" fill="none" stroke="currentColor" strokeWidth="1.5" />
-        <path d="M 50 12 L 50 20 M 50 80 L 50 88 M 12 50 L 20 50 M 80 50 L 88 50 M 23 23 L 29 29 M 71 71 L 77 77 M 23 71 L 29 65 M 71 23 L 77 29" stroke="currentColor" strokeWidth="6" strokeLinecap="round" />
-        <text x="50" y="59" fontSize="26" fontWeight="bold" fontFamily="monospace" textAnchor="middle" fill="currentColor">R</text>
-      </svg>
-    );
-  }
-  if (name === "opencode") {
-    return (
-      <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" width="48" height="48" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" style={{ color: "#bd5bff" }}>
-        <path d="M 30 30 L 10 50 L 30 70" />
-        <path d="M 70 30 L 90 50 L 70 70" />
-        <circle cx="50" cy="50" r="8" fill="currentColor" />
-      </svg>
-    );
-  }
-  if (name === "codex") {
-    return (
-      <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" width="48" height="48" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" style={{ color: "#01cbf1" }}>
-        <path d="M 25 20 L 75 20 L 75 80 L 25 80 Z" />
-        <path d="M 35 35 L 65 35 M 35 50 L 65 50 M 35 65 L 55 65" strokeWidth="3" />
-        <path d="M 20 28 L 20 86 L 70 86" />
-      </svg>
-    );
-  }
-  if (name === "agent") {
-    return (
-      <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" width="48" height="48" strokeWidth="3" strokeLinecap="round" style={{ color: "#ff8c00" }}>
-        <circle cx="50" cy="30" r="8" fill="currentColor" />
-        <circle cx="25" cy="65" r="8" fill="currentColor" />
-        <circle cx="75" cy="65" r="8" fill="currentColor" />
-        <line x1="50" y1="38" x2="28" y2="59" />
-        <line x1="50" y1="38" x2="72" y2="59" />
-        <line x1="33" y1="65" x2="67" y2="65" />
-        <circle cx="50" cy="50" r="3" fill="currentColor" />
-      </svg>
-    );
-  }
-  if (name === "nextjs") {
-    return (
-      <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" width="48" height="48" style={{ color: "#ffffff" }}>
-        <circle cx="50" cy="50" r="40" stroke="currentColor" strokeWidth="5" />
-        <path d="M 40 30 L 70 70 M 70 30 L 70 70" strokeWidth="6" strokeLinecap="round" />
-      </svg>
-    );
-  }
-  if (name === "workshop") {
-    return (
-      <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" width="48" height="48" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" style={{ color: "#32cd32" }}>
-        <path d="M 15 25 L 85 25 L 85 75 L 15 75 Z" />
-        <path d="M 15 38 L 85 38" />
-        <circle cx="28" cy="31" r="2" fill="currentColor" />
-        <circle cx="36" cy="31" r="2" fill="currentColor" />
-        <circle cx="44" cy="31" r="2" fill="currentColor" />
-        <path d="M 40 48 L 32 56 L 40 64 M 60 48 L 68 56 L 60 64" />
-      </svg>
-    );
-  }
-  return null;
-}
 
 export function FloatingDiagnosticTerminal({
   setLang,
@@ -344,6 +280,16 @@ export function FloatingDiagnosticTerminal({
     </>
   );
 }
+
+const partnerColors: Record<string, { glow: string; border: string }> = {
+  yoma: { glow: "rgba(1, 203, 241, 0.22)", border: "#01cbf1" },
+  yinghepai: { glow: "rgba(242, 234, 83, 0.18)", border: "#f2ea53" },
+  paopai: { glow: "rgba(189, 91, 255, 0.18)", border: "#bd5bff" },
+  clawtime: { glow: "rgba(255, 75, 75, 0.18)", border: "#ff4b4b" },
+  seeai: { glow: "rgba(50, 205, 50, 0.18)", border: "#32cd32" },
+  gopc: { glow: "rgba(0, 191, 255, 0.18)", border: "#00bfff" },
+  xinze: { glow: "rgba(255, 105, 180, 0.18)", border: "#ff69b4" },
+};
 
 export default function Home() {
   const [lang, setLang] = useState<Lang>("zh");
@@ -898,24 +844,37 @@ export default function Home() {
                 <span className={styles.partnersEyebrow}>{t.partners.eyebrow}</span>
                 <h2 className={styles.partnersTitle}>{t.partners.title}</h2>
                 <div className={styles.partnersGrid}>
-                  {t.partners.list.map((partner, idx) => (
-                    <a
-                      key={idx}
-                      href={partner.url}
-                      target={partner.url === "#" ? undefined : "_blank"}
-                      rel={partner.url === "#" ? undefined : "noopener noreferrer"}
-                      className={styles.partnerCard}
-                    >
-                      <div className={styles.partnerGlow} />
-                      <div className={styles.partnerLogoWrapper}>
-                        <PartnerLogoIcon name={partner.logoName} />
-                      </div>
-                      <div className={styles.partnerInfo}>
-                        <span className={styles.partnerName}>{partner.name}</span>
-                        <span className={styles.partnerRole}>{partner.role}</span>
-                      </div>
-                    </a>
-                  ))}
+                  {t.partners.list.map((partner, idx) => {
+                    const colors = partnerColors[partner.logoName] || { glow: "rgba(255,255,255,0.08)", border: "rgba(255,255,255,0.2)" };
+                    return (
+                      <a
+                        key={idx}
+                        href={partner.url}
+                        target={partner.url === "#" ? undefined : "_blank"}
+                        rel={partner.url === "#" ? undefined : "noopener noreferrer"}
+                        className={styles.partnerCard}
+                        style={{
+                          "--partner-glow": colors.glow,
+                          "--partner-border": colors.border,
+                        } as React.CSSProperties}
+                      >
+                        <div className={styles.partnerGlow} />
+                        <div className={styles.partnerLogoContainer}>
+                          <Image
+                            src={asset(`/assets/partners/${partner.logoName}.png`)}
+                            alt={partner.name}
+                            width={180}
+                            height={80}
+                            style={{ objectFit: "contain", width: "auto", height: "auto", maxWidth: "100%", maxHeight: "100%" }}
+                          />
+                        </div>
+                        <div className={styles.partnerTextContainer}>
+                          <span className={styles.partnerCardName}>{partner.name}</span>
+                          <span className={styles.partnerCardRole}>{partner.role}</span>
+                        </div>
+                      </a>
+                    );
+                  })}
                 </div>
               </div>
             </section>

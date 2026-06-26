@@ -765,7 +765,8 @@
 .brandIp,
 .cta,
 .docsPage,
-.logPage {
+.logPage,
+.partnersSection {
   width: 100%;
   max-width: 1200px;
   margin: 0 auto;
@@ -1897,6 +1898,7 @@
   .cta,
   .docsPage,
   .logPage,
+  .partnersSection,
   .footer {
     padding-right: 18px;
     padding-left: 18px;
@@ -6330,17 +6332,13 @@
 }
 
 .partnersSection {
-  padding: 80px 32px;
-  background: rgba(10, 11, 14, 0.3);
-  border-top: 1px solid rgba(86, 90, 129, 0.15);
-  border-bottom: 1px solid rgba(86, 90, 129, 0.15);
-  position: relative;
-  overflow: hidden;
+  margin: 0 auto 96px;
+  padding-top: 64px;
+  padding-bottom: 64px;
 }
 
 .partnersContainer {
-  max-width: 1200px;
-  margin: 0 auto;
+  width: 100%;
   text-align: center;
   position: relative;
   z-index: 2;
@@ -6371,35 +6369,101 @@
 }
 
 .partnersGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 24px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
   justify-content: center;
+  margin-top: 24px;
 }
 
 .partnerCard {
   position: relative;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 20px;
-  padding: 24px;
-  background: rgba(26, 27, 31, 0.55);
-  border: 1px solid rgba(1, 203, 241, 0.08);
-  border-radius: 16px;
+  justify-content: flex-start;
+  padding: 32px 20px 24px;
+  background: rgba(26, 27, 31, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 20px;
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   text-decoration: none;
-  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), 
-              border-color 0.22s ease, 
-              box-shadow 0.22s ease;
+  transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), 
+              border-color 0.28s ease, 
+              box-shadow 0.28s ease,
+              background-color 0.28s ease;
   overflow: hidden;
+  min-height: 190px;
+  flex: 0 1 260px;
+  width: 260px;
+}
+
+/* Hover laser scanning line sweep */
+.partnerCard::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -10%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent 10%, var(--partner-border, var(--cyan)) 50%, transparent 90%);
+  box-shadow: 0 0 8px var(--partner-border, var(--cyan)), 0 0 16px var(--partner-border, var(--cyan));
+  opacity: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.partnerCard:hover::before {
+  animation: cardLaserSweep 0.9s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+
+@keyframes cardLaserSweep {
+  0% {
+    top: 0%;
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    top: 100%;
+    opacity: 0;
+  }
+}
+
+/* Sweeping light beam effect */
+.partnerCard::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -150%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.06),
+    transparent
+  );
+  transform: skewX(-20deg);
+  pointer-events: none;
+}
+
+.partnerCard:hover::after {
+  left: 150%;
+  transition: all 0.75s ease;
 }
 
 .partnerCard:hover {
-  transform: translateY(-4px) scale(1.01);
-  border-color: rgba(1, 203, 241, 0.42);
-  box-shadow: 0 12px 32px rgba(1, 203, 241, 0.12),
-              inset 0 0 12px rgba(1, 203, 241, 0.05);
+  transform: translateY(-6px);
+  border-color: var(--partner-border, rgba(1, 203, 241, 0.38));
+  background: rgba(26, 27, 31, 0.75);
+  box-shadow: 0 16px 36px var(--partner-glow, rgba(1, 203, 241, 0.12)),
+              inset 0 0 15px rgba(255, 255, 255, 0.01);
 }
 
 .partnerCard:hover .partnerGlow {
@@ -6409,64 +6473,80 @@
 .partnerGlow {
   position: absolute;
   inset: 0;
-  background: radial-gradient(circle 120px at 50% 50%, rgba(1, 203, 241, 0.06), transparent 70%);
+  background: radial-gradient(circle at 50% 50%, var(--partner-glow, rgba(1, 203, 241, 0.08)), transparent 70%);
   opacity: 0;
   transition: opacity 0.3s ease;
   pointer-events: none;
 }
 
-.partnerLogoWrapper {
+.partnerLogoContainer {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 64px;
-  height: 64px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  flex-shrink: 0;
-  transition: transform 0.3s ease;
+  width: 100%;
+  height: 70px;
+  margin-bottom: 20px;
+  transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1), filter 0.3s ease, opacity 0.3s ease;
+  filter: grayscale(100%) opacity(0.65);
 }
 
-.partnerCard:hover .partnerLogoWrapper {
-  transform: scale(1.08) rotate(2deg);
+.partnerCard:hover .partnerLogoContainer {
+  transform: scale(1.08);
+  filter: grayscale(0%) opacity(1);
 }
 
-.partnerInfo {
+.partnerTextContainer {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  text-align: left;
+  align-items: center;
+  text-align: center;
+  width: 100%;
 }
 
-.partnerName {
+.partnerCardName {
   font-family: var(--font-space), sans-serif;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 700;
   color: #fff;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
   transition: color 0.2s ease;
+  line-height: 1.2;
 }
 
-.partnerCard:hover .partnerName {
-  color: var(--cyan);
+.partnerCard:hover .partnerCardName {
+  color: var(--partner-border, var(--cyan));
 }
 
-.partnerRole {
-  font-size: 13px;
-  color: #9ba7ba;
-  line-height: 1.4;
+.partnerCardRole {
+  font-size: 12px;
+  color: #8c9ba5;
+  line-height: 1.35;
+  font-weight: 400;
+}
+
+@media (max-width: 1024px) {
+  .partnerCard {
+    flex: 0 1 calc(33.333% - 16px);
+    width: auto;
+    min-width: 220px;
+  }
 }
 
 @media (max-width: 768px) {
   .partnersSection {
-    padding: 60px 20px;
-  }
-  .partnersGrid {
-    grid-template-columns: 1fr;
-    gap: 16px;
+    margin-bottom: 60px;
+    padding-top: 48px;
+    padding-bottom: 48px;
   }
   .partnerCard {
-    padding: 20px;
+    flex: 0 1 calc(50% - 12px);
+    min-height: 170px;
+    padding: 24px 16px 20px;
+  }
+}
+
+@media (max-width: 480px) {
+  .partnerCard {
+    flex: 0 1 100%;
   }
 }
