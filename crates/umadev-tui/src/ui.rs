@@ -2248,7 +2248,7 @@ fn render_chat(frame: &mut Frame, app: &App) {
     render_title_row(frame, chunks[0], app);
     render_transcript(frame, chunks[1], app);
     if panel_h > 0 {
-        render_plan_panel(frame, chunks[2], &panel_lines);
+        render_plan_panel(frame, chunks[2], &panel_lines, app.lang);
     }
     render_prompt(frame, chunks[3], app);
     render_status_row(frame, chunks[4], app);
@@ -2450,22 +2450,34 @@ fn truncate_display(s: &str, max: usize) -> String {
 /// Render the live plan / team-review panel into `area`. A thin top rule
 /// separates it from the transcript above. Lines are clipped to the area height
 /// (the caller already capped it); an overflow shows a muted "…" tail row.
-fn render_plan_panel(frame: &mut Frame, area: Rect, lines: &[Line<'static>]) {
+fn render_plan_panel(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[Line<'static>],
+    lang: umadev_i18n::Lang,
+) {
     // The TOP border eats one row, so the content fits in `area.height - 1`.
     let inner_rows = (area.height as usize).saturating_sub(1);
     if inner_rows == 0 {
         return;
     }
     let shown: Vec<Line<'static>> = if lines.len() > inner_rows {
-        // Keep the head visible (title + first steps) and mark the clip so the
-        // user knows there's more behind /plan.
+        // Keep the head visible (title + first steps) and mark the clip with a
+        // HINT — the clipped rows (usually the tail of the team-review verdicts)
+        // are not lost: the full per-seat verdicts are in the transcript above,
+        // and `/plan` re-prints the checklist. Telling the user HOW is the whole
+        // point ("… +N" alone read as a dead end).
         let mut v: Vec<Line<'static>> = lines
             .iter()
             .take(inner_rows.saturating_sub(1))
             .cloned()
             .collect();
         v.push(Line::from(Span::styled(
-            format!("  … +{}", lines.len() - inner_rows + 1),
+            format!(
+                "  … +{} · {}",
+                lines.len() - inner_rows + 1,
+                umadev_i18n::t(lang, "plan.panel.more_hint")
+            ),
             Style::default().fg(theme::TEXT_MUTED()),
         )));
         v
@@ -5591,6 +5603,34 @@ mod tests {
         assert!(
             out.contains('…') || out.contains('+'),
             "panel capped: {out}"
+        );
+    }
+
+    #[test]
+    fn clipped_panel_tail_carries_a_how_to_see_more_hint() {
+        // Defect 1: a clipped panel's "… +N" tail must tell the user HOW to read
+        // the rest (the full verdicts are in the scrollable transcript / `/plan`),
+        // not dead-end at a bare count.
+        let mut app = app_with(Some("offline"));
+        let steps: Vec<String> = (0..20)
+            .map(|i| format!("s{i} · step number {i} (frontend)"))
+            .collect();
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            steps,
+            done: 0,
+            total: 20,
+        });
+        let out = render_chat_to_string(&app, 80, 12);
+        // The clip tail is the row carrying the ellipsis marker; it must also
+        // carry the `/plan` affordance (present in the hint in every locale). A
+        // line-scoped check stays robust to the locale AND to the renderer
+        // spacing out wide CJK glyphs (so an exact substring match is unreliable).
+        let tail_points_somewhere = out
+            .lines()
+            .any(|l| l.contains('\u{2026}') && l.contains("/plan"));
+        assert!(
+            tail_points_somewhere,
+            "the clip tail surfaces a how-to-see-more affordance: {out}"
         );
     }
 

@@ -1352,6 +1352,13 @@ pub struct App {
     /// `true` collapses the team-review panel to a one-line accept/block tally.
     /// Default expanded so the first review is visible.
     pub critics_collapsed: bool,
+    /// `true` while a review burst is OPEN — the seats of the *current* round are
+    /// still arriving (one [`EngineEvent::CriticVerdict`] per seat, contiguous).
+    /// A plan-step transition / phase start / fresh plan post **seals** it
+    /// (`false`), so the NEXT verdict that arrives is recognised as a new round
+    /// and clears the previous round's rows before appending — the panel shows
+    /// the CURRENT round, never a stale mix. Default `false` (no round open yet).
+    pub critic_round_open: bool,
 
     /// The last routed intent (Wave 1 deliverable 1) — the class id the router
     /// decided for the in-flight turn (`chat` / `build` / …). Drives the status
@@ -1486,6 +1493,7 @@ impl App {
             plan_collapsed: false,
             critic_verdicts: Vec::new(),
             critics_collapsed: false,
+            critic_round_open: false,
             last_intent_class: None,
         };
         app.load_history();
@@ -2099,6 +2107,9 @@ impl App {
         self.last_output_at = None;
         // No live phase → no heartbeat reassurance should remain.
         self.transient_status = None;
+        // A bailed round is terminal — drop the live plan / team-review panel so
+        // its last (now stale) state doesn't hang under the transcript.
+        self.clear_live_panels();
         self.push(ChatRole::System, body);
         self.refresh_status();
     }
@@ -2886,8 +2897,10 @@ impl App {
                 }
             })
             .collect();
-        // A fresh plan un-collapses the panel so the first plan is always seen.
+        // A fresh plan un-collapses the panel so the first plan is always seen,
+        // and seals any open review round (a re-plan starts a clean review cycle).
         self.plan_collapsed = false;
+        self.critic_round_open = false;
         if total > 0 {
             self.push(
                 ChatRole::UmaDev,
@@ -2901,6 +2914,12 @@ impl App {
     /// appended so the panel never silently loses a transition. Fail-open: an
     /// unrecognised status string renders as a neutral pending dot.
     fn apply_plan_step_status(&mut self, id: &str, title: &str, status: &str) {
+        // A step transition means the director is between review bursts (a build
+        // step is running, or a review step just (de)activated) — seal the open
+        // review round so the NEXT verdict clears the prior round's seats instead
+        // of mixing two rounds. A review burst itself emits no `PlanStepStatus`,
+        // so this never splits a round mid-flight.
+        self.critic_round_open = false;
         if let Some(row) = self.plan_steps.iter_mut().find(|s| s.id == id) {
             row.status = status.to_string();
             if !title.trim().is_empty() {
@@ -2920,9 +2939,20 @@ impl App {
     }
 
     /// Record one reviewing seat's verdict for the **collapsible team-review
-    /// panel** ([`EngineEvent::CriticVerdict`]). A repeated seat id replaces its
-    /// prior row (a re-review updates in place, never stacks). Replaces the old
-    /// bland team `Note`.
+    /// panel** ([`EngineEvent::CriticVerdict`]). A repeated seat id within the
+    /// SAME round replaces its prior row (a re-review updates in place, never
+    /// stacks).
+    ///
+    /// Two extra guarantees on top of the panel:
+    /// - **Fresh-round clearing.** When the prior round was sealed (a plan-step
+    ///   transition / phase start happened since the last verdict, so
+    ///   `critic_round_open == false`), the first verdict of the new round clears
+    ///   the previous round's rows first — the panel shows the CURRENT round, not
+    ///   a stale mix of two rounds' seats.
+    /// - **Transcript emission.** Every verdict is ALSO pushed as a `System` note
+    ///   carrying the seat + verdict + its full blocking findings, so the
+    ///   complete set is always in the scrollable history. The panel's compact
+    ///   "… +N" tail can clip rows; the transcript never loses content.
     fn apply_critic_verdict(
         &mut self,
         seat: String,
@@ -2930,6 +2960,16 @@ impl App {
         blocking: Vec<String>,
         advisory: Vec<String>,
     ) {
+        // A sealed round means this verdict opens a NEW review round — drop the
+        // previous round's rows before the new seats land so the panel can't show
+        // a half-old / half-new mix.
+        if !self.critic_round_open {
+            self.critic_verdicts.clear();
+            self.critic_round_open = true;
+        }
+        // Mirror the full verdict into the transcript (the never-lost source of
+        // truth) before the value is moved into the panel row.
+        self.push_critic_note(&seat, accepts, &blocking);
         let row = CriticRow {
             seat,
             accepts,
@@ -2941,6 +2981,29 @@ impl App {
         } else {
             self.critic_verdicts.push(row);
         }
+    }
+
+    /// Push one reviewing seat's verdict into the transcript as a `System` note —
+    /// the unbounded, scrollable record that guarantees a blocking critic's full
+    /// findings are never hidden behind the panel's "… +N" clip. An accept is one
+    /// line; a block lists every must-fix finding underneath. Localized.
+    fn push_critic_note(&mut self, seat: &str, accepts: bool, blocking: &[String]) {
+        let mut body = if accepts {
+            umadev_i18n::tf(self.lang, "plan.review.note.accept", &[seat])
+        } else {
+            umadev_i18n::tf(
+                self.lang,
+                "plan.review.note.block",
+                &[seat, &blocking.len().max(1).to_string()],
+            )
+        };
+        for b in blocking {
+            let item = b.trim();
+            if !item.is_empty() {
+                body.push_str(&format!("\n  - {item}"));
+            }
+        }
+        self.push(ChatRole::System, body);
     }
 
     // ---- engine events ----------------------------------------------------
@@ -3002,6 +3065,9 @@ impl App {
                 // Fresh phase → fresh stall clock; nothing has stalled yet.
                 self.last_output_at = Some(std::time::Instant::now());
                 self.tool_in_progress = false;
+                // A new phase is a clean boundary — seal any open review round so
+                // the next phase's verdicts don't pile onto the last phase's.
+                self.critic_round_open = false;
                 // A new phase replaces any prior phase's lingering heartbeat
                 // line so a stale "still working" timer never bleeds across.
                 self.transient_status = None;
@@ -3199,6 +3265,11 @@ impl App {
                         ChatRole::UmaDev,
                         umadev_i18n::tf(lang, "delivery.complete_banner", &[&zip_info]),
                     );
+                    // The run is settled — fold the last review round into a
+                    // one-line summary in the transcript (the per-seat verdicts are
+                    // already in scrollback) and drop the live plan / team-review
+                    // panel so a finished run stops rendering a stale live list.
+                    self.finalize_live_panels();
                 }
             }
             EngineEvent::BackendProbed {
@@ -4448,10 +4519,42 @@ impl App {
         self.pending_steer = None;
         // A new run owns a fresh plan + review panel — the previous run's
         // checklist / verdicts must not bleed into it.
+        self.clear_live_panels();
+    }
+
+    /// Drop the live plan checklist + team-review panel state back to empty, so
+    /// the panel region disappears (it only renders when a plan / review is
+    /// live). Called when a run is reset for a fresh start AND when a run reaches
+    /// a terminal state (finished / aborted) — a settled run must not keep a
+    /// stale "计划 N/M · 进行中" / half-finished verdict list hanging on screen.
+    /// Fail-open: pure state reset, never touches the transcript or panics.
+    fn clear_live_panels(&mut self) {
         self.plan_steps.clear();
         self.plan_collapsed = false;
         self.critic_verdicts.clear();
         self.critics_collapsed = false;
+        self.critic_round_open = false;
+    }
+
+    /// Settle the live panels at a CLEAN terminal (a finished delivery): if the
+    /// last round carried any verdicts, fold them into a one-line accept/blocking
+    /// tally in the transcript (the per-seat detail is already in scrollback),
+    /// then [`clear_live_panels`](Self::clear_live_panels) so the live region
+    /// stops rendering a stale list. Fail-open: no verdicts → no summary line.
+    fn finalize_live_panels(&mut self) {
+        if !self.critic_verdicts.is_empty() {
+            let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
+            let blocking = self.critic_verdicts.len() - accepts;
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(
+                    self.lang,
+                    "plan.review.note.summary",
+                    &[&accepts.to_string(), &blocking.to_string()],
+                ),
+            );
+        }
+        self.clear_live_panels();
     }
 
     /// Reset run state after `/cancel` aborts the in-flight pipeline task, and
@@ -6897,6 +7000,11 @@ impl App {
         let preview = self.auto_preview_target();
         let card = self.build_completion_card(preview.is_some());
         self.push(ChatRole::UmaDev, card);
+        // A chat/Fast director build is settling here (this path never reaches the
+        // Delivery `BlockCompleted` banner) — fold the last review round into the
+        // transcript and drop the live plan / team-review panel so it doesn't hang
+        // on screen below the completion card as stale state.
+        self.finalize_live_panels();
         preview
     }
 
@@ -9415,6 +9523,160 @@ mod tests {
         app.reset_for_new_run();
         assert!(app.plan_steps.is_empty(), "plan cleared for a fresh run");
         assert!(app.critic_verdicts.is_empty(), "review cleared too");
+    }
+
+    #[test]
+    fn critic_verdict_is_mirrored_into_the_transcript_with_full_findings() {
+        // Defect 1: the panel collapses extra verdicts to "… +N"; the FULL set
+        // (seat + every blocking finding) must always reach the scrollable
+        // transcript so nothing is lost behind the clip.
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "frontend-engineer".into(),
+            accepts: false,
+            blocking: vec![
+                "API contract drift: /login missing".into(),
+                "no error states on the form".into(),
+            ],
+            advisory: vec![],
+        });
+        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
+        assert!(joined.contains("[frontend-engineer]"), "seat in transcript");
+        assert!(
+            joined.contains("API contract drift: /login missing"),
+            "first must-fix in transcript: {joined}"
+        );
+        assert!(
+            joined.contains("no error states on the form"),
+            "second must-fix (beyond the panel's first-line inline) in transcript"
+        );
+    }
+
+    #[test]
+    fn a_new_review_round_replaces_the_previous_rounds_seats() {
+        // Defect 2a: round 1 blocks with three seats; a plan-step transition seals
+        // the round; round 2 has a single passing seat. The panel must show ONLY
+        // round 2's seat, not a stale mix of both rounds.
+        let mut app = fresh_app(Some("offline"));
+        for seat in ["frontend-engineer", "backend-engineer", "qa"] {
+            app.apply_engine(EngineEvent::CriticVerdict {
+                seat: seat.into(),
+                accepts: false,
+                blocking: vec!["fix it".into()],
+                advisory: vec![],
+            });
+        }
+        assert_eq!(app.critic_verdicts.len(), 3, "round 1 has three seats");
+        // Work resumes (the director drives the next step) → the round is sealed.
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "rework".into(),
+            status: "active".into(),
+        });
+        // Round 2: a single seat now passes.
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        assert_eq!(
+            app.critic_verdicts.len(),
+            1,
+            "the new round replaced the old one, not a stale mix"
+        );
+        assert_eq!(app.critic_verdicts[0].seat, "qa");
+        assert!(app.critic_verdicts[0].accepts, "shows the CURRENT round");
+    }
+
+    #[test]
+    fn contiguous_verdicts_in_one_round_do_not_clear_each_other() {
+        // The seal must NOT fire between two seats of the SAME round (no work
+        // event interleaves a review burst), so both seats accumulate.
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["no tests".into()],
+            advisory: vec![],
+        });
+        assert_eq!(app.critic_verdicts.len(), 2, "one round keeps both seats");
+    }
+
+    #[test]
+    fn delivery_finish_clears_the_live_plan_and_review_panels() {
+        // Defect 2b: a finished run must not leave a stale live plan / verdict
+        // list hanging below the transcript — the terminal transition clears them
+        // and folds the round into a one-line summary in the transcript.
+        let mut app = fresh_app(Some("offline"));
+        app.run_started = true;
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · ship it (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
+        app.apply_engine(EngineEvent::BlockCompleted {
+            final_phase: Phase::Delivery,
+            paused_at: None,
+        });
+        assert!(app.finished, "the run reached its terminal delivery state");
+        assert!(
+            app.plan_steps.is_empty(),
+            "the live plan panel is cleared on finish"
+        );
+        assert!(
+            app.critic_verdicts.is_empty(),
+            "the live team-review panel is cleared on finish"
+        );
+        // The verdict content isn't silently dropped — a settle summary lands.
+        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
+        assert!(
+            joined.contains(umadev_i18n::t(app.lang, "plan.review.title")),
+            "a team-review settle summary is folded into the transcript: {joined}"
+        );
+    }
+
+    #[test]
+    fn an_aborted_block_clears_the_live_plan_and_review_panels() {
+        // Defect 2b (abort branch): a bailed round is terminal too — its panels
+        // must not linger as stale state.
+        let mut app = fresh_app(Some("offline"));
+        app.run_started = true;
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · do a thing (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["broken".into()],
+            advisory: vec![],
+        });
+        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
+        app.apply_engine(EngineEvent::Note(format!(
+            "{}本轮已中止:磁盘写入失败",
+            crate::ABORT_SENTINEL
+        )));
+        assert!(app.aborted, "the sentinel flips the run into aborted");
+        assert!(app.plan_steps.is_empty(), "plan panel cleared on abort");
+        assert!(
+            app.critic_verdicts.is_empty(),
+            "team-review panel cleared on abort"
+        );
     }
 
     // --- Wave 1: honest picker auth state (gap G10) ---
