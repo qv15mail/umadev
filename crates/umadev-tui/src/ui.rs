@@ -6,7 +6,7 @@
 //! - **Chat** — persistent input box + scrolling conversation history,
 //!   modelled after Claude Code's REPL feel.
 
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -2221,10 +2221,10 @@ fn render_chat(frame: &mut Frame, app: &App) {
         .split(area)[1];
     // Prompt height tracks the wrapped input: 1 row when empty/short, growing
     // (capped) as the user types or it wraps — underline sits right under it.
-    // CLAMP it so the title(1) + at least one transcript row + status(1) always
-    // fit: `area.height - 3` is the most the prompt may take. Without this a
-    // tall multi-line input on a short terminal would shove the status row (and
-    // the bottom of the input) past the viewport edge.
+    // CLAMP it so the title(1) + at least one transcript row + the spacer(1)
+    // above the prompt always fit: `area.height - 3` is the most the prompt may
+    // take. Without this a tall multi-line input on a short terminal would shove
+    // the spacer (and the bottom of the input) past the viewport edge.
     let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app))
         .min(inner.height.saturating_sub(3))
         .max(2);
@@ -2245,7 +2245,7 @@ fn render_chat(frame: &mut Frame, app: &App) {
         let want = u16::try_from(panel_lines.len())
             .unwrap_or(0)
             .saturating_add(1);
-        let headroom = inner.height.saturating_sub(1 + 3 + prompt_h + 1); // title + min transcript + prompt + status
+        let headroom = inner.height.saturating_sub(1 + 3 + 1 + prompt_h); // title + min transcript + spacer + prompt
         want.min(headroom).min(PLAN_PANEL_MAX_ROWS)
     };
     let chunks = Layout::default()
@@ -2254,8 +2254,8 @@ fn render_chat(frame: &mut Frame, app: &App) {
             Constraint::Length(1),        // title row (borderless)
             Constraint::Min(1),           // transcript (grows; ≥1 guaranteed)
             Constraint::Length(panel_h),  // live plan / team-review panel (0 = hidden)
-            Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1)
-            Constraint::Length(1),        // status row
+            Constraint::Length(1),        // spacer — breathing room above the prompt
+            Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1, live status pinned bottom-right)
         ])
         .split(inner);
 
@@ -2264,14 +2264,18 @@ fn render_chat(frame: &mut Frame, app: &App) {
     if panel_h > 0 {
         render_plan_panel(frame, chunks[2], &panel_lines, app.lang);
     }
-    render_prompt(frame, chunks[3], app);
-    render_status_row(frame, chunks[4], app);
+    // chunks[3] is an intentional blank spacer row — it separates the transcript
+    // / live plan panel from the input box so the prompt no longer sits jammed
+    // against the content above it. The live status that used to burn its own
+    // footer row now rides the bottom-right of the prompt's meta row instead, so
+    // this gap costs no net vertical space.
+    render_prompt(frame, chunks[4], app);
 
     // Slash-command palette popover floats above the prompt when the user is
     // typing a `/`-prefixed command with at least one match.
     let palette = app.palette_matches();
     if !palette.is_empty() {
-        render_palette_popover(frame, chunks[3], app, &palette);
+        render_palette_popover(frame, chunks[4], app, &palette);
     }
 }
 
@@ -4412,6 +4416,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Live state (ready / running heartbeat / aborted / complete) — pinned to the
+    // bottom-RIGHT of the meta row below instead of burning its own footer line.
+    // `None` mid-turn (the activity indicator above the input already proves
+    // motion). Reused by both the gate-branch meta row and the normal one.
+    let status = status_text_and_color(app);
     // Context line beneath the input box: model / backend / hints.
     let backend = app.backend.as_deref().unwrap_or("offline");
     let hint: String = if app.input.starts_with('/') {
@@ -4433,6 +4442,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
                 ("· ".into(), theme::BORDER()),
                 (backend.into(), theme::TEXT_MUTED()),
             ],
+            status,
         );
     } else if app.input.contains('\n') {
         umadev_i18n::t(app.lang, "tui.hint.multiline").into()
@@ -4483,15 +4493,53 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     }
     parts.push(("·".into(), theme::BORDER()));
     parts.push((hint, theme::TEXT_MUTED()));
-    meta_row(frame, prompt_chunks[1], border_color, &parts);
+    meta_row(frame, prompt_chunks[1], border_color, &parts, status);
 }
 
-/// Helper to render the meta row as a sequence of styled spans, left-aligned.
-fn meta_row(frame: &mut Frame, area: Rect, _bar: Color, parts: &[(String, Color)]) {
+/// Render the meta row: `parts` left-aligned, with the optional live `status`
+/// pinned to the bottom-RIGHT of the SAME row (reclaiming the footer line the
+/// old standalone status row used to burn just to print one word). The left
+/// meta's own trailing space provides the gap; the status is clipped by display
+/// width (CJK-safe) to whatever room is left, and on a terminal too narrow to
+/// fit even a sliver of it the status is dropped entirely (fail-open) so the
+/// meta info always wins — it never wraps or overruns the row.
+fn meta_row(
+    frame: &mut Frame,
+    area: Rect,
+    _bar: Color,
+    parts: &[(String, Color)],
+    status: Option<(String, Color)>,
+) {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (text, color) in parts {
         spans.push(Span::styled(text.clone(), Style::default().fg(*color)));
         spans.push(Span::raw(" "));
+    }
+    let left_width: usize = spans.iter().map(|s| disp_width(s.content.as_ref())).sum();
+    let total = usize::from(area.width);
+    if let Some((text, color)) = status {
+        // Room left after the meta (whose last span is already a space → the gap).
+        // Need at least 2 cols to be worth showing; otherwise the meta info wins.
+        let room = total.saturating_sub(left_width);
+        if room >= 2 {
+            let shown = if disp_width(&text) > room {
+                truncate_to_width(&text, room)
+            } else {
+                text
+            };
+            let status_w = u16::try_from(disp_width(&shown)).unwrap_or(0);
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(status_w)])
+                .split(area);
+            frame.render_widget(Paragraph::new(Line::from(spans)), split[0]);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(shown, Style::default().fg(color))))
+                    .alignment(Alignment::Right),
+                split[1],
+            );
+            return;
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -4596,21 +4644,24 @@ fn render_palette_popover(
     frame.render_widget(List::new(items).block(block), area);
 }
 
-/// Bottom status row — directory on the left, phase/status on the right,
-/// both muted, separated by flexible whitespace. No box.
-fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
-    let phase_info = if app.thinking {
-        // The bottom-right shows what the BASE is doing right now — the live tool it
-        // is running (read / edit / a command), else a compact elapsed timer — so it
-        // COMPLEMENTS the "正在思考" indicator above the input instead of repeating
-        // it. Animated so a sent message never looks frozen while the base replies.
-        // The live activity (thinking / reading / editing / running …) is now ON
-        // the indicator above the input, so the bottom status row stays EMPTY during
-        // a normal turn — no duplicate, no lingering tool name. Run states below
-        // (aborted / gate / finished) still render here.
-        String::new()
-    } else if app.aborted {
-        // Dedicated terminal branch — an aborted round reads as `[aborted]` here
+/// The live state shown at the bottom-RIGHT of the prompt's meta row — `就绪`
+/// (ready), the running heartbeat (`<phase> · still working (mm:ss) · ESC`),
+/// `[aborted]`, or `[ok] complete` — with the colour it should carry. A stall
+/// paints it red (honest "about to hang"); otherwise the normal info colour.
+/// Returns `None` mid-turn (`thinking`), where the live activity indicator above
+/// the input already proves motion, so the meta row stays uncluttered.
+///
+/// Relocated here from the old standalone status ROW, which burned a whole footer
+/// line just to print one word; `meta_row` now right-aligns this onto the same
+/// line as the backend / trust-mode / hint chrome.
+fn status_text_and_color(app: &App) -> Option<(String, Color)> {
+    if app.thinking {
+        // The activity indicator above the input speaks for the live turn; the
+        // bottom-right stays empty so there's no duplicate / lingering tool name.
+        return None;
+    }
+    let text = if app.aborted {
+        // Dedicated terminal branch — an aborted round reads as `[aborted]`
         // DIRECTLY, instead of leaning on `app.status` carrying the right text.
         // That coupling was fragile: a future `refresh_status` change could
         // silently make a wedged run show stale phase progress. Checked before
@@ -4618,10 +4669,10 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         format!("[aborted] {}", umadev_i18n::t(app.lang, "status.aborted"))
     } else if app.run_started {
         // While a slow phase's heartbeat is live, show its in-place "still
-        // working (mm:ss)" reassurance HERE (overwritten each beat) instead of
-        // letting it pile up in the transcript. The spinner + phase timer in
-        // `app.status` still prove motion; this just makes the wait explicit and
-        // reminds the user the long phase is interruptible (ESC).
+        // working (mm:ss)" reassurance (overwritten each beat) instead of letting
+        // it pile up in the transcript. The spinner + phase timer in `app.status`
+        // still prove motion; this just makes the wait explicit and reminds the
+        // user the long phase is interruptible (ESC).
         let esc_hint = if app.interrupt_armed() {
             umadev_i18n::t(app.lang, "status.esc_confirm")
         } else {
@@ -4637,27 +4688,13 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         umadev_i18n::t(app.lang, "status.ready").to_string()
     };
-    // The bottom row is the LIVE state line ONLY — what's happening right now.
-    // The project + base now live in the top title bar, so we no longer repeat
-    // "{dir} · {backend} · /help" here (that duplicate chrome was the complaint).
-    // Clip to the row width (CJK-safe) so a long activity never wraps/overruns.
-    let avail = usize::from(area.width).saturating_sub(1);
-    let phase_info = if disp_width(&phase_info) > avail {
-        truncate_to_width(&phase_info, avail)
-    } else {
-        phase_info
-    };
-    // Stall → red (honest "about to hang"); otherwise the normal info color.
-    let info_color = if app.is_stalled() {
+    // Stall → red (honest "about to hang"); otherwise the normal info colour.
+    let color = if app.is_stalled() {
         theme::ERROR()
     } else {
         theme::INFO()
     };
-    let line = Line::from(vec![Span::styled(
-        format!(" {phase_info}"),
-        Style::default().fg(info_color),
-    )]);
-    frame.render_widget(Paragraph::new(line), area);
+    Some((text, color))
 }
 
 // ---------- Help overlay (both modes) -------------------------------------
@@ -6030,31 +6067,34 @@ mod tests {
     }
 
     #[test]
-    fn prompt_height_is_clamped_so_status_row_stays_on_screen() {
+    fn prompt_height_is_clamped_so_meta_row_stays_on_screen() {
         // A tall multi-line input on a short terminal must not push the prompt
-        // past `area.height - 3`; the status row (and the input bottom) stay on
-        // screen. We assert the clamp arithmetic directly.
+        // past `area.height - 3`; the spacer above the prompt (and the input
+        // bottom + its meta row) stay on screen. We assert the clamp arithmetic
+        // directly (now reserving title + ≥1 transcript row + the spacer).
         let inner_h: u16 = 12; // a short content column
                                // A would-be very tall prompt (e.g. INPUT_MAX_ROWS + 2).
         let raw = INPUT_MAX_ROWS + 2;
         let clamped = raw.min(inner_h.saturating_sub(3)).max(2);
         assert!(
             clamped <= inner_h.saturating_sub(3),
-            "prompt must leave room for title + ≥1 transcript row + status"
+            "prompt must leave room for title + ≥1 transcript row + spacer"
         );
         assert!(clamped >= 2, "prompt keeps at least input + meta rows");
         // And it renders without panicking even with a multi-line input on a
-        // short terminal (regression guard for the clip-out-of-view bug).
+        // short terminal (regression guard for the clip-out-of-view bug). The live
+        // status now rides the bottom-right of the meta row, so a comfortably wide
+        // terminal shows it; assert the leading glyph of the localized "ready" word
+        // is on screen (wide CJK glyphs carry a skip-cell, so match the first one).
         let mut app = app_with(Some("offline"));
         app.insert_str_at_cursor("a\nb\nc\nd\ne\nf\ng\nh");
-        let out = render_chat_at(&app, 50, 12);
-        // The bottom status row (now the live state line) is still drawn on screen.
-        // Match the status text's FIRST glyph: the flattened buffer separates wide
-        // CJK glyphs with their skip-cell space, so the full multi-char word won't
-        // appear contiguous, but its leading glyph reliably does.
+        let out = render_chat_at(&app, 120, 12);
         let ready = umadev_i18n::t(app.lang, "status.ready").to_string();
         let marker = ready.chars().next().unwrap().to_string();
-        assert!(out.contains(&marker), "status row clipped: {out}");
+        assert!(
+            out.contains(&marker),
+            "live status clipped off the meta row: {out}"
+        );
     }
 
     #[test]
@@ -6122,17 +6162,27 @@ mod tests {
         );
     }
 
-    // --- P2-A: status-row display-width alignment (CJK) ---
+    // --- P2-A: live-status display-width alignment (CJK) ---
 
-    /// Render JUST the status row at `width` cols and return its single row as a
-    /// per-cell `Vec<String>` (one entry per terminal column). A wide CJK glyph
-    /// occupies one cell + a following skip cell, so column indices are exact —
-    /// the honest way to assert alignment without re-measuring a flattened string.
+    /// Render the meta row's STATUS portion (empty left meta) at `width` cols and
+    /// return its single row as a per-cell `Vec<String>` (one entry per terminal
+    /// column). The live state is now pinned to the bottom-RIGHT of the meta row
+    /// instead of a standalone status line; an empty left meta hands the whole row
+    /// to the right-aligned status so its placement is isolated. A wide CJK glyph
+    /// occupies one cell + a following skip cell, so column indices are exact.
     fn render_status_cells(app: &App, width: u16) -> Vec<String> {
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render_status_row(f, f.area(), app))
+            .draw(|f| {
+                meta_row(
+                    f,
+                    f.area(),
+                    theme::BORDER(),
+                    &[],
+                    status_text_and_color(app),
+                );
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         buffer
@@ -6166,22 +6216,25 @@ mod tests {
     }
 
     #[test]
-    fn status_row_renders_cjk_status_left_aligned_without_overflow() {
-        // The bottom row is now the live state line ONLY (the dir·base·/help chrome
-        // moved to the top title bar). A Chinese status (`就绪`, 4 display cols / 6
-        // bytes) must render LEFT-aligned and never overrun the row width.
+    fn status_renders_cjk_right_aligned_without_overflow() {
+        // The live state now rides the bottom-RIGHT of the meta row (no more
+        // standalone status line). A Chinese status (`就绪`, 4 display cols / 6
+        // bytes) must render flush-RIGHT and never overrun the row width.
         let mut app = app_with(Some("offline"));
         app.lang = umadev_i18n::Lang::ZhCn;
         let width = 80u16;
         let cells = render_status_cells(&app, width);
         // No overflow: render_status_cells yields exactly `width` cells by build.
         assert_eq!(cells.len(), width as usize);
-        // Idle → the localized "ready" status renders near the LEFT (a leading
-        // space, then the text), not pushed to the right by chrome that's now gone.
+        // Idle → the localized "ready" status renders flush-RIGHT (an empty left
+        // meta hands the whole row to the right-aligned status), past the midpoint.
         let ready = umadev_i18n::t(app.lang, "status.ready").to_string();
         let first = ready.chars().next().unwrap().to_string();
         let col = col_of(&cells, &first).expect("CJK status glyph renders");
-        assert!(col < 4, "status should be left-aligned now (col {col})");
+        assert!(
+            col > width as usize / 2,
+            "status should be right-aligned now (col {col})"
+        );
     }
 
     #[test]
@@ -6204,22 +6257,65 @@ mod tests {
     }
 
     #[test]
-    fn status_row_clips_overlong_cjk_on_a_narrow_terminal() {
-        // On a very narrow terminal the phase string is wider than the space left
-        // after the chrome — it must be clipped (by display width) so it never
-        // wraps or overruns. The render itself is the proof: a TestBackend of
-        // width W always yields exactly W cells; the assertion verifies the
-        // chrome + clipped phase still fit (no panic, phase head still visible).
+    fn status_clips_overlong_cjk_on_a_narrow_terminal() {
+        // On a narrow row the status (`[aborted] 本轮已中止`, 20 display cols) is
+        // wider than the room left — it must be clipped (by display width, keeping
+        // the HEAD) so it never wraps or overruns. A TestBackend of width W always
+        // yields exactly W cells; the assertion verifies the clipped head still
+        // fits with no panic.
         let mut app = app_with(Some("offline"));
         app.lang = umadev_i18n::Lang::ZhCn;
         app.aborted = true; // → "[aborted] 本轮已中止"
-        let width = 30u16;
+        let width = 16u16; // narrower than the 20-col status → forces truncation
         let cells = render_status_cells(&app, width);
         assert_eq!(cells.len(), width as usize, "row is exactly the width");
-        // The `[aborted]` tag (left of the phase text) still renders even clipped.
+        // The `[aborted]` tag (the HEAD of the status) still renders even clipped.
         assert!(
             col_of(&cells, "a").is_some(),
             "aborted status head should still render at a narrow width"
+        );
+    }
+
+    #[test]
+    fn meta_row_pins_status_right_and_drops_it_when_too_narrow() {
+        // The live status is pinned to the bottom-RIGHT of the meta row: flush
+        // against the right edge after the left meta when there's room, and
+        // DROPPED (fail-open) when the row is too narrow to fit both — so the meta
+        // info always wins and nothing ever wraps or overruns.
+        let render = |parts: &[(String, Color)], status: Option<(String, Color)>, w: u16| {
+            let backend = TestBackend::new(w, 1);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| meta_row(f, f.area(), theme::BORDER(), parts, status))
+                .unwrap();
+            let buf = term.backend().buffer().clone();
+            buf.content()
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+        let parts = vec![("UmaDev".to_string(), theme::ACCENT())];
+        // Roomy: the status sits flush-RIGHT (last cell at the row edge) while the
+        // left meta still shows.
+        let cells = render(&parts, Some(("READY".to_string(), theme::INFO())), 40);
+        assert_eq!(cells.len(), 40);
+        assert!(
+            cells[39].contains('Y'),
+            "status flush-right at the row edge: {:?}",
+            &cells[34..40]
+        );
+        assert!(col_of(&cells, "U").is_some(), "left meta still shown");
+        // Too narrow for both (` UmaDev ` already fills 8 cols) → status dropped,
+        // meta survives, exactly `w` cells, no overflow.
+        let narrow = render(&parts, Some(("READY".to_string(), theme::INFO())), 8);
+        assert_eq!(narrow.len(), 8);
+        assert!(
+            col_of(&narrow, "U").is_some(),
+            "meta info wins on a narrow row"
+        );
+        assert!(
+            !narrow.join("").contains("READY"),
+            "status dropped when it can't fit: {:?}",
+            narrow.join("")
         );
     }
 
