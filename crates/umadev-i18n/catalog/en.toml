@@ -413,6 +413,18 @@
 "base.empty_reply" = "[warn] Base `{}` returned no content."
 "route.failed" = "[warn] Routing failed (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
 
+# Base-failure classifier — actionable diagnosis (classify -> actionable_message)
+"base.fail.auth.claude" = "Base not logged in — run `claude /login` (or check your third-party API key), then /continue"
+"base.fail.auth.codex" = "codex not logged in / auth failed — check codex login or API key, then /continue"
+"base.fail.auth.opencode" = "opencode not logged in / auth failed — check opencode login or API key, then /continue"
+"base.fail.auth.generic" = "Base not logged in / auth failed — check the base login or API key, then /continue"
+"base.fail.ratelimit" = "Base hit a rate limit — retry shortly, or switch model with /model"
+"base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or switch model/base with /model"
+"base.fail.network" = "Cannot reach the base model endpoint — check your network or proxy settings"
+"base.fail.network.ssl" = "SSL / certificate verification failed — check your proxy or corporate cert (NODE_EXTRA_CA_CERTS)"
+"base.fail.context" = "Context exceeded the base limit — /compact to shrink, or switch to a larger-context model"
+"base.fail.exited" = "Base process exited (code {})"
+
 # Preview dev server / deploy (background tasks, use the process-wide language)
 "preview.dev_starting" = "[wait] dev server starting, waiting for the port to be ready…"
 "preview.dev_ready" = "[ok] dev server ready, browser opened: {}\n  /stop-preview to stop"

@@ -36,6 +36,7 @@
 
 pub mod acceptance;
 pub mod adopt;
+pub mod base_error;
 pub mod checkpoint;
 pub mod coach;
 pub mod config;

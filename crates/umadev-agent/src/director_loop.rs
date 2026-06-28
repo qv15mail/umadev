@@ -265,15 +265,32 @@ pub(crate) fn idle_reason(idle: Duration) -> String {
 /// a bare "base went idle — …" and no cause — the original symptom on the path that
 /// matters most for a hung build.
 ///
-/// Fail-open + bounded, mirroring the chat path: a non-success exit appends
-/// `(base 进程已退出: <status>)`; a present stderr tail appends ` — base stderr: …`
-/// using its last 3 non-empty lines, ≤280 chars. A `None` exit / tail → today's
-/// bare `base_reason` unchanged. Never panics, never blocks.
+/// Fail-open + bounded, mirroring the chat path: it first [`classify`]es the
+/// base's own captured evidence (exit + stderr tail) and
+/// PREPENDS the per-base [`actionable_message`] (D1: turn "base session idle" into
+/// "底座未登录 — 运行 claude /login …"); then a non-success exit appends
+/// `(base 进程已退出: <status>)` and a present stderr tail appends
+/// ` — base stderr: …` using its last 3 non-empty lines, ≤280 chars, so power
+/// users still see the verbatim base error as the technical detail. A failure
+/// that classifies as [`BaseFailure::Unknown`] prepends nothing → today's bare
+/// `base_reason` behaviour. Never panics, never blocks.
+///
+/// [`classify`]: crate::base_error::classify
+/// [`actionable_message`]: crate::base_error::actionable_message
+/// [`BaseFailure::Unknown`]: crate::base_error::BaseFailure::Unknown
 pub(crate) fn enrich_idle_reason(
     base_reason: &str,
     exit: Option<std::process::ExitStatus>,
     stderr_tail: Option<String>,
+    backend: &str,
 ) -> String {
+    // Classify FIRST on the captured evidence — the BASE's own exit + stderr (the
+    // `base_reason` is UmaDev's OWN synthetic label, NOT base output, so it is
+    // never fed to the classifier). Pass the exit string only when it is a real
+    // non-success exit.
+    let exit_str = exit.filter(|s| !s.success()).map(|s| s.to_string());
+    let failure = crate::base_error::classify(exit_str.as_deref(), stderr_tail.as_deref(), None);
+
     let mut msg = match exit {
         Some(s) if !s.success() => format!("{base_reason}(base 进程已退出: {s})"),
         _ => base_reason.to_string(),
@@ -290,7 +307,14 @@ pub(crate) fn enrich_idle_reason(
             msg = format!("{msg} — base stderr: {snippet}");
         }
     }
-    msg
+
+    // PREPEND the actionable diagnosis (empty for Unknown → unchanged behaviour).
+    let prefix = crate::base_error::actionable_message(&failure, backend);
+    if prefix.is_empty() {
+        msg
+    } else {
+        format!("{prefix} — {msg}")
+    }
 }
 
 /// How the director loop settled. Mirrors the caller's existing director outcome but
@@ -1973,6 +1997,7 @@ async fn drive_one_turn(
                     "base session ended mid-turn",
                     exit,
                     stderr_tail,
+                    &options.backend,
                 ));
             }
             IdleEvent::IdleTimedOut { exit, stderr_tail } => {
@@ -1984,7 +2009,12 @@ async fn drive_one_turn(
                 record_turn_usage(options, events, None, est_tokens);
                 // Fold in the base's stderr tail / exit so a hung build no longer
                 // settles with a cause-less "base went idle — …".
-                return Err(enrich_idle_reason(&idle_reason(idle), exit, stderr_tail));
+                return Err(enrich_idle_reason(
+                    &idle_reason(idle),
+                    exit,
+                    stderr_tail,
+                    &options.backend,
+                ));
             }
         };
         match ev {
@@ -3084,15 +3114,18 @@ mod tests {
 
     #[test]
     fn enrich_idle_reason_is_fail_open_and_bounded() {
-        // No exit, no tail → today's bare reason, unchanged (fail-open).
+        // No exit, no tail, an opaque idle reason → no family matches → today's
+        // bare reason, unchanged (fail-open: Unknown prepends nothing).
         let base = idle_reason(Duration::from_secs(7));
-        assert_eq!(enrich_idle_reason(&base, None, None), base);
+        assert_eq!(enrich_idle_reason(&base, None, None, "claude-code"), base);
         // A present tail is folded in, last 3 non-empty lines, joined (a 4th-from-end
-        // line and blank lines are dropped).
+        // line and blank lines are dropped). The tail is still appended verbatim
+        // even when the classifier also fires.
         let enriched = enrich_idle_reason(
             "base session ended mid-turn",
             None,
             Some("DROPPED\n\nmodel not found\nlogin required\nfinal line\n".to_string()),
+            "claude-code",
         );
         assert!(enriched.contains("base stderr: model not found | login required | final line"));
         assert!(
@@ -3101,9 +3134,34 @@ mod tests {
         );
         // A long tail is bounded to ≤280 chars of snippet (never unbounded).
         let long = "x".repeat(1_000);
-        let enriched = enrich_idle_reason("r", None, Some(long));
+        let enriched = enrich_idle_reason("r", None, Some(long), "claude-code");
         let tail = enriched.split("base stderr: ").nth(1).unwrap();
         assert!(tail.chars().count() <= 280, "stderr tail is bounded");
+    }
+
+    #[test]
+    fn enrich_idle_reason_prepends_actionable_line_for_a_known_stderr() {
+        // D1: a known stderr (here an auth error) now classifies and PREPENDS the
+        // per-base actionable diagnosis, while still appending the raw stderr tail
+        // as the technical detail — so a hung claude with a bad key reads e.g.
+        // "底座未登录 — 运行 claude /login … — base stderr: error: invalid x-api-key"
+        // instead of a blind "base session idle".
+        let enriched = enrich_idle_reason(
+            "base session idle",
+            None,
+            Some("error: invalid x-api-key".to_string()),
+            "claude-code",
+        );
+        // The actionable line is prepended (auth → claude-code key)…
+        assert!(
+            enriched.starts_with(&crate::base_error::actionable_message(
+                &crate::base_error::BaseFailure::Auth,
+                "claude-code"
+            )),
+            "actionable line is prepended: {enriched}"
+        );
+        // …and the raw stderr tail is still appended for power users.
+        assert!(enriched.contains("base stderr: error: invalid x-api-key"));
     }
 
     #[test]

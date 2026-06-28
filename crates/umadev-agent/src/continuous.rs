@@ -488,6 +488,7 @@ async fn drive_phase(
                     "session ended mid-turn",
                     exit,
                     stderr_tail,
+                    &options.backend,
                 ));
             }
             crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
@@ -499,6 +500,7 @@ async fn drive_phase(
                     &crate::director_loop::idle_reason(idle),
                     exit,
                     stderr_tail,
+                    &options.backend,
                 ));
             }
         };
@@ -1775,6 +1777,7 @@ async fn drive_rework_turn_with_idle(
                     "team · rework turn ended — base session ended mid-turn",
                     exit,
                     stderr_tail,
+                    &options.backend,
                 )));
                 return ReworkTurn {
                     done: false,
@@ -1787,6 +1790,7 @@ async fn drive_rework_turn_with_idle(
                     &crate::director_loop::idle_reason(idle),
                     exit,
                     stderr_tail,
+                    &options.backend,
                 )));
                 return ReworkTurn {
                     done: false,

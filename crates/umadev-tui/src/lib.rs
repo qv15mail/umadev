@@ -2462,16 +2462,32 @@ async fn next_chat_event_idle(
 /// never killed while it is still streaming, but a true silent hang settles.
 const CHAT_SESSION_IDLE: Duration = Duration::from_secs(300);
 
-/// Enrich a base-failure reason with the base's OWN stderr tail + exit status, so
-/// "base session idle" / "ended mid-turn" tells the user WHY. A broken base
+/// Enrich a base-failure reason with a classified, per-base, actionable diagnosis
+/// PLUS the base's OWN stderr tail + exit status, so "base session idle" /
+/// "ended mid-turn" tells the user WHAT failed and HOW to fix it. A broken base
 /// model/login config writes its error to stderr (previously discarded) and never
-/// to stdout, so the bare reason gave no diagnosis. Fail-open: a missing tail / exit
-/// → the bare reason. The tail is bounded (last 3 non-empty lines, ≤280 chars).
+/// to stdout, so the bare reason gave no diagnosis. D1: this calls the shared
+/// classifier FIRST (on the base's own exit + stderr tail), PREPENDS the
+/// per-base [`actionable_message`], and KEEPS the raw stderr tail appended as the
+/// technical detail. Fail-open: a failure that classifies as `Unknown` prepends
+/// nothing (today's behaviour); a missing tail / exit → the bare reason. The tail
+/// is bounded (last 3 non-empty lines, ≤280 chars).
+///
+/// [`actionable_message`]: umadev_agent::base_error::actionable_message
 fn enrich_base_failure(
     base_msg: &str,
     exit: Option<std::process::ExitStatus>,
     stderr_tail: Option<String>,
+    backend: &str,
 ) -> String {
+    // Classify FIRST on the captured evidence — the BASE's own exit + stderr
+    // (mirrors the /run path's `enrich_idle_reason`). The `base_msg` is UmaDev's
+    // OWN synthetic label, NOT base output, so it is never fed to the classifier.
+    // The exit string is passed only for a real non-success exit.
+    let exit_str = exit.filter(|s| !s.success()).map(|s| s.to_string());
+    let failure =
+        umadev_agent::base_error::classify(exit_str.as_deref(), stderr_tail.as_deref(), None);
+
     let mut msg = match exit {
         Some(s) if !s.success() => format!("{base_msg}(base 进程已退出: {s})"),
         _ => base_msg.to_string(),
@@ -2488,7 +2504,14 @@ fn enrich_base_failure(
             msg = format!("{msg} — base stderr: {snippet}");
         }
     }
-    msg
+
+    // PREPEND the actionable diagnosis (empty for Unknown → unchanged behaviour).
+    let prefix = umadev_agent::base_error::actionable_message(&failure, backend);
+    if prefix.is_empty() {
+        msg
+    } else {
+        format!("{prefix} — {msg}")
+    }
 }
 
 /// A WARM resident chat session: the live base process paired with the firmware it
@@ -2732,7 +2755,8 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 let tail = session.stderr_tail();
                 let exit = session.try_exit_status();
                 let _ = session.end().await;
-                let reason = enrich_base_failure("base session ended mid-turn", exit, tail);
+                let reason =
+                    enrich_base_failure("base session ended mid-turn", exit, tail, &backend);
                 let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
                     &[&backend, &reason],
@@ -2752,6 +2776,7 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     "base session idle(底座 300s 无输出 — 检查它的登录/模型配置)",
                     exit,
                     tail,
+                    &backend,
                 );
                 let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
@@ -4769,6 +4794,33 @@ mod tests {
             role: role.into(),
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn enrich_base_failure_prepends_actionable_line_and_keeps_tail() {
+        // D1 (chat path): a known auth stderr now classifies and PREPENDS the
+        // per-base actionable diagnosis, while still appending the raw stderr
+        // tail — so an idle base with a bad key is no longer a blind reason.
+        let reason = enrich_base_failure(
+            "base session idle",
+            None,
+            Some("error: invalid x-api-key".to_string()),
+            "claude-code",
+        );
+        assert!(
+            reason.starts_with(&umadev_agent::base_error::actionable_message(
+                &umadev_agent::base_error::BaseFailure::Auth,
+                "claude-code"
+            )),
+            "actionable line is prepended: {reason}"
+        );
+        assert!(reason.contains("base stderr: error: invalid x-api-key"));
+        // Fail-open: an opaque reason with no recognisable family prepends
+        // nothing → today's bare reason, unchanged.
+        assert_eq!(
+            enrich_base_failure("base session idle", None, None, "claude-code"),
+            "base session idle"
+        );
     }
 
     /// A bare key event (no modifiers) — the shape a leaked mouse-report byte
