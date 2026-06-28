@@ -1615,7 +1615,8 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
 # Docs: https://github.com/umacloud/umadev/blob/main/crates/umadev-agent/src/config.rs\n\
 \n[quality]\nthreshold = 90           # minimum weighted score to pass the quality gate\nskip_checks = []         # e.g. [\"Dark mode support\"]\n\
 \n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\nauto_approve_gates = true # autonomous mode: auto-approve all gates (like /goal)\n\
-\n[knowledge]\nenabled = true           # enable BM25 / hybrid expert-knowledge retrieval\nengine = \"bm25\"          # bm25 (offline) or hybrid (needs OPENAI_API_KEY)\ntop_k = 6                # knowledge chunks injected per phase\n";
+\n[knowledge]\nenabled = true           # enable BM25 / hybrid expert-knowledge retrieval\nengine = \"bm25\"          # bm25 (offline) or hybrid (needs OPENAI_API_KEY)\ntop_k = 6                # knowledge chunks injected per phase\n\
+\n[codex]\n# Codex launch sandbox: read-only | workspace-write (default, safe) | danger-full-access.\n# The default blocks local dev servers (npm start for React/Electron) and git commits;\n# set danger-full-access to allow them (high-risk -- you accept the system-environment risk).\nsandbox_mode = \"workspace-write\"\n";
         let _ = std::fs::write(&umadevrc, template);
         println!("  config:  {}", umadevrc.display());
     }
@@ -5239,6 +5240,7 @@ mod tests {
             last_transition_at: "2026-01-01T00:00:00Z".to_string(),
             note: "Advanced to docs".to_string(),
             backend: String::new(),
+            base_session_id: None,
             spec_version: "UMADEV_HOST_SPEC_V1".to_string(),
         };
         let gate = resolve_active_gate(&state).expect("should recover");

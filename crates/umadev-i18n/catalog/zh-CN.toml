@@ -185,6 +185,9 @@
 "session.unfinished" = "[session] 检测到未完成的会话(phase={}, 需求:\"{}\")。\n  输入 /continue 推进上次 · 输入新需求会重新开始 · /status 查看详情"
 "session.resume_goal" = "[目标] 上次有个目标没做完:下一步「{}」(已完成 {}/{} 步)。/run 续上 · 或直接说要不要继续。"
 
+# Codex 高危沙箱责任警告(仅在 codex 且 danger-full-access 时显示)
+"codex.sandbox.danger_warning" = "警告:Codex 高危沙箱模式(danger-full-access)已开启 —— 请自行承担系统环境风险。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
+
 # Shared config write error
 "config.write_failed" = "(无法写入 {}: {})"
 "config.save_failed_note" = "[warn] 设置已对本会话生效,但未能持久化保存(下次启动会回退):{}"

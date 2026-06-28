@@ -92,6 +92,50 @@ fn codex_app_server_subcmd() -> String {
     std::env::var("UMADEV_CODEX_APP_SERVER_SUBCMD").unwrap_or_else(|_| "app-server".to_string())
 }
 
+/// Resolve the Codex launch sandbox for the WRITABLE session paths
+/// (`thread/start` + the writable `thread/resume`). Mirrors the env-driven
+/// [`crate::claude_session`] `UMADEV_CLAUDE_PERMISSION_MODE` precedent: the TUI
+/// publishes the project's `.umadevrc` `[codex] sandbox_mode` into
+/// `UMADEV_CODEX_SANDBOX` at startup, and advanced users / CI can set it
+/// directly. Fail-open: unset / unknown → the safe `workspace-write` baseline,
+/// so default behaviour is UNCHANGED and a typo can never widen the sandbox.
+///
+/// (The read-only critic fork — [`thread_resume_params`] — is NEVER driven by
+/// this: its `read-only` sandbox is the single-writer invariant, not a knob.)
+fn codex_sandbox_mode() -> &'static str {
+    resolve_codex_sandbox(std::env::var("UMADEV_CODEX_SANDBOX").ok().as_deref())
+}
+
+/// Pure, unit-testable core of [`codex_sandbox_mode`]: map a raw env string to
+/// codex's canonical kebab `sandbox` id, leniently (case / `_`↔`-`) and
+/// fail-open (unset / garbage → `workspace-write`).
+fn resolve_codex_sandbox(raw: Option<&str>) -> &'static str {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase().replace('_', "-"))
+        .as_deref()
+    {
+        Some("read-only" | "readonly") => "read-only",
+        Some("danger-full-access" | "danger-full" | "full-access") => "danger-full-access",
+        // unset / "workspace-write" / anything unrecognised → the safe default.
+        _ => "workspace-write",
+    }
+}
+
+/// Pair the `approvalPolicy` with the resolved `sandbox`. The
+/// `danger-full-access` tier is the user's EXPLICIT non-interactive opt-in — its
+/// whole purpose is to stop codex interrupting full-stack work (booting local
+/// dev servers, running `git`) — so it always pairs with `never`. Otherwise the
+/// autonomy tier governs, exactly as before: `true` → `never` (write
+/// unattended), `false` → `on-request` (the server raises `requestApproval` at
+/// gates).
+fn codex_approval_policy(sandbox: &str, autonomous: bool) -> &'static str {
+    if sandbox == "danger-full-access" || autonomous {
+        "never"
+    } else {
+        "on-request"
+    }
+}
+
 /// How long the `initialize` / `thread/start` (and fork `thread/resume`)
 /// handshake may take before [`start`](CodexSession::start) gives up. WITHOUT
 /// this bound a `codex app-server` that spawns but never replies (a wedged
@@ -660,16 +704,30 @@ fn initialize_params() -> Value {
 }
 
 /// Build the `thread/start` params for `workspace` / `model` / autonomy tier.
+/// The launch sandbox is resolved from [`codex_sandbox_mode`] (`.umadevrc`
+/// `[codex] sandbox_mode` published via `UMADEV_CODEX_SANDBOX`); unset → the
+/// safe `workspace-write` baseline, so default behaviour is unchanged.
 fn thread_start_params(workspace: &Path, model: &str, autonomous: bool) -> Value {
-    let approval_policy = if autonomous { "never" } else { "on-request" };
+    thread_start_params_for(workspace, model, autonomous, codex_sandbox_mode())
+}
+
+/// Pure inner of [`thread_start_params`] taking the resolved `sandbox`
+/// explicitly, so each mode is unit-testable without mutating process env.
+fn thread_start_params_for(
+    workspace: &Path,
+    model: &str,
+    autonomous: bool,
+    sandbox: &str,
+) -> Value {
     let mut params = json!({
         "cwd": workspace.to_string_lossy(),
-        "approvalPolicy": approval_policy,
+        "approvalPolicy": codex_approval_policy(sandbox, autonomous),
         // codex's sandbox enum is KEBAB-case (`read-only` / `workspace-write` /
-        // `danger-full-access`), matching its `--sandbox` CLI flag. We sent camelCase
-        // (`workspaceWrite`), which newer codex rejects with `unknown variant
-        // 'workspaceWrite'`, killing the continuous session (user-reported on Windows).
-        "sandbox": "workspace-write",
+        // `danger-full-access`), matching its `--sandbox` CLI flag. We once sent
+        // camelCase (`workspaceWrite`), which newer codex rejects with `unknown
+        // variant 'workspaceWrite'`, killing the continuous session (user-reported
+        // on Windows) — so the resolved value is always a kebab id.
+        "sandbox": sandbox,
     });
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
@@ -707,14 +765,32 @@ fn thread_resume_params_writable(
     model: &str,
     autonomous: bool,
 ) -> Value {
-    let approval_policy = if autonomous { "never" } else { "on-request" };
+    thread_resume_params_writable_for(
+        thread_id,
+        workspace,
+        model,
+        autonomous,
+        codex_sandbox_mode(),
+    )
+}
+
+/// Pure inner of [`thread_resume_params_writable`] taking the resolved `sandbox`
+/// explicitly, so each mode is unit-testable without mutating process env.
+fn thread_resume_params_writable_for(
+    thread_id: &str,
+    workspace: &Path,
+    model: &str,
+    autonomous: bool,
+    sandbox: &str,
+) -> Value {
     let mut params = json!({
         "threadId": thread_id,
         "cwd": workspace.to_string_lossy(),
-        "approvalPolicy": approval_policy,
+        "approvalPolicy": codex_approval_policy(sandbox, autonomous),
         // Kebab-case (see `thread_start_params`): writable so the resumed thread
-        // can continue building, not just review.
-        "sandbox": "workspace-write",
+        // can continue building, not just review. The tier is the resolved
+        // `.umadevrc` sandbox (default `workspace-write`).
+        "sandbox": sandbox,
     });
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
@@ -1569,6 +1645,97 @@ mod tests {
             gated.get("model").is_none(),
             "non-codex model must be dropped"
         );
+    }
+
+    #[test]
+    fn resolve_codex_sandbox_is_fail_open_and_lenient() {
+        // Canonical kebab ids.
+        assert_eq!(resolve_codex_sandbox(Some("read-only")), "read-only");
+        assert_eq!(
+            resolve_codex_sandbox(Some("workspace-write")),
+            "workspace-write"
+        );
+        assert_eq!(
+            resolve_codex_sandbox(Some("danger-full-access")),
+            "danger-full-access"
+        );
+        // Lenient about case / underscores.
+        assert_eq!(
+            resolve_codex_sandbox(Some("  DANGER_FULL_ACCESS ")),
+            "danger-full-access"
+        );
+        // Fail-open: unset / empty / garbage → the safe baseline (never panics).
+        assert_eq!(resolve_codex_sandbox(None), "workspace-write");
+        assert_eq!(resolve_codex_sandbox(Some("")), "workspace-write");
+        assert_eq!(resolve_codex_sandbox(Some("yolo-root")), "workspace-write");
+    }
+
+    #[test]
+    fn codex_approval_policy_pairs_full_access_with_never() {
+        // danger-full-access is the explicit non-interactive opt-in: ALWAYS never,
+        // even in the guarded (non-autonomous) tier, so local servers / git run
+        // uninterrupted.
+        assert_eq!(codex_approval_policy("danger-full-access", false), "never");
+        assert_eq!(codex_approval_policy("danger-full-access", true), "never");
+        // Other tiers keep the existing autonomy-driven behaviour.
+        assert_eq!(codex_approval_policy("workspace-write", true), "never");
+        assert_eq!(
+            codex_approval_policy("workspace-write", false),
+            "on-request"
+        );
+        assert_eq!(codex_approval_policy("read-only", false), "on-request");
+    }
+
+    #[test]
+    fn thread_start_params_carry_resolved_sandbox_per_mode() {
+        // Each mode flows verbatim into the `sandbox` param, with the paired policy.
+        let ro = thread_start_params_for(Path::new("/tmp/p"), "gpt-5-codex", false, "read-only");
+        assert_eq!(ro["sandbox"], "read-only");
+        assert_eq!(ro["approvalPolicy"], "on-request");
+
+        let ww =
+            thread_start_params_for(Path::new("/tmp/p"), "gpt-5-codex", false, "workspace-write");
+        assert_eq!(ww["sandbox"], "workspace-write");
+        assert_eq!(ww["approvalPolicy"], "on-request");
+
+        let full = thread_start_params_for(
+            Path::new("/tmp/p"),
+            "gpt-5-codex",
+            false,
+            "danger-full-access",
+        );
+        assert_eq!(full["sandbox"], "danger-full-access");
+        assert_eq!(
+            full["approvalPolicy"], "never",
+            "full access forces non-interactive even in the guarded tier"
+        );
+        // Model handling is unchanged regardless of sandbox.
+        assert_eq!(full["model"], "gpt-5-codex");
+    }
+
+    #[test]
+    fn thread_resume_params_writable_carry_resolved_sandbox_per_mode() {
+        let full = thread_resume_params_writable_for(
+            "thr_main",
+            Path::new("/tmp/p"),
+            "gpt-5-codex",
+            false,
+            "danger-full-access",
+        );
+        assert_eq!(full["threadId"], "thr_main");
+        assert_eq!(full["sandbox"], "danger-full-access");
+        assert_eq!(full["approvalPolicy"], "never");
+
+        let ro = thread_resume_params_writable_for(
+            "thr_main",
+            Path::new("/tmp/p"),
+            "gpt-5-codex",
+            true,
+            "read-only",
+        );
+        assert_eq!(ro["sandbox"], "read-only");
+        // Autonomous tier → never (unchanged) when not full-access.
+        assert_eq!(ro["approvalPolicy"], "never");
     }
 
     #[test]

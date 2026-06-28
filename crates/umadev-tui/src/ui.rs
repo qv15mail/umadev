@@ -353,6 +353,7 @@ mod theme {
             ChatRole::Host => SUCCESS(),
             ChatRole::Gate => WARNING(),
             ChatRole::System => BORDER_ACTIVE(),
+            ChatRole::Error => ERROR(),
         }
     }
 }
@@ -3374,6 +3375,24 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     let spans = vec![
                         role_spine_span(ChatRole::System),
                         Span::styled(line.to_string(), Style::default().fg(theme::TEXT_MUTED())),
+                    ];
+                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+                }
+            }
+            // **Error / high-risk warnings** — a LOUD, bold line in the theme's
+            // error red (the same red as a failed tool / blocked review row),
+            // behind the role spine. No emoji marker — the color + bold is the
+            // signal. Drives the codex `danger-full-access` startup warning.
+            ChatRole::Error => {
+                for line in body.lines() {
+                    let spans = vec![
+                        role_spine_span(ChatRole::Error),
+                        Span::styled(
+                            line.to_string(),
+                            Style::default()
+                                .fg(theme::ERROR())
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ];
                     rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
                 }

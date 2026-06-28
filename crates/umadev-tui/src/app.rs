@@ -316,6 +316,11 @@ pub enum ChatRole {
     Gate,
     /// A system event (config saved, error, hint).
     System,
+    /// A LOUD, high-risk warning — rendered bold in the theme's error red (the
+    /// same red as a failed tool / blocked review row). Reserved for warnings
+    /// the user must not miss, e.g. the codex `danger-full-access` sandbox
+    /// notice at startup.
+    Error,
 }
 
 /// Lifecycle of a structured tool call shown in the transcript. Drives the
@@ -1503,6 +1508,11 @@ impl App {
         // Export per-phase model tiers (if configured) so the in-process worker
         // loop drives each phase with the right-sized model.
         config.apply_model_tiers();
+        // Publish the project's Codex launch-sandbox choice (`.umadevrc`
+        // `[codex] sandbox_mode`) into `UMADEV_CODEX_SANDBOX` so the codex driver
+        // honors it, mirroring the model-tier export above. Default stays the safe
+        // `workspace-write`; an env already set (advanced / CI) wins.
+        let codex_sandbox = resolve_and_publish_codex_sandbox(&project_root);
         let mode = if config.has_backend() {
             AppMode::Chat
         } else {
@@ -1614,6 +1624,10 @@ impl App {
             app.load_chat_for_launch();
             app.maybe_push_resume_hint();
             app.maybe_push_goal_continuity();
+            // Liability notice: if codex is the active base AND the high-risk
+            // `danger-full-access` sandbox is resolved, push a loud red warning
+            // last so it is the most-visible startup line.
+            app.maybe_warn_codex_sandbox(codex_sandbox);
         }
         app.refresh_status();
         app
@@ -1849,6 +1863,19 @@ impl App {
                 &[&next_step, &done.to_string(), &total.to_string()],
             ),
         );
+    }
+
+    /// Liability notice for the high-risk codex sandbox. Pushes a LOUD red, bold
+    /// warning line ONLY when codex is the active base AND the resolved sandbox is
+    /// `danger-full-access` (see [`should_warn_codex_sandbox`]); `read-only` /
+    /// `workspace-write` stay silent. Trilingual via i18n.
+    fn maybe_warn_codex_sandbox(&mut self, mode: umadev_agent::config::CodexSandbox) {
+        if should_warn_codex_sandbox(self.backend.as_deref(), mode) {
+            self.push(
+                ChatRole::Error,
+                umadev_i18n::t(self.lang, "codex.sandbox.danger_warning").to_string(),
+            );
+        }
     }
 
     fn push(&mut self, role: ChatRole, body: impl Into<String>) {
@@ -7319,6 +7346,7 @@ impl App {
                 ChatRole::Host => "worker",
                 ChatRole::Gate => "GATE",
                 ChatRole::System => "system",
+                ChatRole::Error => "WARNING",
             };
             body.push_str(&format!("[{label}] {}\n", msg.body()));
             body.push('\n');
@@ -8325,6 +8353,40 @@ pub(crate) struct ChatSession {
 /// Used by both the Ctrl+R toggle (to pick the row to flip) and the renderer (to
 /// decide whether to draw the head-N preview + summary). Cheap line count;
 /// fail-open (anything else → not foldable).
+/// Resolve the effective Codex launch sandbox and publish it into
+/// `UMADEV_CODEX_SANDBOX` (the env the codex driver reads). Precedence: a
+/// pre-set env (advanced / CI override) wins; otherwise the project's `.umadevrc`
+/// `[codex] sandbox_mode` is resolved (fail-open → `workspace-write`) and
+/// exported. Returns the effective mode so the caller can decide whether to warn.
+fn resolve_and_publish_codex_sandbox(
+    project_root: &std::path::Path,
+) -> umadev_agent::config::CodexSandbox {
+    use umadev_agent::config::CodexSandbox;
+    // An explicit env (set by an advanced user or CI) is authoritative.
+    if let Ok(v) = std::env::var("UMADEV_CODEX_SANDBOX") {
+        if !v.trim().is_empty() {
+            return CodexSandbox::parse_fail_open(&v);
+        }
+    }
+    // Otherwise publish the `.umadevrc` choice so the codex driver honors it.
+    let mode = umadev_agent::config::load_project_config(project_root)
+        .codex
+        .resolved_sandbox();
+    std::env::set_var("UMADEV_CODEX_SANDBOX", mode.as_codex_arg());
+    mode
+}
+
+/// Decide whether the high-risk codex-sandbox liability warning should fire: ONLY
+/// when codex is the active base AND the resolved sandbox is the high-risk
+/// `danger-full-access` tier. `read-only` / `workspace-write`, or any other base,
+/// stay silent. Pure + unit-testable.
+pub(crate) fn should_warn_codex_sandbox(
+    backend: Option<&str>,
+    mode: umadev_agent::config::CodexSandbox,
+) -> bool {
+    mode.is_high_risk() && backend == Some("codex")
+}
+
 pub(crate) fn message_is_collapsible(m: &ChatMessage) -> bool {
     match &m.kind {
         MessageBody::Text(s) => {
@@ -9140,6 +9202,34 @@ fn format_lessons_report(lang: umadev_i18n::Lang, report: &umadev_agent::Lessons
 mod tests {
     use super::*;
     use crate::config::UserConfig;
+    use umadev_agent::config::CodexSandbox;
+
+    #[test]
+    fn codex_sandbox_warning_only_for_danger_full_access_on_codex() {
+        // Fires ONLY for the high-risk tier on the codex base.
+        assert!(should_warn_codex_sandbox(
+            Some("codex"),
+            CodexSandbox::DangerFullAccess
+        ));
+        // Safe tiers stay silent, even on codex.
+        assert!(!should_warn_codex_sandbox(
+            Some("codex"),
+            CodexSandbox::WorkspaceWrite
+        ));
+        assert!(!should_warn_codex_sandbox(
+            Some("codex"),
+            CodexSandbox::ReadOnly
+        ));
+        // Other bases never warn, even at the high-risk tier (the knob is codex's).
+        assert!(!should_warn_codex_sandbox(
+            Some("claude-code"),
+            CodexSandbox::DangerFullAccess
+        ));
+        assert!(!should_warn_codex_sandbox(
+            None,
+            CodexSandbox::DangerFullAccess
+        ));
+    }
 
     fn fresh_app(backend: Option<&str>) -> App {
         use std::sync::atomic::{AtomicU64, Ordering};

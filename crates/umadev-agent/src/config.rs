@@ -27,6 +27,16 @@
 //!                                       # ~/.umadev/config.toml) instead of
 //!                                       # the global default. Empty = disable
 //!                                       # any custom provider for this project.
+//!
+//! [codex]
+//! sandbox_mode = "workspace-write"     # codex launch sandbox: read-only |
+//!                                       # workspace-write (default, safe) |
+//!                                       # danger-full-access. The default
+//!                                       # blocks local dev servers (npm start
+//!                                       # for React / Electron) and git
+//!                                       # commits; set danger-full-access to
+//!                                       # allow them (high-risk — you accept
+//!                                       # the risk to your system environment).
 //! ```
 
 use std::path::Path;
@@ -51,6 +61,9 @@ pub struct ProjectConfig {
     /// Custom-model (API provider) overrides.
     #[serde(default)]
     pub model: ModelConfig,
+    /// Codex base launch-sandbox overrides.
+    #[serde(default)]
+    pub codex: CodexConfig,
 }
 
 /// Quality gate customization.
@@ -148,6 +161,92 @@ pub struct ModelConfig {
     pub provider: Option<String>,
 }
 
+/// Codex base launch-sandbox customization (`.umadevrc` `[codex]` section).
+///
+/// Codex launches its workspace in one of three sandbox tiers. UmaDev keeps the
+/// safe `workspace-write` baseline by default (write the project dir, but no
+/// network and no arbitrary system access) — behaviour is UNCHANGED when this
+/// section is absent. A full-stack project that must boot a local dev server
+/// (`npm start` for React / Electron) or run `git commit` needs the relaxed
+/// `danger-full-access` tier; advanced users opt in explicitly and accept the
+/// risk to their system environment.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexConfig {
+    /// One of `read-only` / `workspace-write` (default) / `danger-full-access`.
+    /// An unknown / garbage value fails open to `workspace-write` (never an
+    /// error), so a typo can never silently widen the sandbox.
+    #[serde(default = "default_codex_sandbox")]
+    pub sandbox_mode: String,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            sandbox_mode: default_codex_sandbox(),
+        }
+    }
+}
+
+impl CodexConfig {
+    /// Resolve the configured string to the typed [`CodexSandbox`], failing open
+    /// to [`CodexSandbox::WorkspaceWrite`] on any unrecognised value.
+    #[must_use]
+    pub fn resolved_sandbox(&self) -> CodexSandbox {
+        CodexSandbox::parse_fail_open(&self.sandbox_mode)
+    }
+}
+
+fn default_codex_sandbox() -> String {
+    CodexSandbox::WorkspaceWrite.as_codex_arg().to_string()
+}
+
+/// The three Codex launch sandbox tiers, matching codex's own `--sandbox` enum
+/// (and the JSON-RPC `sandbox` param).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexSandbox {
+    /// Read-only: the base can read the workspace but write nothing.
+    ReadOnly,
+    /// Write the workspace only — codex's default and UmaDev's safe baseline.
+    #[default]
+    WorkspaceWrite,
+    /// No sandbox: full filesystem + network + process access. Required to boot
+    /// local dev servers / run `git`; high-risk, opt-in only.
+    DangerFullAccess,
+}
+
+impl CodexSandbox {
+    /// Parse a config / env string fail-open. Recognises codex's canonical
+    /// kebab-case ids (and is lenient about case / `_`↔`-`); anything else —
+    /// including an empty or garbage value — resolves to [`Self::WorkspaceWrite`]
+    /// so a typo can never silently widen the sandbox.
+    #[must_use]
+    pub fn parse_fail_open(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "read-only" | "readonly" => Self::ReadOnly,
+            "danger-full-access" | "danger-full" | "full-access" => Self::DangerFullAccess,
+            // "workspace-write" + every unrecognised value → the safe default.
+            _ => Self::WorkspaceWrite,
+        }
+    }
+
+    /// The canonical codex `--sandbox` / JSON-RPC `sandbox` value.
+    #[must_use]
+    pub fn as_codex_arg(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    /// `true` for the high-risk full-access tier — drives the loud startup
+    /// warning and the forced non-interactive approval pairing.
+    #[must_use]
+    pub fn is_high_risk(self) -> bool {
+        matches!(self, Self::DangerFullAccess)
+    }
+}
+
 /// Knowledge-base (RAG) retrieval customization.
 ///
 /// Controls the [`umadev_knowledge`] retrieval engine that replaces the
@@ -217,6 +316,23 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     // Clamp quality threshold and top_k to sensible bounds.
     cfg.quality.threshold = cfg.quality.threshold.min(100);
     cfg.knowledge.top_k = cfg.knowledge.top_k.clamp(1, 50);
+    // Normalise the codex sandbox to a canonical kebab id; an unrecognised
+    // value fails open to the safe `workspace-write` baseline (never widens the
+    // sandbox). Mirrors the knowledge.engine fail-open above.
+    let raw_sandbox = cfg.codex.sandbox_mode.clone();
+    let resolved_sandbox = CodexSandbox::parse_fail_open(&raw_sandbox);
+    let normalized_sandbox = raw_sandbox.trim().to_ascii_lowercase().replace('_', "-");
+    if resolved_sandbox == CodexSandbox::WorkspaceWrite
+        && !normalized_sandbox.is_empty()
+        && normalized_sandbox != "workspace-write"
+    {
+        tracing::warn!(
+            "codex.sandbox_mode = {:?} is not read-only/workspace-write/danger-full-access \
+             — falling back to workspace-write",
+            raw_sandbox
+        );
+    }
+    cfg.codex.sandbox_mode = resolved_sandbox.as_codex_arg().to_string();
     cfg
 }
 
@@ -257,6 +373,94 @@ mod tests {
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 999\n").unwrap();
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.quality.threshold, 100);
+    }
+
+    #[test]
+    fn codex_sandbox_unset_defaults_to_workspace_write() {
+        let tmp = TempDir::new().unwrap();
+        // No `.umadevrc` at all → default, behaviour UNCHANGED.
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(
+            cfg.codex.resolved_sandbox(),
+            CodexSandbox::WorkspaceWrite,
+            "missing config must keep the safe baseline"
+        );
+        // A `.umadevrc` that omits the [codex] section → still the default.
+        std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 80\n").unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+        assert_eq!(cfg.codex.sandbox_mode, "workspace-write");
+    }
+
+    #[test]
+    fn codex_sandbox_danger_full_access_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
+        assert!(cfg.codex.resolved_sandbox().is_high_risk());
+        assert_eq!(cfg.codex.sandbox_mode, "danger-full-access");
+    }
+
+    #[test]
+    fn codex_sandbox_read_only_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::ReadOnly);
+        assert!(!cfg.codex.resolved_sandbox().is_high_risk());
+    }
+
+    #[test]
+    fn codex_sandbox_garbage_falls_back_to_workspace_write() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"yolo-root\"\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(
+            cfg.codex.resolved_sandbox(),
+            CodexSandbox::WorkspaceWrite,
+            "a garbage value must fail open to the safe baseline, never error"
+        );
+        // The stored string is normalised so downstream consumers see the canonical id.
+        assert_eq!(cfg.codex.sandbox_mode, "workspace-write");
+    }
+
+    #[test]
+    fn codex_sandbox_parse_fail_open_is_lenient() {
+        assert_eq!(
+            CodexSandbox::parse_fail_open("DANGER_FULL_ACCESS"),
+            CodexSandbox::DangerFullAccess
+        );
+        assert_eq!(
+            CodexSandbox::parse_fail_open("  Read-Only  "),
+            CodexSandbox::ReadOnly
+        );
+        assert_eq!(
+            CodexSandbox::parse_fail_open(""),
+            CodexSandbox::WorkspaceWrite
+        );
+        // Round-trip: every tier maps to codex's canonical kebab arg.
+        assert_eq!(CodexSandbox::ReadOnly.as_codex_arg(), "read-only");
+        assert_eq!(
+            CodexSandbox::WorkspaceWrite.as_codex_arg(),
+            "workspace-write"
+        );
+        assert_eq!(
+            CodexSandbox::DangerFullAccess.as_codex_arg(),
+            "danger-full-access"
+        );
     }
 
     #[test]

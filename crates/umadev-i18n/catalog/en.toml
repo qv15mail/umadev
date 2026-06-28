@@ -185,6 +185,9 @@
 "session.unfinished" = "[session] Detected an unfinished session (phase={}, requirement: \"{}\").\n  Type /continue to resume · a new requirement restarts from scratch · /status for details"
 "session.resume_goal" = "[goal] Last time a goal was left unfinished: next step \"{}\" (step {}/{} done). /run to pick it back up · or just say whether to continue."
 
+# Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
+"codex.sandbox.danger_warning" = "WARNING: Codex high-risk sandbox (danger-full-access) is ENABLED — you assume all risk to your system environment.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
+
 # Shared config write error
 "config.write_failed" = "(could not write {}: {})"
 "config.save_failed_note" = "[warn] Setting applied for this session, but could not be saved (it will revert on next launch): {}"
