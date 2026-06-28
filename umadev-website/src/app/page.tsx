@@ -357,6 +357,10 @@ export default function Home() {
       title = lang === "zh"
         ? "更新日志 | UmaDev - AI 编码项目总监 Agent"
         : "Changelog | UmaDev - AI coding project director";
+    } else if (view === "contributors") {
+      title = lang === "zh"
+        ? "特别贡献荣誉殿堂 | UmaDev - AI 编码项目总监 Agent"
+        : "Special Contributors | UmaDev - AI coding project director";
     }
     
     document.title = title;
@@ -648,6 +652,13 @@ export default function Home() {
           </button>
           <button className={navClass(view === "gallery")} type="button" onClick={() => go("gallery")}>
             <ScrambledHoverText text={t.nav.gallery} />
+          </button>
+          <button
+            className={navClass(view === "contributors")}
+            type="button"
+            onClick={() => go("contributors")}
+          >
+            <ScrambledHoverText text={t.nav.contributors} />
           </button>
           <button
             className={navClass(view === "changelog")}
@@ -1249,6 +1260,41 @@ export default function Home() {
                 <button className={styles.galleryItem} key={src} onClick={() => setLightbox(i)} type="button">
                   <Image alt={`UmaDev IP ${i + 1}`} className={styles.galleryImg} height={420} src={src} unoptimized width={420} />
                 </button>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {view === "contributors" && (
+          <section className={styles.contributorsPage}>
+            <PageHero title={t.contributorsPage.title} sub={t.contributorsPage.sub} />
+            
+            <div className={styles.contributorsMatrix}>
+              {[
+                { ...t.contributors.featured, isVip: true },
+                ...t.contributors.list.map((item) => ({ ...item, isVip: false }))
+              ].map((member) => (
+                <div
+                  key={member.avatarKey}
+                  className={styles.matrixCard}
+                  data-vip={member.isVip ? "true" : undefined}
+                >
+                  <div className={styles.matrixCardGlow} />
+                  {member.isVip && <div className={styles.matrixVipBadge}>#1 核心贡献</div>}
+                  <div className={styles.matrixAvatarWrapper}>
+                    <Image
+                      src={asset(`/assets/contributors/${member.avatarKey}.png`)}
+                      alt={member.name}
+                      width={88}
+                      height={88}
+                      className={styles.matrixAvatarImg}
+                    />
+                  </div>
+                  <div className={styles.matrixTextInfo}>
+                    <span className={styles.matrixName}>{member.name}</span>
+                    <span className={styles.matrixRole}>{member.role}</span>
+                  </div>
+                </div>
               ))}
             </div>
           </section>

@@ -766,7 +766,8 @@
 .cta,
 .docsPage,
 .logPage,
-.partnersSection {
+.partnersSection,
+.contributorsPage {
   width: 100%;
   max-width: 1200px;
   margin: 0 auto;
@@ -1914,6 +1915,7 @@
   .docsPage,
   .logPage,
   .partnersSection,
+  .contributorsPage,
   .footer {
     padding-right: 18px;
     padding-left: 18px;
@@ -6612,5 +6614,189 @@
   .partnerCard {
     padding: 20px 12px 16px;
     min-height: 130px;
+  }
+}
+
+/* ==========================================
+   Dedicated Special Contributors Hall of Fame Matrix
+   ========================================== */
+.contributorsPage {
+  width: 100%;
+  padding-bottom: 60px;
+}
+
+.contributorsMatrix {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 16px;
+  width: 100%;
+  margin-top: 28px;
+}
+
+.matrixCard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px 12px 16px;
+  background: rgba(20, 22, 28, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 20px;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), 
+              border-color 0.28s ease, 
+              box-shadow 0.28s ease,
+              background-color 0.28s ease;
+  overflow: hidden;
+}
+
+.matrixCard:hover {
+  transform: translateY(-5px);
+  border-color: rgba(1, 203, 241, 0.45);
+  background: rgba(26, 30, 42, 0.82);
+  box-shadow: 0 12px 28px rgba(1, 203, 241, 0.14),
+              inset 0 0 12px rgba(1, 203, 241, 0.04);
+}
+
+.matrixCardGlow {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 50%, rgba(1, 203, 241, 0.08), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.28s ease;
+  pointer-events: none;
+}
+
+.matrixCard:hover .matrixCardGlow {
+  opacity: 1;
+}
+
+/* VIP Card Custom Accent (#1 元宝) - Same compact dimensions, elegant golden accent */
+.matrixCard[data-vip="true"] {
+  background: radial-gradient(circle at 50% 0%, rgba(255, 184, 0, 0.14), rgba(20, 22, 28, 0.88) 75%);
+  border-color: rgba(255, 200, 80, 0.5);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 0 20px rgba(255, 184, 0, 0.14);
+}
+
+.matrixCard[data-vip="true"]:hover {
+  transform: translateY(-5px);
+  border-color: rgba(255, 215, 0, 0.85);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.5), 0 0 30px rgba(255, 184, 0, 0.28);
+}
+
+.matrixVipBadge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 7px;
+  background: linear-gradient(135deg, #ffb800, #ff7700);
+  color: #000;
+  font-family: var(--font-space), sans-serif;
+  font-size: 9.5px;
+  font-weight: 900;
+  border-radius: 12px;
+  letter-spacing: 0.03em;
+  box-shadow: 0 2px 8px rgba(255, 136, 0, 0.4);
+}
+
+.matrixAvatarWrapper {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 12px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  transition: transform 0.28s ease, border-color 0.28s ease, box-shadow 0.28s ease;
+}
+
+.matrixCard[data-vip="true"] .matrixAvatarWrapper {
+  border-color: #ffc850;
+  box-shadow: 0 0 14px rgba(255, 184, 0, 0.35);
+}
+
+.matrixCard:hover .matrixAvatarWrapper {
+  transform: scale(1.06);
+}
+
+.matrixCard[data-vip="true"]:hover .matrixAvatarWrapper {
+  border-color: #ffd700;
+  box-shadow: 0 0 18px rgba(255, 215, 0, 0.5);
+}
+
+.matrixAvatarImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.matrixTextInfo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  width: 100%;
+}
+
+.matrixName {
+  font-family: var(--font-space), sans-serif;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 2px;
+  transition: color 0.2s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.matrixCard[data-vip="true"] .matrixName {
+  color: #fff;
+  text-shadow: 0 0 8px rgba(255, 200, 80, 0.4);
+}
+
+.matrixCard:hover .matrixName {
+  color: var(--cyan);
+}
+
+.matrixCard[data-vip="true"]:hover .matrixName {
+  color: #ffd700;
+}
+
+.matrixRole {
+  font-size: 11px;
+  color: #8c9ba5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.matrixCard[data-vip="true"] .matrixRole {
+  color: #ffd778;
+}
+
+@media (max-width: 768px) {
+  .contributorsMatrix {
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 12px;
+  }
+  .matrixCard {
+    padding: 16px 8px 12px;
+    border-radius: 16px;
+  }
+  .matrixAvatarWrapper {
+    width: 48px;
+    height: 48px;
+    margin-bottom: 10px;
+  }
+  .matrixName {
+    font-size: 13.5px;
+  }
+  .matrixRole {
+    font-size: 10.5px;
   }
 }

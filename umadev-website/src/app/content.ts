@@ -1,5 +1,5 @@
 export type Lang = "zh" | "en";
-export type View = "home" | "docs" | "gallery" | "changelog";
+export type View = "home" | "docs" | "gallery" | "changelog" | "contributors";
 
 export type DocBlock =
   | { h: string }
@@ -10,7 +10,7 @@ export type DocBlock =
 
 export const i18n = {
   zh: {
-    nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志" },
+    nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志", contributors: "特别贡献" },
     hero: {
       badge: "v1.0.7 · MIT 开源 · Rust 单二进制",
       title1: "把 AI 编码工具，变成",
@@ -218,9 +218,30 @@ export const i18n = {
         { name: "辛泽", role: "AIGC、多元化社区", logoName: "xinze", url: "#" }
       ]
     },
+    contributors: {
+      eyebrow: "特别贡献者",
+      title: "致敬特别贡献者，共同铸就 UmaDev 核心生态",
+      featured: { name: "元宝", role: "核心领航贡献者", avatarKey: "yuanbao" },
+      list: [
+        { name: "Robin", role: "特别贡献者", avatarKey: "robin" },
+        { name: "perfect", role: "特别贡献者", avatarKey: "perfect" },
+        { name: "境随AI转", role: "特别贡献者", avatarKey: "jingsuiai" },
+        { name: "张楠伟", role: "特别贡献者", avatarKey: "zhangnanwei" },
+        { name: "慕怀", role: "特别贡献者", avatarKey: "muhuai" },
+        { name: "昭文", role: "特别贡献者", avatarKey: "zhaowen" },
+        { name: "枫叶", role: "特别贡献者", avatarKey: "fengye" },
+        { name: "海涛", role: "特别贡献者", avatarKey: "haitao" },
+        { name: "眼睛", role: "特别贡献者", avatarKey: "yanjing" },
+        { name: "马辉", role: "特别贡献者", avatarKey: "mahui" }
+      ]
+    },
+    contributorsPage: {
+      title: "特别贡献荣誉殿堂",
+      sub: "致敬每一位铸就 UmaDev 核心生态与可治理编码体系的大咖与贡献者"
+    },
   },
   en: {
-    nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog" },
+    nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog", contributors: "Contributors" },
     hero: {
       badge: "v1.0.7 · MIT licensed · Single Rust binary",
       title1: "Turn your AI coding tool into a",
@@ -427,6 +448,27 @@ export const i18n = {
         { name: "GOPC", role: "AIGC & Diversified Community", logoName: "gopc", url: "#" },
         { name: "XinZe", role: "AIGC & Diversified Community", logoName: "xinze", url: "#" }
       ]
+    },
+    contributors: {
+      eyebrow: "SPECIAL CONTRIBUTORS",
+      title: "Honoring Special Contributors Shaping the Core UmaDev Ecosystem",
+      featured: { name: "YuanBao", role: "Core Lead Contributor", avatarKey: "yuanbao" },
+      list: [
+        { name: "Robin", role: "Special Contributor", avatarKey: "robin" },
+        { name: "perfect", role: "Special Contributor", avatarKey: "perfect" },
+        { name: "JingSuiAI", role: "Special Contributor", avatarKey: "jingsuiai" },
+        { name: "ZhangNanWei", role: "Special Contributor", avatarKey: "zhangnanwei" },
+        { name: "MuHuai", role: "Special Contributor", avatarKey: "muhuai" },
+        { name: "ZhaoWen", role: "Special Contributor", avatarKey: "zhaowen" },
+        { name: "FengYe", role: "Special Contributor", avatarKey: "fengye" },
+        { name: "HaiTao", role: "Special Contributor", avatarKey: "haitao" },
+        { name: "YanJing", role: "Special Contributor", avatarKey: "yanjing" },
+        { name: "MaHui", role: "Special Contributor", avatarKey: "mahui" }
+      ]
+    },
+    contributorsPage: {
+      title: "Special Contributors Hall of Fame",
+      sub: "Honoring visionary leaders and contributors building the core UmaDev ecosystem"
     },
   },
 } as const;
