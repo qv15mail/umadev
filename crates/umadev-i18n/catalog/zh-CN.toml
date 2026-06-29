@@ -122,6 +122,18 @@
 "gate.guide_prefix" = "指引: {}"
 "gate.auto_approved" = "[auto] 自主模式:已自动通过检查点 `{}`,继续推进…  (想逐步审核就输入 /manual)"
 
+# Structured gate picker — 一个问题 + 2-4 个带标签的选项(↑↓ / 数字键 + Enter);
+# 自由文本始终可用(直接输入即可),选项映射到既有的确认/修改流程。
+"gate.choice.docs.question" = "三份核心文档已就绪,你想怎么继续?"
+"gate.choice.preview.question" = "前端预览已就绪,你想怎么继续?"
+"gate.choice.confirm" = "确认通过,继续"
+"gate.choice.revise" = "要修改"
+"gate.choice.add_more" = "补充内容"
+"gate.choice.cancel" = "取消本次运行"
+"gate.choice.hint" = "↑↓ 选择 · 数字键直选 · Enter 确认 · 或直接输入你的反馈"
+"gate.choice.revise.prompt" = "好的,请描述要修改的地方。"
+"gate.choice.add_more.prompt" = "好的,请补充你想增加的内容。"
+
 # 运行时叙述
 "run.started" = "流水线启动:{}\n按 9 阶段流程交付,关键节点会停下让你审。"
 "run.phase_start" = "> phase {} 开始…"

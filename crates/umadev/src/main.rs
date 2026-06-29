@@ -2204,7 +2204,7 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
         EngineEvent::PhaseCompleted { phase } => {
             eprintln!("  [ok] {} complete", phase.id());
         }
-        EngineEvent::GateOpened { gate } => {
+        EngineEvent::GateOpened { gate, .. } => {
             eprintln!(
                 "
 [gate]  Gate: {} — run `umadev continue` to proceed.",

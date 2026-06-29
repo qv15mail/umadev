@@ -24,7 +24,7 @@
 use std::collections::VecDeque;
 
 use crossterm::event::KeyCode;
-use umadev_agent::{EngineEvent, Gate};
+use umadev_agent::{EngineEvent, Gate, GateChoice, GateDecision};
 use umadev_spec::{Phase, PHASE_CHAIN};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -2063,6 +2063,13 @@ pub struct App {
     pub phases: Vec<PhaseRow>,
     /// The gate the pipeline is currently paused at, if any.
     pub active_gate: Option<Gate>,
+    /// The structured choice surfaced by the active gate, rendered as a picker
+    /// (a question + 2–4 labeled options). `None` → the gate is free-form only
+    /// (fail-open). Free-text input stays available alongside the picker.
+    pub gate_choice: Option<GateChoice>,
+    /// The highlighted option index in [`Self::gate_choice`] (0-based). Reset to
+    /// 0 each time a fresh choice is set; meaningless when `gate_choice` is `None`.
+    pub gate_choice_sel: usize,
     /// `true` once a delivery proof-pack has landed.
     pub finished: bool,
     /// `true` once the user has kicked off a pipeline run in this session.
@@ -2530,6 +2537,8 @@ impl App {
             requirement: String::new(),
             phases,
             active_gate: None,
+            gate_choice: None,
+            gate_choice_sel: 0,
             finished: false,
             run_started: false,
             aborted: false,
@@ -3469,6 +3478,7 @@ impl App {
         // The run errored out (not a user cancel) → its task is a Failed row.
         self.mark_active_task(TaskStatus::Failed);
         self.active_gate = None;
+        self.gate_choice = None;
         self.run_started_at = None;
         self.phase_started_at = None;
         // The run is over — any worker-stall animation must stop.
@@ -5557,8 +5567,17 @@ impl App {
                     umadev_i18n::tf(self.lang, "event.phase_done", &[phase.id()]),
                 );
             }
-            EngineEvent::GateOpened { gate } => {
+            EngineEvent::GateOpened { gate, choice } => {
                 self.active_gate = Some(gate);
+                // Drop any stale picker up front so the auto-approve / queued-steer
+                // early-return paths can never leave one rendering; the paused path
+                // re-arms it below.
+                self.gate_choice = None;
+                // Resolve the structured choice to render as a picker: the event's
+                // choice when it carries renderable options, else none (fail-open
+                // → the existing free-form gate). Stashed below ONLY on the paused
+                // path (auto-approve / queued-steer return early without a picker).
+                let resolved_choice = choice.filter(GateChoice::is_renderable);
                 // Feature A — snapshot the run's elapsed BEFORE the live counters
                 // are stopped below, so the gate-pause bell (armed only on the
                 // manual-pause path) can gate on how long the run has been going.
@@ -5635,6 +5654,12 @@ impl App {
                     ChatRole::Gate,
                     gate_card(gate, &self.slug, &self.project_root, self.lang),
                 );
+                // Structured-choice picker (a nicer front-end to the confirm/revise
+                // flow). Stored alongside the gate card; the live panel renders it
+                // with a moving highlight, ↑↓/number keys drive it, and free-text
+                // stays available (typing a custom response still works).
+                self.gate_choice = resolved_choice;
+                self.gate_choice_sel = 0;
                 // Plan (read-only) tier: tell the user the run stops here by
                 // design and how to execute the plan once they're happy with it.
                 if mode == umadev_agent::TrustMode::Plan {
@@ -5671,6 +5696,7 @@ impl App {
                         );
                     }
                     self.active_gate = None;
+                    self.gate_choice = None;
                     self.run_started_at = None;
                     self.phase_started_at = None;
                     let lang = self.lang;
@@ -6379,6 +6405,40 @@ impl App {
             self.reset_kill_yank();
         }
 
+        // ---- structured gate picker ----------------------------------------
+        // When a gate surfaced a structured choice AND the input box is EMPTY,
+        // the arrow keys / number keys / Enter drive the picker — a nicer
+        // front-end to the confirm/revise flow. The moment the user types ANY
+        // text the box is non-empty and the picker yields to the free-text
+        // fallback (a custom revision still works), so it never blocks the
+        // keyboard. Esc is deliberately NOT intercepted (it keeps its
+        // interrupt/quit meaning), and Shift+↑/↓ still scroll the transcript.
+        if self.input.is_empty() {
+            if let Some(n) = self.gate_choice.as_ref().map(|c| c.options.len()) {
+                match key {
+                    KeyCode::Up if !shift => {
+                        self.gate_choice_move(-1);
+                        return Action::None;
+                    }
+                    KeyCode::Down if !shift => {
+                        self.gate_choice_move(1);
+                        return Action::None;
+                    }
+                    KeyCode::Char(d @ '1'..='9') => {
+                        let idx = (d as usize) - ('1' as usize);
+                        if idx < n {
+                            return self.gate_choice_pick(idx);
+                        }
+                        // Out-of-range digit → fall through to normal insertion.
+                    }
+                    KeyCode::Enter if !shift => {
+                        return self.gate_choice_pick(self.gate_choice_sel);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         match key {
             // ---- @-mention popover: Esc closes it WITHOUT inserting ----
             // Higher precedence than the interrupt / quit-confirm Esc below, so a
@@ -6912,6 +6972,7 @@ impl App {
             if gate == Gate::ClarifyGate {
                 if matches!(text.trim(), "c" | "C") {
                     self.active_gate = None;
+                    self.gate_choice = None;
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::t(self.lang, "gate.clarify_saved").to_string(),
@@ -6934,6 +6995,7 @@ impl App {
             }
             if matches!(text.trim(), "c" | "C") {
                 self.active_gate = None;
+                self.gate_choice = None;
                 let what = match gate {
                     Gate::DocsConfirm => umadev_i18n::t(self.lang, "gate.confirmed_docs"),
                     Gate::PreviewConfirm => umadev_i18n::t(self.lang, "gate.confirmed_preview"),
@@ -6998,6 +7060,91 @@ impl App {
             self.queued_steer.push_back(text);
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
             Action::None
+        }
+    }
+
+    /// Move the structured-gate picker highlight by `delta` (wrapping). A no-op
+    /// when no picker is active or it has no options (fail-open).
+    fn gate_choice_move(&mut self, delta: isize) {
+        let Some(choice) = self.gate_choice.as_ref() else {
+            return;
+        };
+        let n = choice.options.len();
+        if n == 0 {
+            return;
+        }
+        // Wrap with signed arithmetic done in `isize`, then back to a 0..n index.
+        let cur = isize::try_from(self.gate_choice_sel.min(n - 1)).unwrap_or(0);
+        let n_i = isize::try_from(n).unwrap_or(1);
+        let next = (cur + delta).rem_euclid(n_i);
+        self.gate_choice_sel = usize::try_from(next).unwrap_or(0);
+    }
+
+    /// Confirm the picker option at `idx`, mapping the chosen [`GateDecision`]
+    /// onto the EXISTING gate flow (no new decision machinery):
+    /// - `Approve` → clear the gate + record trust, drive [`Action::Continue`]
+    ///   (exactly what typing `c` does);
+    /// - `Revise` / `AddMore` → keep the gate open and drop into the free-text
+    ///   fallback (the next typed line drives the existing [`Action::Revise`]),
+    ///   prompting the user for specifics;
+    /// - `Cancel` → [`Action::Cancel`].
+    ///
+    /// **Fail-open:** an out-of-range index, no active picker, or no active gate
+    /// → [`Action::None`] (the gate is left untouched).
+    fn gate_choice_pick(&mut self, idx: usize) -> Action {
+        let Some(option) = self
+            .gate_choice
+            .as_ref()
+            .and_then(|c| c.options.get(idx))
+            .cloned()
+        else {
+            return Action::None;
+        };
+        let Some(gate) = self.active_gate else {
+            return Action::None;
+        };
+        // Echo the chosen option so the transcript records the decision (the
+        // picker panel itself is transient). Localize the label key via `t()`,
+        // which returns a literal verbatim and a known key localized.
+        let label = umadev_i18n::t(self.lang, &option.label).to_string();
+        self.push(ChatRole::You, label);
+        // The picker is consumed regardless of the branch; the gate stays open
+        // only for a revise/add-more free-text follow-up (re-checked below).
+        self.gate_choice = None;
+        self.gate_choice_sel = 0;
+        match option.decision {
+            GateDecision::Approve => {
+                self.active_gate = None;
+                let what = match gate {
+                    Gate::DocsConfirm => umadev_i18n::t(self.lang, "gate.confirmed_docs"),
+                    Gate::PreviewConfirm => umadev_i18n::t(self.lang, "gate.confirmed_preview"),
+                    Gate::ClarifyGate => umadev_i18n::t(self.lang, "gate.confirmed_generic"),
+                };
+                self.push(ChatRole::UmaDev, format!("[ok] {what}"));
+                // A picker approval builds trust for this gate, like a manual `c`.
+                self.record_trust_pass(gate.id_str());
+                Action::Continue(gate)
+            }
+            GateDecision::Revise | GateDecision::AddMore => {
+                // A revise needs specifics → keep the gate open and hand off to
+                // the free-text fallback; the user's next line drives the existing
+                // revise path. A picked revise resets this gate's trust streak.
+                self.record_trust_revision(gate.id_str());
+                let prompt_key = if matches!(option.decision, GateDecision::AddMore) {
+                    "gate.choice.add_more.prompt"
+                } else {
+                    "gate.choice.revise.prompt"
+                };
+                self.push(
+                    ChatRole::UmaDev,
+                    umadev_i18n::t(self.lang, prompt_key).to_string(),
+                );
+                Action::None
+            }
+            GateDecision::Cancel => {
+                self.active_gate = None;
+                Action::Cancel
+            }
         }
     }
 
@@ -7408,6 +7555,7 @@ impl App {
         self.finished = false;
         self.run_started = false;
         self.active_gate = None;
+        self.gate_choice = None;
         // P5c: a reset ends any open reasoning block (collapse its placeholder).
         self.collapse_thinking_block();
         // Drop any not-yet-fired queued steers so they can't bleed into a later
@@ -15285,6 +15433,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         for c in "/continue".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
@@ -15366,6 +15515,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         for c in "/revise 把 OAuth 删掉".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
@@ -15379,6 +15529,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         for c in "/revise".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
@@ -15562,6 +15713,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         for c in "去掉 OAuth".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
@@ -15887,10 +16039,120 @@ mod tests {
         // pending steer — fired as a revision — instead of auto-approving.
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         assert!(a.queued_steer.is_empty());
         assert_eq!(a.pending_steer.as_deref(), Some("make it dark mode"));
         assert!(a.pending_auto_continue.is_none());
+    }
+
+    // ── Structured-choice gate picker ──────────────────────────────────────
+
+    #[test]
+    fn structured_choice_gate_arms_picker_and_approve_drives_continue() {
+        let mut a = fresh_app(Some("offline"));
+        // A confirm gate opened via the standard constructor carries the picker.
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
+        let choice = a.gate_choice.as_ref().expect("picker armed");
+        assert_eq!(choice.options.len(), 3, "approve / revise / add-more");
+        assert_eq!(a.gate_choice_sel, 0);
+        // Arrow keys move the highlight (wrapping both ways).
+        let _ = a.apply_key(KeyCode::Down);
+        let _ = a.apply_key(KeyCode::Down);
+        assert_eq!(a.gate_choice_sel, 2);
+        let _ = a.apply_key(KeyCode::Down); // wraps to 0
+        assert_eq!(a.gate_choice_sel, 0);
+        let _ = a.apply_key(KeyCode::Up); // wraps to 2
+        assert_eq!(a.gate_choice_sel, 2);
+        let _ = a.apply_key(KeyCode::Down); // back to the Approve row
+        assert_eq!(a.gate_choice_sel, 0);
+        // Enter on the highlighted Approve option drives the EXISTING confirm path.
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
+        assert!(a.gate_choice.is_none() && a.active_gate.is_none());
+    }
+
+    #[test]
+    fn gate_picker_number_key_selects_and_drives_decision() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        // `1` picks the first option (Approve) directly → Continue.
+        let action = a.apply_key(KeyCode::Char('1'));
+        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
+        assert!(a.gate_choice.is_none());
+    }
+
+    #[test]
+    fn gate_picker_revise_option_hands_off_to_free_text_then_revises() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        // `2` picks "Revise": no immediate Action, the picker is consumed, and the
+        // gate STAYS open awaiting the free-text revision (reuses the revise path).
+        let action = a.apply_key(KeyCode::Char('2'));
+        assert_eq!(action, Action::None);
+        assert!(a.gate_choice.is_none(), "picker consumed");
+        assert_eq!(
+            a.active_gate,
+            Some(Gate::DocsConfirm),
+            "gate open for the revision"
+        );
+        // The next typed line drives the existing Action::Revise.
+        for c in "make the header sticky".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Revise("make the header sticky".to_string()));
+    }
+
+    #[test]
+    fn gate_without_options_falls_back_to_free_form() {
+        let mut a = fresh_app(Some("offline"));
+        // No structured choice on the event → no picker (fail-open).
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: Gate::DocsConfirm,
+            choice: None,
+        });
+        assert!(a.gate_choice.is_none(), "no picker → free-form");
+        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
+        // The free-text approval (`c`) still works exactly as before.
+        let _ = a.apply_key(KeyCode::Char('c'));
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
+    }
+
+    #[test]
+    fn gate_picker_coexists_with_free_text_fallback() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::PreviewConfirm));
+        assert!(a.gate_choice.is_some(), "picker present");
+        // Typing letters is NOT swallowed by the picker — the box only yields its
+        // keys to the picker while empty, so a custom response still types in.
+        for c in "use lucide".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.input, "use lucide");
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Revise("use lucide".to_string()));
+    }
+
+    #[test]
+    fn gate_picker_out_of_range_digit_is_fail_open() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        // `9` is past the 3 options → not a selection; it falls through to normal
+        // insertion (fail-open: never panics, never picks a phantom option).
+        let action = a.apply_key(KeyCode::Char('9'));
+        assert_eq!(action, Action::None);
+        assert_eq!(a.input, "9");
+        assert!(a.gate_choice.is_some(), "picker untouched");
+    }
+
+    #[test]
+    fn gate_picker_pick_is_noop_without_active_gate() {
+        // Direct fail-open guard: picking with no active picker/gate is a no-op.
+        let mut a = fresh_app(Some("offline"));
+        assert_eq!(a.gate_choice_pick(0), Action::None);
     }
 
     #[test]
@@ -15923,6 +16185,7 @@ mod tests {
         // At the next gate, ALL of them fold into one pending revision (in order).
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         assert!(a.queued_steer.is_empty(), "queue drained at the gate");
         assert_eq!(
@@ -16577,6 +16840,7 @@ mod tests {
         });
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         let card = a
             .history
@@ -16602,6 +16866,7 @@ mod tests {
         });
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::PreviewConfirm,
+            choice: None,
         });
         let card = a
             .history
@@ -16621,6 +16886,7 @@ mod tests {
         });
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         let card = a
             .history
@@ -16661,6 +16927,7 @@ mod tests {
         });
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         // Timer stops while waiting on the user — status bar shouldn't keep
         // ticking during an approval pause.
@@ -16691,6 +16958,7 @@ mod tests {
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         let _ = a.apply_key(KeyCode::Char('c'));
         let action = a.apply_key(KeyCode::Enter);
@@ -18289,6 +18557,7 @@ mod tests {
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
         a.apply_engine(EngineEvent::GateOpened {
             gate: umadev_agent::gates::Gate::DocsConfirm,
+            choice: None,
         });
         assert!(
             !a.is_stalled(),
@@ -18335,6 +18604,7 @@ mod tests {
         });
         a.apply_engine(EngineEvent::GateOpened {
             gate: umadev_agent::gates::Gate::DocsConfirm,
+            choice: None,
         });
         // Even with a very stale clock, a gate pause is not a stall.
         a.run_started_at =
@@ -19832,6 +20102,7 @@ mod tests {
         a.slash_mode("plan");
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         // Plan is read-only: the gate pauses, never auto-continues.
         assert!(
@@ -19856,6 +20127,7 @@ mod tests {
         a.slash_mode("auto");
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         // Auto tier auto-advances AND books a trust pass for the gate.
         assert_eq!(a.pending_auto_continue, Some(Gate::DocsConfirm));

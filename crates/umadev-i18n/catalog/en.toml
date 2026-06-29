@@ -122,6 +122,19 @@
 "gate.guide_prefix" = "Guide: {}"
 "gate.auto_approved" = "[auto] Autonomous mode: auto-approved checkpoint `{}`, continuing…  (type /manual to review each step)"
 
+# Structured gate picker — a question + 2-4 labeled options (↑↓ / number keys +
+# Enter); free-text stays available (just type), options map onto the existing
+# confirm/revise flow.
+"gate.choice.docs.question" = "The three core docs are ready — how do you want to proceed?"
+"gate.choice.preview.question" = "The frontend preview is ready — how do you want to proceed?"
+"gate.choice.confirm" = "Confirm and continue"
+"gate.choice.revise" = "Request changes"
+"gate.choice.add_more" = "Add more"
+"gate.choice.cancel" = "Cancel this run"
+"gate.choice.hint" = "↑↓ to choose · number keys to pick · Enter to confirm · or just type your feedback"
+"gate.choice.revise.prompt" = "Okay — describe what you'd like changed."
+"gate.choice.add_more.prompt" = "Okay — tell me what to add."
+
 # Runtime narration
 "run.started" = "Pipeline started: {}\nDelivering in 9 phases; it pauses at key checkpoints for your review."
 "run.phase_start" = "> phase {} starting…"

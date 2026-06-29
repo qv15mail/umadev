@@ -1008,7 +1008,7 @@ impl<R: Runtime> AgentRunner<R> {
         }
         self.emit(EngineEvent::PhaseCompleted { phase });
         if let Some(gate) = output.gate {
-            self.emit(EngineEvent::GateOpened { gate });
+            self.emit(EngineEvent::gate_opened(gate));
         }
         Ok(output)
     }
@@ -1565,9 +1565,7 @@ impl<R: Runtime> AgentRunner<R> {
         }
         // Show the questions to the user and pause.
         let questions = std::fs::read_to_string(&clarify_path).unwrap_or_default();
-        self.emit(EngineEvent::GateOpened {
-            gate: Gate::ClarifyGate,
-        });
+        self.emit(EngineEvent::gate_opened(Gate::ClarifyGate));
         self.emit(EngineEvent::Note(format!(
             "请回答以下澄清问题(逐条回答,或输入 c 跳过):\n{questions}"
         )));
@@ -7334,7 +7332,8 @@ error TS2304: Cannot find name 'Foo'
             sink.count(|e| matches!(
                 e,
                 EngineEvent::GateOpened {
-                    gate: Gate::ClarifyGate
+                    gate: Gate::ClarifyGate,
+                    ..
                 }
             )),
             0,

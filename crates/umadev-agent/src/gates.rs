@@ -55,6 +55,126 @@ pub enum GateOutcome {
     Cancelled,
 }
 
+/// The semantic decision a structured-gate option maps onto. Each maps to the
+/// EXISTING gate flow — there is **no new decision machinery**: `Approve` drives
+/// the confirm/continue path, `Revise`/`AddMore` drop into the existing
+/// free-text revise path (the picker is a nicer front-end to it), and `Cancel`
+/// aborts the run. UD-FLOW-002 / UD-FLOW-003.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateDecision {
+    /// Approve the gate — the existing confirm/continue path.
+    Approve,
+    /// Request revisions — drops into the existing free-text revise path.
+    Revise,
+    /// Supplement / add more — a revise-class follow-up with an "add more" framing.
+    AddMore,
+    /// Cancel the run.
+    Cancel,
+}
+
+impl GateDecision {
+    /// Stable id (persistence / tests).
+    #[must_use]
+    pub const fn id_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Revise => "revise",
+            Self::AddMore => "add_more",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// The i18n key the UI localizes into this option's picker label. Carried as
+    /// a key (not a localized string) so the runner can attach a structured
+    /// choice without knowing the user's locale — the TUI resolves it at render
+    /// time (a non-key string passed through `t()` is returned verbatim, so a
+    /// caller may also supply a literal label).
+    #[must_use]
+    pub const fn label_key(self) -> &'static str {
+        match self {
+            Self::Approve => "gate.choice.confirm",
+            Self::Revise => "gate.choice.revise",
+            Self::AddMore => "gate.choice.add_more",
+            Self::Cancel => "gate.choice.cancel",
+        }
+    }
+}
+
+/// One labeled option in a structured gate choice (2–4 per choice).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GateChoiceOption {
+    /// The display label — an i18n KEY (localized by the UI via `t()`) or a
+    /// literal string (passed through verbatim). See [`GateDecision::label_key`].
+    pub label: String,
+    /// Which existing gate decision picking this option drives.
+    pub decision: GateDecision,
+}
+
+/// A structured choice surfaced when a gate opens: a question + 2–4 labeled
+/// options the UI renders as a picker (↑↓ / number keys + Enter). Free-text
+/// stays an always-available fallback — the picker never replaces it.
+///
+/// **Fail-open:** an empty `options` list (or a `None` choice on the gate event)
+/// means "no structured choice" → the UI falls back to the existing free-form
+/// gate exactly as before.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GateChoice {
+    /// The question shown above the options — an i18n key or a literal (same
+    /// resolution rule as [`GateChoiceOption::label`]).
+    pub question: String,
+    /// The 2–4 options.
+    pub options: Vec<GateChoiceOption>,
+}
+
+impl GateChoice {
+    /// The STANDARD structured choice for a gate, carried as i18n keys so it is
+    /// locale-free (the UI localizes at render). Returns `None` for a gate that
+    /// has no standard approve/revise choice (the clarify gate collects free-form
+    /// answers, not a decision) so the caller falls back to the free-form gate.
+    #[must_use]
+    pub fn standard(gate: Gate) -> Option<Self> {
+        let (question, decisions): (&str, &[GateDecision]) = match gate {
+            Gate::DocsConfirm => (
+                "gate.choice.docs.question",
+                &[
+                    GateDecision::Approve,
+                    GateDecision::Revise,
+                    GateDecision::AddMore,
+                ],
+            ),
+            Gate::PreviewConfirm => (
+                "gate.choice.preview.question",
+                &[
+                    GateDecision::Approve,
+                    GateDecision::Revise,
+                    GateDecision::AddMore,
+                ],
+            ),
+            // The clarify gate is an answer-collection surface, not an
+            // approve/revise decision → no standard picker (free-form, unchanged).
+            Gate::ClarifyGate => return None,
+        };
+        Some(Self {
+            question: question.to_string(),
+            options: decisions
+                .iter()
+                .map(|d| GateChoiceOption {
+                    label: d.label_key().to_string(),
+                    decision: *d,
+                })
+                .collect(),
+        })
+    }
+
+    /// Whether this choice has at least one option — the fail-open guard the UI
+    /// checks before rendering a picker (an empty choice → free-form gate).
+    #[must_use]
+    pub fn is_renderable(&self) -> bool {
+        !self.options.is_empty()
+    }
+}
+
 const APPROVAL_TOKENS: &[&str] = &[
     "确认", "通过", "继续", "approved", "approve", "lgtm", "ship it", "ok",
 ];
@@ -355,6 +475,45 @@ mod tests {
     #[test]
     fn empty_reply_is_revise_with_empty_text() {
         assert!(matches!(classify_reply(""), GateOutcome::Revise(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn standard_choice_is_present_for_confirm_gates_and_absent_for_clarify() {
+        // docs/preview confirm gates carry a 3-option approve/revise/add-more
+        // choice (locale-free i18n keys); the clarify gate has no standard picker.
+        for gate in [Gate::DocsConfirm, Gate::PreviewConfirm] {
+            let c = GateChoice::standard(gate).expect("confirm gate has a choice");
+            assert!(c.is_renderable());
+            assert_eq!(c.options.len(), 3);
+            assert_eq!(c.options[0].decision, GateDecision::Approve);
+            assert_eq!(c.options[1].decision, GateDecision::Revise);
+            assert_eq!(c.options[2].decision, GateDecision::AddMore);
+            // Labels are carried as i18n KEYS, not localized strings.
+            assert_eq!(c.options[0].label, "gate.choice.confirm");
+        }
+        assert!(GateChoice::standard(Gate::ClarifyGate).is_none());
+    }
+
+    #[test]
+    fn empty_choice_is_not_renderable_fail_open() {
+        let empty = GateChoice {
+            question: "q".to_string(),
+            options: vec![],
+        };
+        assert!(!empty.is_renderable());
+    }
+
+    #[test]
+    fn gate_decision_ids_and_label_keys_are_stable() {
+        for d in [
+            GateDecision::Approve,
+            GateDecision::Revise,
+            GateDecision::AddMore,
+            GateDecision::Cancel,
+        ] {
+            assert!(!d.id_str().is_empty());
+            assert!(d.label_key().starts_with("gate.choice."));
+        }
     }
 
     #[test]

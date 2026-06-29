@@ -292,7 +292,7 @@ pub async fn run_block(
             // and resume the continuous run from THIS gate — exactly the state shape
             // the single-shot `transition(gate_phase, gate.id_str())` would write.
             persist_state(options, phase, gate.id_str());
-            events.emit(EngineEvent::GateOpened { gate });
+            events.emit(EngineEvent::gate_opened(gate));
             events.emit(EngineEvent::BlockCompleted {
                 final_phase: phase,
                 paused_at: Some(gate),
@@ -2577,7 +2577,8 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(
             e,
             EngineEvent::GateOpened {
-                gate: Gate::DocsConfirm
+                gate: Gate::DocsConfirm,
+                ..
             }
         )));
     }

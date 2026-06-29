@@ -120,7 +120,10 @@ pub use first_pass::{
     first_pass_rate, low_confidence_nudge as first_pass_low_confidence_nudge,
     seat_kind as first_pass_seat_kind, FirstPassStats, KindStat,
 };
-pub use gates::{claims_code_changes, classify_reply, Gate, GateOutcome};
+pub use gates::{
+    claims_code_changes, classify_reply, Gate, GateChoice, GateChoiceOption, GateDecision,
+    GateOutcome,
+};
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
     capture_dev_errors, capture_gate_revision, capture_quality_failures,

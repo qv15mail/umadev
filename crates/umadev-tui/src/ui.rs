@@ -2725,7 +2725,70 @@ const PLAN_PANEL_MAX_ROWS: u16 = 12;
 /// deliverables 2/3). Returns the pre-styled lines, or an empty vec when there's
 /// nothing live (plan empty AND no verdicts) — the caller then reserves zero
 /// rows. Fail-open: an unknown status string renders as a neutral pending dot.
+/// Render the structured-gate picker into the live-panel region: the question,
+/// each option as a numbered row with a highlight marker on the selected one,
+/// and a one-line hint. Labels are localized via `t()` (an i18n key is resolved,
+/// a literal is shown verbatim). All colors come from the theme — no naked hex,
+/// no emoji. Free-text stays available; the hint says so.
+fn gate_choice_lines(app: &App, choice: &umadev_agent::GateChoice) -> Vec<Line<'static>> {
+    let lang = app.lang;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The question, warm-yellow + bold to match the gate's `[gate]` accent.
+    lines.push(Line::from(Span::styled(
+        format!(" {}", umadev_i18n::t(lang, &choice.question)),
+        Style::default()
+            .fg(theme::WARNING())
+            .add_modifier(Modifier::BOLD),
+    )));
+    let sel = app
+        .gate_choice_sel
+        .min(choice.options.len().saturating_sub(1));
+    for (i, opt) in choice.options.iter().enumerate() {
+        let n = i + 1;
+        let label = umadev_i18n::t(lang, &opt.label);
+        let selected = i == sel;
+        // `▸` (a plain triangle marker, not an emoji) flags the highlighted row;
+        // a space keeps the others aligned. The number is the 1-based hotkey.
+        let marker = if selected { "▸" } else { " " };
+        let (marker_color, label_style) = if selected {
+            (
+                theme::PRIMARY(),
+                Style::default()
+                    .fg(theme::PRIMARY())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (theme::TEXT_MUTED(), Style::default().fg(theme::TEXT()))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {n}. "),
+                Style::default().fg(marker_color),
+            ),
+            Span::styled(truncate_display(label, 56), label_style),
+        ]));
+    }
+    // Hint: how to drive the picker, and that free-text is still available.
+    lines.push(Line::from(Span::styled(
+        format!("  {}", umadev_i18n::t(lang, "gate.choice.hint")),
+        Style::default().fg(theme::TEXT_MUTED()),
+    )));
+    lines
+}
+
 fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+    // A live structured gate choice takes over the panel as a picker: the plan is
+    // paused AT the gate, so the user's attention belongs on the decision. Shown
+    // only while the input box is empty — the instant the user starts typing a
+    // custom response the picker yields to the free-text fallback (this mirrors
+    // the key-handling guard, so render + interaction stay in lockstep).
+    // Fail-open: a `None`/empty choice falls straight through to the plan/review.
+    if app.input.is_empty() {
+        if let Some(choice) = app.gate_choice.as_ref().filter(|c| c.is_renderable()) {
+            return gate_choice_lines(app, choice);
+        }
+    }
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     let has_plan = !app.plan_steps.is_empty();
     let has_review = !app.critic_verdicts.is_empty();
@@ -6635,6 +6698,44 @@ mod tests {
     }
 
     #[test]
+    fn gate_picker_renders_question_options_and_highlight() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::gate_opened(
+            umadev_agent::Gate::DocsConfirm,
+        ));
+        let out = render_chat_to_string(&app, 100, 30);
+        // The localized question + all three option labels render in the picker.
+        assert!(
+            out.contains("how do you want to proceed"),
+            "question shown: {out}"
+        );
+        assert!(out.contains("Confirm and continue"), "approve option shown");
+        assert!(out.contains("Request changes"), "revise option shown");
+        assert!(out.contains("Add more"), "add-more option shown");
+        // The selection marker is a plain triangle (no emoji), and the hint says
+        // free-text is still available.
+        assert!(out.contains('\u{25b8}'), "selection marker rendered");
+        assert!(out.contains("just type"), "free-text fallback hinted");
+    }
+
+    #[test]
+    fn gate_without_choice_renders_no_picker() {
+        // Fail-open: a gate with no structured choice shows no picker panel.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::GateOpened {
+            gate: umadev_agent::Gate::DocsConfirm,
+            choice: None,
+        });
+        let out = render_chat_to_string(&app, 100, 30);
+        assert!(
+            !out.contains("how do you want to proceed"),
+            "no picker question when there is no choice: {out}"
+        );
+    }
+
+    #[test]
     fn team_review_panel_renders_seat_verdicts() {
         let mut app = app_with(Some("offline"));
         app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
@@ -6794,6 +6895,7 @@ mod tests {
         let mut app = app_with(Some("offline"));
         app.apply_engine(umadev_agent::EngineEvent::GateOpened {
             gate: umadev_agent::Gate::DocsConfirm,
+            choice: None,
         });
         let out = render_to_string(&app);
         // The input status hint is gate-aware.
@@ -6876,6 +6978,7 @@ mod tests {
         let mut app = app_with(Some("offline"));
         app.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
+            choice: None,
         });
         let out = render_to_string(&app);
         assert!(out.contains("gate"));

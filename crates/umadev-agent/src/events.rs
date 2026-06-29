@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use umadev_spec::Phase;
 
-use crate::gates::Gate;
+use crate::gates::{Gate, GateChoice};
 
 /// One thing the engine did, surfaced to whatever UI is watching.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -46,6 +46,11 @@ pub enum EngineEvent {
     GateOpened {
         /// Which gate is now open.
         gate: Gate,
+        /// An optional structured choice to render as a picker (a question +
+        /// 2–4 labeled options). `None` → the UI shows the existing free-form
+        /// gate, unchanged (fail-open). Free-text input stays available even
+        /// when a choice is present.
+        choice: Option<GateChoice>,
     },
     /// A block of execution finished — either paused at a gate, or the
     /// whole pipeline completed when `paused_at` is `None`.
@@ -226,6 +231,18 @@ impl EngineEvent {
             team: route.team.iter().map(|s| s.role_id().to_string()).collect(),
             est_tool_calls: route.est_budget.max_tool_calls,
             rationale: route.rationale(),
+        }
+    }
+
+    /// Build an [`EngineEvent::GateOpened`] carrying the gate's STANDARD
+    /// structured choice (or `None` for a gate with no standard choice → the
+    /// free-form gate). The single place the standard picker is attached, so
+    /// every emit site stays one call.
+    #[must_use]
+    pub fn gate_opened(gate: Gate) -> Self {
+        Self::GateOpened {
+            gate,
+            choice: GateChoice::standard(gate),
         }
     }
 
@@ -488,6 +505,23 @@ mod tests {
                 status: "active".into(),
             }
         );
+    }
+
+    #[test]
+    fn gate_opened_attaches_standard_choice_for_confirm_gates() {
+        use crate::gates::Gate;
+        // A confirm gate carries the structured choice…
+        let EngineEvent::GateOpened { choice, .. } = EngineEvent::gate_opened(Gate::DocsConfirm)
+        else {
+            unreachable!()
+        };
+        assert!(choice.is_some_and(|c| c.is_renderable()));
+        // …the clarify gate carries none (free-form, unchanged → fail-open).
+        let EngineEvent::GateOpened { choice, .. } = EngineEvent::gate_opened(Gate::ClarifyGate)
+        else {
+            unreachable!()
+        };
+        assert!(choice.is_none(), "clarify gate has no standard picker");
     }
 
     #[test]

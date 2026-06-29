@@ -604,6 +604,18 @@ mod tests {
             "input.example.tests",
             "input.example.explain",
             "input.example.file_generic",
+            // Structured-choice gate picker: the per-gate question, the
+            // approve/revise/add-more/cancel option labels, the driver hint, and
+            // the revise/add-more free-text follow-up prompts.
+            "gate.choice.docs.question",
+            "gate.choice.preview.question",
+            "gate.choice.confirm",
+            "gate.choice.revise",
+            "gate.choice.add_more",
+            "gate.choice.cancel",
+            "gate.choice.hint",
+            "gate.choice.revise.prompt",
+            "gate.choice.add_more.prompt",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {
