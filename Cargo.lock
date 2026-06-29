@@ -3145,6 +3145,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "umadev-agent",
+ "umadev-contract",
  "umadev-governance",
  "umadev-host",
  "umadev-i18n",

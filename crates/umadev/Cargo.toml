@@ -16,6 +16,7 @@ path = "src/main.rs"
 umadev-spec = { workspace = true }
 umadev-governance = { workspace = true }
 umadev-agent = { workspace = true, features = ["vector"] }
+umadev-contract = { workspace = true }
 umadev-runtime = { workspace = true }
 umadev-host = { workspace = true }
 umadev-tui = { workspace = true }

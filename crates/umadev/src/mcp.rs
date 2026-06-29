@@ -1,25 +1,33 @@
 //! Minimal MCP (Model Context Protocol) server over stdio.
 //!
-//! Exposes UmaDev's governance layer as a `tools/call` target so ANY
+//! Exposes UmaDev's governance + director layer as a `tools/call` target so ANY
 //! MCP-compatible host (Claude Desktop, Cursor, Continue, etc.) can ask
-//! "is this file content safe to write?" and get a structured decision —
-//! turning UmaDev into a governance gateway for the whole MCP ecosystem,
+//! "is this file content safe to write?" — and now also query the live plan, the
+//! frontend↔backend contract, and the self-evolving pitfall memory — turning
+//! UmaDev into a **portable governance gateway** for the whole MCP ecosystem,
 //! not just Claude Code's PreToolUse hook.
 //!
 //! ## Protocol
 //! JSON-RPC 2.0 over stdio, one request per line. UmaDev implements:
 //! - `initialize` → server capabilities
-//! - `tools/list` → the `govern_file` + `govern_command` tools
-//! - `tools/call` → run governance on a `{file_path, content}` or `{command}`
+//! - `tools/list` → the governance tools (`govern_file` / `govern_command`)
+//!   plus the read-mostly director tools (`plan_status` / `contract_check` /
+//!   `lessons_recall` / `governance_summary`)
+//! - `tools/call` → run the named tool over a project root
 //!
-//! Hosts register UmaDev as an MCP server (stdio transport) and call
-//! `govern_file` before writing. This is the MCP equivalent of the
-//! PreToolUse hook — but portable to every MCP client, not just Claude Code.
+//! ## Safety contract
+//! The two `govern_*` tools are content-scoped pure checks. The four director
+//! tools are **read-mostly + fail-open by contract**: each calls an existing
+//! pure agent/contract entry point over the project root and, on ANY failure
+//! (missing/corrupt artifact, unreadable dir), returns an empty / "unavailable"
+//! result — never a crash, never a workspace mutation. The heavy, mutating work
+//! (running tests, writing files, driving a build) stays behind the TUI/CLI and
+//! the trust floor; the MCP surface is a safe query window into UmaDev's state.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use umadev_governance::{check_dangerous_bash, scan_content_with_policy, Policy};
 
@@ -27,6 +35,14 @@ use umadev_governance::{check_dangerous_bash, scan_content_with_policy, Policy};
 const TOOL_GOVERN_FILE: &str = "govern_file";
 /// Tool name: govern a shell command before execution.
 const TOOL_GOVERN_COMMAND: &str = "govern_command";
+/// Tool name: read the owned, persisted build plan (`.umadev/plan.json`).
+const TOOL_PLAN_STATUS: &str = "plan_status";
+/// Tool name: cross-check frontend calls against the API contract (read-only).
+const TOOL_CONTRACT_CHECK: &str = "contract_check";
+/// Tool name: recall recorded pitfalls + corrective strategies from memory.
+const TOOL_LESSONS_RECALL: &str = "lessons_recall";
+/// Tool name: summarise the active rule policy + the audit-trail tail.
+const TOOL_GOVERNANCE_SUMMARY: &str = "governance_summary";
 
 /// Run the MCP server loop: read JSON-RPC requests from stdin, write
 /// responses to stdout. Runs until stdin closes (EOF) or `shutdown` arrives.
@@ -183,6 +199,48 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
                             },
                             "required": ["command"]
                         }
+                    },
+                    {
+                        "name": TOOL_PLAN_STATUS,
+                        "description": "Read UmaDev's owned, persisted build plan (`.umadev/plan.json`) for a project: the dependency-DAG steps with their seat, kind, acceptance criterion and status, plus progress, risks and open questions. Read-only. Returns `has_plan:false` when no plan exists.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." }
+                            }
+                        }
+                    },
+                    {
+                        "name": TOOL_CONTRACT_CHECK,
+                        "description": "Cross-check the project's real frontend fetch/axios calls against the API contract parsed from `output/<slug>-architecture.md` (UD-CODE-003). Returns the endpoint count, call count, alignment flag and any violations (undeclared_call / method_mismatch). Read-only analysis — never mutates the workspace.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." },
+                                "slug": { "type": "string", "description": "Project slug selecting `output/<slug>-architecture.md`. Optional — auto-detected from the output/ directory when omitted." }
+                            }
+                        }
+                    },
+                    {
+                        "name": TOOL_LESSONS_RECALL,
+                        "description": "Recall recorded pitfalls + corrective strategies from UmaDev's self-evolving memory for a project. Optionally filter by a free-text query; on-stack pitfalls (matching the project's dependency fingerprint) surface too. Returns each pitfall's signature, hit count, fix-lifecycle status, recorded fix and already-tried-but-failed fixes, plus validated success patterns. Read-only.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." },
+                                "query": { "type": "string", "description": "Free-text query to filter pitfalls by (title / signature / fix / tech-stack context). Optional — omit to get the worst-first top pitfalls." }
+                            }
+                        }
+                    },
+                    {
+                        "name": TOOL_GOVERNANCE_SUMMARY,
+                        "description": "Summarise the project's active governance posture: the total governance clause count, the clauses/paths/domains the project has opted out of (`.umadev/rules.toml`), and the tail of the tool-call audit trail (`.umadev/audit/tool-calls.jsonl`). Read-only.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." }
+                            }
+                        }
                     }
                 ]
             })),
@@ -209,6 +267,12 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
 
 /// Handle a `tools/call` request. `id` is the request id (already known to be
 /// present — `tools/call` is never a notification in this server).
+///
+/// Dispatches to the named tool. The two `govern_*` tools are content-scoped
+/// pure checks; the four director tools are read-mostly + fail-open (any
+/// failure degrades to an empty/"unavailable" result, never an error response).
+/// Each tool yields `(text, is_error)`; only an UNKNOWN tool name is a protocol
+/// error (`-32602`).
 fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRpcResponse {
     let name = req
         .params
@@ -216,44 +280,353 @@ fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRp
         .and_then(|n| n.as_str())
         .unwrap_or("");
     let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
-    let (blocked, clause, reason) = match name {
-        TOOL_GOVERN_FILE => {
-            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let d = scan_content_with_policy(path, content, policy);
-            (d.block, d.clause, d.reason)
-        }
-        TOOL_GOVERN_COMMAND => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let d = check_dangerous_bash(cmd);
-            (d.block, d.clause, d.reason)
-        }
-        _ => {
-            return JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id: Some(id.clone()),
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32602,
-                    message: format!("unknown tool: {name}"),
-                }),
-            };
-        }
+    let outcome: Option<(String, bool)> = match name {
+        TOOL_GOVERN_FILE => Some(govern_file_tool(&args, policy)),
+        TOOL_GOVERN_COMMAND => Some(govern_command_tool(&args)),
+        TOOL_PLAN_STATUS => Some(plan_status_tool(&args)),
+        TOOL_CONTRACT_CHECK => Some(contract_check_tool(&args)),
+        TOOL_LESSONS_RECALL => Some(lessons_recall_tool(&args)),
+        TOOL_GOVERNANCE_SUMMARY => Some(governance_summary_tool(&args)),
+        _ => None,
     };
-    let text = if blocked {
-        format!("BLOCKED ({clause}): {reason}")
-    } else {
-        "PASS: no governance violations detected.".into()
-    };
+    match outcome {
+        Some((text, is_error)) => tool_text_result(id, &text, is_error),
+        None => JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(id.clone()),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("unknown tool: {name}"),
+            }),
+        },
+    }
+}
+
+/// Wrap a tool's `(text, is_error)` outcome in the standard MCP `tools/call`
+/// result envelope (a single text content block + the `isError` flag).
+fn tool_text_result(id: &Value, text: &str, is_error: bool) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
         id: Some(id.clone()),
         result: Some(json!({
             "content": [{ "type": "text", "text": text }],
-            "isError": blocked,
+            "isError": is_error,
         })),
         error: None,
     }
+}
+
+/// Pretty-print a JSON value as the tool's text payload. Fail-open: a serialize
+/// error (unreachable for the values we build) degrades to `{}`.
+fn json_text(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Resolve the project root a director tool operates on: the `project_root`
+/// argument when given + non-empty, else the server's current directory.
+fn arg_root(args: &Value) -> PathBuf {
+    args.get("project_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            PathBuf::from,
+        )
+}
+
+/// `govern_file`: run the governance rules on a file's proposed content.
+fn govern_file_tool(args: &Value, policy: &Policy) -> (String, bool) {
+    let path = args.get("file_path").and_then(Value::as_str).unwrap_or("");
+    let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+    let d = scan_content_with_policy(path, content, policy);
+    govern_decision_text(d.block, &d.clause, &d.reason)
+}
+
+/// `govern_command`: run the dangerous-command guard on a shell command.
+fn govern_command_tool(args: &Value) -> (String, bool) {
+    let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+    let d = check_dangerous_bash(cmd);
+    govern_decision_text(d.block, &d.clause, &d.reason)
+}
+
+/// Render a governance decision into the tool's `(text, is_error)` outcome —
+/// the historical wording, preserved so existing hosts/tests are unaffected.
+fn govern_decision_text(blocked: bool, clause: &str, reason: &str) -> (String, bool) {
+    let text = if blocked {
+        format!("BLOCKED ({clause}): {reason}")
+    } else {
+        "PASS: no governance violations detected.".to_string()
+    };
+    (text, blocked)
+}
+
+/// `plan_status`: read the owned, persisted plan (`.umadev/plan.json`) for the
+/// project. Fail-open: an absent / unreadable / corrupt plan yields
+/// `has_plan:false` (handled inside [`umadev_agent::load_plan`]).
+fn plan_status_tool(args: &Value) -> (String, bool) {
+    let root = arg_root(args);
+    let Some(plan) = umadev_agent::load_plan(&root) else {
+        return (
+            json_text(&json!({
+                "has_plan": false,
+                "message": "No plan found (.umadev/plan.json is absent or unreadable).",
+            })),
+            false,
+        );
+    };
+    let (done, total) = plan.progress();
+    let steps: Vec<Value> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.title,
+                "seat": s.seat.role_id(),
+                "kind": serde_json::to_value(s.kind).unwrap_or(Value::Null),
+                "depends_on": s.depends_on,
+                "acceptance": serde_json::to_value(&s.acceptance).unwrap_or(Value::Null),
+                "status": s.status.as_str(),
+            })
+        })
+        .collect();
+    let out = json!({
+        "has_plan": true,
+        "progress": { "done": done, "total": total },
+        "steps": steps,
+        "risks": plan.risks,
+        "open_questions": plan.open_questions,
+    });
+    (json_text(&out), false)
+}
+
+/// `contract_check`: parse the architecture API table, extract the project's
+/// real frontend calls, and cross-validate (UD-CODE-003). Read-only — it only
+/// reads files and reports violations, never writes. Fail-open: no architecture
+/// doc yields `has_contract:false`.
+fn contract_check_tool(args: &Value) -> (String, bool) {
+    let root = arg_root(args);
+    let explicit_slug = args
+        .get("slug")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some((slug, arch)) = find_architecture_doc(&root, explicit_slug) else {
+        return (
+            json_text(&json!({
+                "has_contract": false,
+                "message": "No architecture contract found (output/<slug>-architecture.md is absent or empty).",
+                "violations": [],
+            })),
+            false,
+        );
+    };
+    let spec = umadev_contract::parse_architecture(&arch, &slug);
+    let calls = umadev_contract::extract_frontend_calls(&root);
+    let violations = umadev_contract::validate_frontend_vs_contract(&calls, &spec);
+    let vlist: Vec<Value> = violations
+        .iter()
+        .map(|v| {
+            json!({
+                "kind": violation_kind_str(v.kind),
+                "detail": v.detail,
+            })
+        })
+        .collect();
+    let out = json!({
+        "has_contract": true,
+        "slug": slug,
+        "endpoints": spec.len(),
+        "frontend_calls": calls.len(),
+        "aligned": violations.is_empty(),
+        "violations": vlist,
+    });
+    (json_text(&out), false)
+}
+
+/// Locate the architecture contract doc under `<root>/output/`. With an explicit
+/// slug, read `output/<slug>-architecture.md`; otherwise scan for the first
+/// non-empty `*-architecture.md` and derive the slug from its name. Returns
+/// `(slug, content)` or `None` when no usable doc exists (fail-open).
+fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(String, String)> {
+    let output = root.join("output");
+    if let Some(slug) = explicit_slug {
+        let path = output.join(format!("{slug}-architecture.md"));
+        let text = std::fs::read_to_string(path).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        return Some((slug.to_string(), text));
+    }
+    let rd = std::fs::read_dir(&output).ok()?;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(slug) = name.strip_suffix("-architecture.md") {
+            if slug.is_empty() {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if !text.trim().is_empty() {
+                    return Some((slug.to_string(), text));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stable wire string for a contract-violation kind.
+fn violation_kind_str(kind: umadev_contract::validate::ViolationKind) -> &'static str {
+    use umadev_contract::validate::ViolationKind;
+    match kind {
+        ViolationKind::UndeclaredCall => "undeclared_call",
+        ViolationKind::MethodMismatch => "method_mismatch",
+        ViolationKind::UnmatchedRoute => "unmatched_route",
+    }
+}
+
+/// `lessons_recall`: recall recorded pitfalls + corrective strategies from the
+/// self-evolving memory. Uses the PURE-READ [`umadev_agent::lessons_report`]
+/// (never the prompt-assembly recall, which mutates efficacy bookkeeping), then
+/// filters by the optional query + the project's tech-stack fingerprint.
+/// Fail-open: an empty KB yields `has_lessons:false`.
+fn lessons_recall_tool(args: &Value) -> (String, bool) {
+    let root = arg_root(args);
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let report = umadev_agent::lessons_report(&root);
+    if report.is_empty() {
+        return (
+            json_text(&json!({
+                "has_lessons": false,
+                "message": "No lessons recorded yet for this project.",
+                "pitfalls": [],
+                "validated_patterns": [],
+            })),
+            false,
+        );
+    }
+    // Build the relevance filter from the query words PLUS the project's real
+    // dependency fingerprint (so an on-stack pitfall surfaces without a textual
+    // query). With NO query and NO detectable stack there is nothing to filter
+    // on → return the worst-first top pitfalls as-is.
+    let q_tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(str::to_string)
+        .collect();
+    let stack: std::collections::HashSet<String> =
+        umadev_agent::lessons::project_context_tokens(&root)
+            .into_iter()
+            .collect();
+    let has_filter = !q_tokens.is_empty() || !stack.is_empty();
+    let relevant = |e: &umadev_agent::PitfallEntry| -> bool {
+        if !has_filter {
+            return true;
+        }
+        let hay = format!(
+            "{} {} {} {}",
+            e.title,
+            e.signature,
+            e.fix,
+            e.context.join(" ")
+        )
+        .to_ascii_lowercase();
+        let by_query = q_tokens.iter().any(|t| hay.contains(t.as_str()));
+        let by_stack = e
+            .context
+            .iter()
+            .any(|c| stack.contains(&c.to_ascii_lowercase()));
+        by_query || by_stack
+    };
+    let pitfalls: Vec<Value> = report
+        .top_pitfalls
+        .iter()
+        .filter(|e| relevant(e))
+        .map(|e| {
+            json!({
+                "title": e.title,
+                "signature": e.signature,
+                "hits": e.hits,
+                "status": pitfall_status_str(e.status),
+                "fix": e.fix,
+                "context": e.context,
+                "failed_fixes": e.failed_fixes,
+            })
+        })
+        .collect();
+    let validated: Vec<Value> = report
+        .validated_patterns
+        .iter()
+        .map(|v| json!({ "title": v.title, "summary": v.summary }))
+        .collect();
+    let out = json!({
+        "has_lessons": true,
+        "efficacy": {
+            "total": report.efficacy.total,
+            "validated": report.efficacy.validated,
+            "recurring": report.efficacy.recurring,
+            "active": report.efficacy.active,
+        },
+        "pitfalls": pitfalls,
+        "validated_patterns": validated,
+    });
+    (json_text(&out), false)
+}
+
+/// Stable wire string for a pitfall's fix-lifecycle status.
+fn pitfall_status_str(status: umadev_agent::PitfallStatus) -> &'static str {
+    use umadev_agent::PitfallStatus;
+    match status {
+        PitfallStatus::Active => "active",
+        PitfallStatus::Validated => "validated",
+        PitfallStatus::Recurring => "recurring",
+    }
+}
+
+/// `governance_summary`: the active rule policy (opt-outs from
+/// `.umadev/rules.toml`) plus the tail of the tool-call audit trail. Read-only +
+/// fail-open: missing policy/audit files yield defaults / an empty tail.
+fn governance_summary_tool(args: &Value) -> (String, bool) {
+    let root = arg_root(args);
+    let policy = Policy::load(&root);
+    let out = json!({
+        "total_clauses": umadev_spec::CLAUSES.len(),
+        "disabled_clauses": policy.disabled.clauses,
+        "excluded_paths": policy.exclusions.paths,
+        "extra_blocked_domains": policy.extra.blocked_domains,
+        "audit_tail": read_audit_tail(&root, AUDIT_TAIL_LEN),
+    });
+    (json_text(&out), false)
+}
+
+/// How many trailing audit rows `governance_summary` surfaces — a recent-activity
+/// peek, not a full dump.
+const AUDIT_TAIL_LEN: usize = 10;
+
+/// Read the last `n` rows of the tool-call audit log
+/// (`.umadev/audit/tool-calls.jsonl`) as parsed JSON, oldest-first. Fail-open: a
+/// missing/unreadable log yields an empty vec; unparseable rows are skipped.
+fn read_audit_tail(root: &Path, n: usize) -> Vec<Value> {
+    let path = root.join(".umadev").join("audit").join("tool-calls.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut tail: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(n)
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    tail.reverse();
+    tail
 }
 
 #[cfg(test)]
@@ -471,5 +844,303 @@ mod tests {
             params: json!({}),
         };
         assert!(handle_request(&req, &Policy::default()).is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Director-layer read-mostly tools (plan_status / contract_check /
+    // lessons_recall / governance_summary).
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Invoke a director tool over `root` with optional extra `arguments`
+    /// (an object). Asserts the tool succeeded (`isError == false` — these are
+    /// read-mostly, never an error) and returns its JSON-decoded text payload.
+    fn director_tool(name: &str, root: &std::path::Path, extra: Value) -> Value {
+        let mut map = extra.as_object().cloned().unwrap_or_default();
+        map.insert(
+            "project_root".to_string(),
+            json!(root.to_string_lossy().to_string()),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({ "name": name, "arguments": Value::Object(map) }),
+        };
+        let resp =
+            handle_request(&req, &Policy::default()).expect("a request with id gets a reply");
+        let result = resp.result.expect("a read tool always yields a result");
+        assert_eq!(result["isError"], false, "read-mostly tools never error");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("text content block");
+        serde_json::from_str(text).expect("the tool's text payload is JSON")
+    }
+
+    #[test]
+    fn tools_list_exposes_all_six_tools() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(2)),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let resp = handle_request(&req, &Policy::default()).unwrap();
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // The two original governance tools stay intact …
+        assert!(names.contains(&"govern_file"));
+        assert!(names.contains(&"govern_command"));
+        // … plus the four new director tools.
+        assert!(names.contains(&"plan_status"));
+        assert!(names.contains(&"contract_check"));
+        assert!(names.contains(&"lessons_recall"));
+        assert!(names.contains(&"governance_summary"));
+        assert_eq!(names.len(), 6, "exactly six tools are registered");
+        // Every tool advertises a valid object input schema.
+        for t in &tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "tool {t:?}");
+        }
+    }
+
+    #[test]
+    fn plan_status_returns_the_persisted_plan() {
+        use umadev_agent::{save_plan, AcceptanceSpec, Plan, PlanStep, Seat, StepKind, StepStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            steps: vec![
+                PlanStep {
+                    id: "scaffold".into(),
+                    title: "Scaffold the app".into(),
+                    seat: Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec![],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    status: StepStatus::Done,
+                },
+                PlanStep {
+                    id: "auth".into(),
+                    title: "Auth route".into(),
+                    seat: Seat::BackendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec!["scaffold".into()],
+                    acceptance: AcceptanceSpec::Contract,
+                    status: StepStatus::Pending,
+                },
+            ],
+            risks: vec!["tight timeline".into()],
+            open_questions: vec![],
+        };
+        save_plan(&plan, tmp.path()).unwrap();
+
+        let out = director_tool("plan_status", tmp.path(), json!({}));
+        assert_eq!(out["has_plan"], true);
+        assert_eq!(out["progress"]["done"], 1);
+        assert_eq!(out["progress"]["total"], 2);
+        let steps = out["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["id"], "scaffold");
+        assert_eq!(steps[0]["seat"], "frontend-engineer");
+        assert_eq!(steps[0]["kind"], "build");
+        assert_eq!(steps[0]["acceptance"], "source-present");
+        assert_eq!(steps[0]["status"], "done");
+        assert_eq!(steps[1]["seat"], "backend-engineer");
+        assert_eq!(steps[1]["depends_on"][0], "scaffold");
+        assert_eq!(out["risks"][0], "tight timeline");
+    }
+
+    #[test]
+    fn plan_status_reports_no_plan_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = director_tool("plan_status", tmp.path(), json!({}));
+        assert_eq!(out["has_plan"], false);
+        assert!(out["message"].as_str().unwrap().contains("No plan"));
+    }
+
+    /// A minimal architecture API table the contract parser understands.
+    const ARCH_DOC: &str = "| Method | Path | Request | Response | Auth | Description |
+|---|---|---|---|---|---|
+| GET | /api/users | - | - | none | List users |
+| POST | /api/users | - | - | none | Create a user |
+";
+
+    #[test]
+    fn contract_check_flags_an_undeclared_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(tmp.path().join("output/demo-architecture.md"), ARCH_DOC).unwrap();
+        // A frontend call to an endpoint the contract never declares.
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/api.ts"),
+            "export const load = () => fetch('/api/ghost');",
+        )
+        .unwrap();
+
+        // Slug auto-detected from output/demo-architecture.md.
+        let out = director_tool("contract_check", tmp.path(), json!({}));
+        assert_eq!(out["has_contract"], true);
+        assert_eq!(out["slug"], "demo");
+        assert_eq!(out["aligned"], false);
+        let violations = out["violations"].as_array().unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["kind"], "undeclared_call");
+        assert!(violations[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/api/ghost"));
+    }
+
+    #[test]
+    fn contract_check_aligned_has_no_violations() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(tmp.path().join("output/shop-architecture.md"), ARCH_DOC).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A declared GET call (method unknown → no false MethodMismatch).
+        std::fs::write(
+            tmp.path().join("src/api.ts"),
+            "export const load = () => fetch('/api/users');",
+        )
+        .unwrap();
+
+        // Explicit slug also resolves the doc.
+        let out = director_tool("contract_check", tmp.path(), json!({ "slug": "shop" }));
+        assert_eq!(out["has_contract"], true);
+        assert_eq!(out["aligned"], true);
+        assert_eq!(out["endpoints"], 2);
+        assert!(out["violations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn contract_check_no_doc_is_fail_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = director_tool("contract_check", tmp.path(), json!({}));
+        assert_eq!(out["has_contract"], false);
+        assert!(out["violations"].as_array().unwrap().is_empty());
+    }
+
+    /// Write a single dev-error pitfall into the raw lessons ledger the report
+    /// reader consumes. Only the no-default `Lesson` fields plus the few the
+    /// report surfaces are set; the rest ride their serde defaults.
+    fn seed_pitfall(root: &std::path::Path) {
+        let raw = root.join(".umadev/learned/_raw");
+        std::fs::create_dir_all(&raw).unwrap();
+        let lesson = json!({
+            "kind": "dev_error",
+            "domain": "dependency",
+            "title": "踩坑 [dependency/module-not-found/react-router-dom]: Cannot find module",
+            "body": "During the demo run this error was hit.",
+            "fix": "Run npm i react-router-dom, then restart the dev server.",
+            "root_cause": "react-router-dom was imported but never installed.",
+            "keywords": ["react", "router", "dependency"],
+            "source_requirement": "build a dashboard",
+            "first_seen": "2026-01-01T00:00:00Z",
+            "signature": "dependency/module-not-found/react-router-dom",
+            "occurrences": 3,
+            "context": ["react", "vite", "typescript"],
+        });
+        std::fs::write(
+            raw.join("dev-errors.jsonl"),
+            format!("{}\n", serde_json::to_string(&lesson).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lessons_recall_returns_the_recorded_pitfall() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pitfall(tmp.path());
+
+        // Query matches the signature/fix/title.
+        let out = director_tool("lessons_recall", tmp.path(), json!({ "query": "router" }));
+        assert_eq!(out["has_lessons"], true);
+        assert_eq!(out["efficacy"]["total"], 1);
+        let pits = out["pitfalls"].as_array().unwrap();
+        assert_eq!(pits.len(), 1);
+        assert!(pits[0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("react-router-dom"));
+        assert_eq!(pits[0]["hits"], 3);
+        assert_eq!(pits[0]["status"], "active");
+        assert!(pits[0]["fix"].as_str().unwrap().contains("npm i"));
+
+        // No query → the worst-first top pitfalls still surface.
+        let all = director_tool("lessons_recall", tmp.path(), json!({}));
+        assert_eq!(all["pitfalls"].as_array().unwrap().len(), 1);
+
+        // A query that matches nothing on this (manifest-less → no stack) project
+        // filters the pitfall out — honest empty, not a crash.
+        let none = director_tool(
+            "lessons_recall",
+            tmp.path(),
+            json!({ "query": "kubernetes" }),
+        );
+        assert!(none["pitfalls"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lessons_recall_empty_kb_is_fail_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = director_tool("lessons_recall", tmp.path(), json!({ "query": "anything" }));
+        assert_eq!(out["has_lessons"], false);
+        assert!(out["pitfalls"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn governance_summary_reports_policy_and_audit_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let udir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(udir.join("audit")).unwrap();
+        std::fs::write(
+            udir.join("rules.toml"),
+            "[disabled]\nclauses = [\"UD-ARCH-002\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            udir.join("audit/tool-calls.jsonl"),
+            "{\"tool\":\"Write\",\"decision\":\"allow\"}\n{\"tool\":\"Bash\",\"decision\":\"block\"}\n",
+        )
+        .unwrap();
+
+        let out = director_tool("governance_summary", tmp.path(), json!({}));
+        assert_eq!(out["total_clauses"], umadev_spec::CLAUSES.len());
+        assert!(out["total_clauses"].as_u64().unwrap() > 0);
+        assert_eq!(out["disabled_clauses"][0], "UD-ARCH-002");
+        let tail = out["audit_tail"].as_array().unwrap();
+        assert_eq!(tail.len(), 2);
+        // Oldest-first ordering is preserved.
+        assert_eq!(tail[0]["tool"], "Write");
+        assert_eq!(tail[1]["tool"], "Bash");
+    }
+
+    #[test]
+    fn director_tools_fail_open_on_a_missing_root() {
+        // A non-existent project root must NEVER panic — every director tool
+        // degrades to its empty/"unavailable" shape with isError == false.
+        let missing = std::path::Path::new("/nonexistent/umadev-mcp-xyz");
+        let plan = director_tool("plan_status", missing, json!({}));
+        assert_eq!(plan["has_plan"], false);
+        let contract = director_tool("contract_check", missing, json!({}));
+        assert_eq!(contract["has_contract"], false);
+        let lessons = director_tool("lessons_recall", missing, json!({}));
+        assert_eq!(lessons["has_lessons"], false);
+        // governance_summary still answers (default policy + empty tail).
+        let gov = director_tool("governance_summary", missing, json!({}));
+        assert!(gov["total_clauses"].as_u64().unwrap() > 0);
+        assert!(gov["audit_tail"].as_array().unwrap().is_empty());
+        assert!(gov["disabled_clauses"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_is_a_param_error() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(9)),
+            method: "tools/call".into(),
+            params: json!({ "name": "does_not_exist", "arguments": {} }),
+        };
+        let resp = handle_request(&req, &Policy::default()).unwrap();
+        assert_eq!(resp.error.expect("unknown tool errors").code, -32602);
     }
 }
