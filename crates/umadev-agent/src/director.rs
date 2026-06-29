@@ -2,16 +2,27 @@
 //! own QC pass (the USB / smart-hardware model of
 //! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`, simplified: NO marker protocol).
 //!
-//! In the USB model the base is already a complete Agent — its body builds the goal
-//! end to end with the team living inside its own head, steered by UmaDev's injected
-//! firmware (identity + craft + knowledge). UmaDev does NOT ask the base to speak a
-//! scheduling protocol to "summon a team" from the outside. Instead, these four
-//! functions are **UmaDev's OWN internal Rust capabilities**, called by
-//! [`crate::director_loop`] AFTER the base builds, to read reality and judge it:
+//! UmaDev never asks the base to speak a scheduling protocol to "summon a team" from
+//! the outside — there is NO base-emitted lever syntax. Instead these four functions
+//! are **UmaDev's OWN internal Rust capabilities**, and [`crate::director_loop`]
+//! invokes them in one of two build modes, chosen AUTOMATICALLY from the router's
+//! depth signal (Wave A):
 //!
-//! - [`summon`] — drive/fork ONE seat (kept as a callable capability; the build loop
-//!   itself does not summon seats, but the lever is retained for QC composition and
-//!   any caller that wants a single-seat round-trip).
+//! - **Deliberate build** → UmaDev's own loop drives the plan SEAT-BY-SEAT
+//!   ([`crate::director_loop::drive_plan_steps`]): it [`summon`]s each step's seat
+//!   serially on the main session (single-writer) so the team visibly BUILDS its own
+//!   deliverables, then [`review`]s / [`verify`]s to judge reality.
+//! - **Lean / single-turn build** → the base is already a complete Agent: its body
+//!   builds the goal end to end with the team living inside its own head, steered by
+//!   UmaDev's injected firmware (identity + craft + knowledge), and these functions
+//!   are called AFTER it builds to read reality and judge it.
+//!
+//! - [`summon`] — drive/fork ONE seat. On a DELIBERATE build the director's build loop
+//!   ([`crate::director_loop::drive_plan_steps`]) drives EACH plan step by `summon`ing
+//!   its seat in [`SummonMode::Serial`] on the main session (single-writer) — the
+//!   seat-by-seat "team builds" path (Wave A). On a lean / single-turn build the base
+//!   builds end to end in one turn and the lever is used only for QC composition + any
+//!   caller that wants a single-seat round-trip.
 //! - [`review`] — fork the cross-review team on read-only sessions and collect
 //!   verdicts (UmaDev's QC, NOT the base summoning anyone).
 //! - [`verify`] — read an objective reality fact (source-present / build-test /
@@ -67,8 +78,8 @@
 //! base is already a whole brain that builds multi-role code internally once the
 //! firmware is injected, so making it speak a scheduling protocol to summon a team
 //! from the outside was over-design. These functions remain ONLY as UmaDev's own
-//! internal Rust calls (used by [`crate::director_loop`]'s QC pass); the base never
-//! learns or emits a lever syntax.
+//! internal Rust calls (used by [`crate::director_loop`] to drive a deliberate build
+//! seat-by-seat and to run its QC pass); the base never learns or emits a lever syntax.
 
 use std::sync::Arc;
 

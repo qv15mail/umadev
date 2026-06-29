@@ -801,11 +801,42 @@ async fn synthesize_and_post_plan(
     Some(plan)
 }
 
+/// Internal escape hatch (Wave A safety valve): when `UMADEV_NO_SEAT_BUILD` is
+/// truthy (`1` / `true` / `yes`, case-insensitive) force-disable seat-by-seat
+/// building so even a deliberate build runs the single end-to-end turn. This is NOT a
+/// user-facing flag/mode — there is no CLI surface for it and the DEFAULT is always
+/// router-driven (a deliberate build builds seat-by-seat). It exists only so an
+/// operator can fall back to the cheaper single-turn path in the field if the seat
+/// scheduler ever misbehaves. Read once at the run boundary (not per step), fail-open:
+/// an unset / unparseable value leaves the router-driven default intact.
+fn seat_build_force_disabled() -> bool {
+    std::env::var("UMADEV_NO_SEAT_BUILD")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Whether to drive THIS build SEAT-BY-SEAT (the team builds its own steps via
+/// [`drive_plan_steps`]) versus the single end-to-end turn — the Wave A build-path
+/// decision. It is AUTOMATIC from the existing [`RoutePlan`]: a deliberate build
+/// ([`crate::router::Depth::is_deliberate`] — the router already sized the turn
+/// `Standard` / `Deep`, i.e. a Greenfield product, a high-complexity feature, the full
+/// team convened) warrants seat-by-seat building, while a lean / `Fast` / quick-edit /
+/// docs route stays the cheap single turn so token cost stays proportional to the task.
+/// It REUSES the router's own `depth` signal — no new classifier, no user flag. The
+/// `force_single_turn` escape hatch (see [`seat_build_force_disabled`]) can only
+/// DISABLE seat-driving, never force it on.
+fn seat_driven_build_warranted(route: &RoutePlan, force_single_turn: bool) -> bool {
+    !force_single_turn && route.depth.is_deliberate()
+}
+
 /// [`drive_director_loop`] with an explicit idle window — the env read is hoisted
 /// to the public wrapper so this core is deterministic (the test drives it with a
 /// tiny window, no process-env mutation / race).
 ///
-/// **Wave 2 — depth-tiered scheduling (the "drive the plan" change):**
+/// **Wave A / Wave 2 — depth-tiered scheduling (the "drive the plan" change):**
 ///
 /// - **Deliberate build (`Standard` / `Deep`) WITH an owned plan** → drive the plan
 ///   STEP-BY-STEP via [`director::summon`] ([`drive_plan_steps`]): each ready Build
@@ -829,13 +860,19 @@ async fn drive_director_loop_with_idle(
     idle: IdleBudget,
     deadline: std::time::Instant,
 ) -> DirectorLoopOutcome {
-    // Wave 2: a DELIBERATE build with an owned plan is driven step-by-step (summon
-    // per step + per-step acceptance + real checklist ticking). A lean/Fast build —
-    // or any path with no plan — keeps the single-turn fast loop below, untouched.
-    // Fail-open: `drive_plan_steps` returns `None` if it couldn't drive even the
-    // first step (the caller then runs the single-turn loop, never losing the build).
+    // Wave A: the build-path decision is AUTOMATIC from the route (no user flag). A
+    // DELIBERATE build with an owned plan is driven step-by-step — each ready step is
+    // `summon`ed on its seat (single-writer doer), verified against its own acceptance
+    // on the deterministic floor, and only then ticked Done, so the TEAM visibly
+    // BUILDS rather than the base doing it all in one turn the team merely reviews
+    // after. A lean/Fast build — or any path with no plan — keeps the single-turn fast
+    // loop below, untouched (token cost proportional to the task). The escape hatch
+    // (`UMADEV_NO_SEAT_BUILD`) can only force the cheaper single turn, never force
+    // seat-driving on. Fail-open: `drive_plan_steps` returns `None` if it couldn't
+    // drive even the first step (the caller then runs the single-turn loop, never
+    // losing the build).
     if let (Some(r), Some(p)) = (route, plan.as_mut()) {
-        if r.depth.is_deliberate() {
+        if seat_driven_build_warranted(r, seat_build_force_disabled()) {
             if let Some(outcome) =
                 drive_plan_steps(session, options, events, r, p, idle, deadline).await
             {
@@ -4458,6 +4495,35 @@ mod tests {
         if let Some(v) = prior {
             std::env::set_var("UMADEV_RUN_BUDGET_SECS", v);
         }
+    }
+
+    #[test]
+    fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
+        // Wave A: the build-path decision is AUTOMATIC from the route (no user flag,
+        // no new classifier — it reuses the router's own `depth` signal). A DELIBERATE
+        // full build (Greenfield → Standard) builds SEAT-BY-SEAT; a lean/Fast build
+        // stays the single end-to-end turn so token cost stays proportional.
+        let deliberate = build_route(); // Greenfield / Standard (deliberate)
+        let lean = fast_build_route(); // Light / Fast (not deliberate)
+        assert!(
+            seat_driven_build_warranted(&deliberate, false),
+            "a deliberate full build warrants seat-by-seat building"
+        );
+        assert!(
+            !seat_driven_build_warranted(&lean, false),
+            "a lean/Fast build stays single-turn (no per-step scheduling)"
+        );
+        // The escape hatch can only DISABLE seat-driving (force the cheaper single
+        // turn); it can NEVER force seat-driving on, and it leaves the lean default
+        // exactly where it was — the default remains router-driven.
+        assert!(
+            !seat_driven_build_warranted(&deliberate, true),
+            "the escape hatch forces even a deliberate build back to a single turn"
+        );
+        assert!(
+            !seat_driven_build_warranted(&lean, true),
+            "the escape hatch never turns a lean build into a seat-driven one"
+        );
     }
 
     #[tokio::test]
