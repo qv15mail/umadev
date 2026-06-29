@@ -1233,12 +1233,127 @@ fn push_range(ranges: &mut WordRanges, start: usize, end: usize) {
     ranges.push((start, end));
 }
 
-/// True when every char of `needle` appears in `haystack` in order (a fuzzy
-/// subsequence match, case-sensitive — callers lowercase first). Powers the
-/// slash-command palette's fuzzy filter (`dpl` → `deploy`).
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut hay = haystack.chars();
-    needle.chars().all(|nc| hay.any(|hc| hc == nc))
+// ── I8 — fzf-style positional fuzzy scorer ──────────────────────────────────
+// A dependency-free positional/boundary scorer shared by the `@`-mention
+// typeahead and the slash-command palette. It replaces the old 3-tier
+// subsequence rank: a boundary / path match (`@src/main.rs` → `src/main.rs`)
+// now outranks an incidental subsequence hit, and an exact / prefix command
+// still sorts first (the callers keep an explicit exact→prefix→fuzzy tier on
+// top of the score). Matching is case-insensitive (ASCII-folded so char indices
+// stay 1:1 and camelCase boundaries in the ORIGINAL case survive), and the
+// greedy earliest-match scan doubles as the subsequence existence test.
+
+/// Reward per matched char (the floor every hit contributes).
+const FZ_MATCH: i32 = 16;
+/// Bonus for a match at a word boundary (string start, after a `/._- ` / `\`
+/// separator, or a camelCase lower→upper transition).
+const FZ_BONUS_BOUNDARY: i32 = 18;
+/// Bonus for a match adjacent to the previous matched char that does NOT itself
+/// start at a boundary — the floor a contiguous run earns. A run that STARTED at
+/// a boundary instead inherits the (larger) boundary bonus for its whole length,
+/// so `main` matched contiguously at `src/main.rs` beats the same chars buried
+/// mid-word (fzf's "consecutive inherits the run-start bonus" rule).
+const FZ_BONUS_CONSECUTIVE: i32 = 14;
+/// Extra nudge when the very first haystack char is the first match (a true
+/// prefix start), on top of its boundary bonus.
+const FZ_BONUS_FIRST: i32 = 8;
+/// Penalty for opening a gap (the first skipped char between two matches).
+const FZ_GAP_START: i32 = 3;
+/// Penalty per additional skipped char inside a gap.
+const FZ_GAP_EXT: i32 = 1;
+/// Penalty per skipped char before the first match (a long leading skip is
+/// worse than a hit near the start), capped by [`FZ_MAX_LEAD`].
+const FZ_PENALTY_LEADING: i32 = 1;
+/// Cap on the leading-skip penalty so one very deep path can't dominate.
+const FZ_MAX_LEAD: i32 = 12;
+/// Cap on a single gap's penalty so one long gap can't dominate.
+const FZ_MAX_GAP_PENALTY: i32 = 12;
+
+/// True when `cur` (at `pos`) starts a new "word" in `hay`: the string start,
+/// just after a path/word separator, or a camelCase lower→upper transition.
+/// `hay` is the ORIGINAL-case char slice so the camelCase signal survives.
+fn fz_is_boundary(hay: &[char], pos: usize) -> bool {
+    if pos == 0 {
+        return true;
+    }
+    let prev = hay[pos - 1];
+    if matches!(prev, '/' | '\\' | '_' | '-' | '.' | ' ') {
+        return true;
+    }
+    // camelCase / PascalCase word start: a non-uppercase char followed by an
+    // uppercase one (`mainComponent` → the `C`).
+    !prev.is_uppercase() && hay[pos].is_uppercase()
+}
+
+/// fzf-style positional fuzzy score: `Some(score)` when every char of `needle`
+/// appears in `haystack` in order (higher = better), `None` when `needle` is
+/// not a subsequence. Case-insensitive (ASCII fold). An empty needle scores `0`
+/// (callers short-circuit the empty query before ranking). Rewards
+/// word-boundary / camelCase / consecutive-char hits, penalizes gaps + a long
+/// leading skip, and applies a mild shorter-haystack bonus so a tight match on a
+/// short path outranks a loose one on a long path.
+fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    let nq: Vec<char> = needle.chars().map(|c| c.to_ascii_lowercase()).collect();
+    if nq.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    if hay.len() < nq.len() {
+        return None;
+    }
+    // Bitmap-style pre-reject: every query char must be present at all (a cheap
+    // set membership) before the ordered scan.
+    let present: std::collections::HashSet<char> =
+        hay.iter().map(char::to_ascii_lowercase).collect();
+    if !nq.iter().all(|c| present.contains(c)) {
+        return None;
+    }
+    let mut score: i32 = 0;
+    let mut cursor = 0usize; // next haystack index to search from
+    let mut prev_match: Option<usize> = None;
+    // The positional bonus the PREVIOUS matched char earned, so a consecutive run
+    // can inherit a strong run-start (boundary) bonus across its whole length.
+    let mut prev_bonus: i32 = 0;
+    for &nc in &nq {
+        // Earliest match at-or-after the cursor. Earliest-match greedy is a
+        // COMPLETE subsequence test, so a `None` here is an authoritative miss.
+        let pos = (cursor..hay.len()).find(|&j| hay[j].to_ascii_lowercase() == nc)?;
+        let boundary = fz_is_boundary(&hay, pos);
+        let consecutive = matches!(prev_match, Some(p) if pos == p + 1);
+        // The per-char bonus: a boundary always wins; otherwise a consecutive
+        // char inherits the run-start bonus (≥ the bare consecutive floor); an
+        // isolated interior char earns nothing.
+        let bonus = if boundary {
+            FZ_BONUS_BOUNDARY + i32::from(pos == 0) * FZ_BONUS_FIRST
+        } else if consecutive {
+            prev_bonus.max(FZ_BONUS_CONSECUTIVE)
+        } else {
+            0
+        };
+        score += FZ_MATCH + bonus;
+        match prev_match {
+            // A gap between this match and the previous one: a start penalty plus
+            // a per-extra-char extension, capped so one long gap can't dominate.
+            Some(p) if !consecutive => {
+                let skipped = i32::try_from(pos - p - 1).unwrap_or(FZ_MAX_GAP_PENALTY);
+                let gap = FZ_GAP_START + (skipped - 1).max(0) * FZ_GAP_EXT;
+                score -= gap.min(FZ_MAX_GAP_PENALTY);
+            }
+            // Leading skip before the first match (capped).
+            None if pos > 0 => {
+                let lead = i32::try_from(pos).unwrap_or(FZ_MAX_LEAD);
+                score -= lead.min(FZ_MAX_LEAD) * FZ_PENALTY_LEADING;
+            }
+            _ => {}
+        }
+        prev_match = Some(pos);
+        prev_bonus = bonus;
+        cursor = pos + 1;
+    }
+    // Shorter-path bonus: a mild length penalty so a tight match on a short
+    // candidate edges out the same match buried in a longer one.
+    score -= i32::try_from(hay.len()).unwrap_or(0) / 4;
+    Some(score)
 }
 
 /// True for a char allowed inside an `@`-file-mention token (`[\w./-]`, plus any
@@ -1542,6 +1657,28 @@ pub struct SearchMatch {
     pub start: usize,
     /// One-past-the-last char (exclusive) of the match.
     pub end: usize,
+}
+
+/// State for the **reverse prompt-history search** (I3 — Ctrl+R): a modal,
+/// incremental substring find over the deduplicated submitted-prompt ring,
+/// newest-first, with a live preview of the focused entry. Distinct from the
+/// transcript [`SearchState`] (Ctrl+F): this searches what the user *typed*, not
+/// what's on screen. Enter loads the focused match into the input box; Esc
+/// cancels without touching the prompt.
+#[derive(Debug, Clone, Default)]
+pub struct HistorySearchState {
+    /// The live query — matched case-insensitively as a substring of each entry.
+    pub query: String,
+    /// Deduplicated prompt-history snapshot taken when the mode opened, NEWEST
+    /// FIRST (the order matches step through, oldest last). Repeated prompts
+    /// appear once, at their most-recent position.
+    pub entries: Vec<String>,
+    /// Indices into [`Self::entries`] that match the current query, newest-first.
+    /// Recomputed on every query edit; an empty query matches everything.
+    pub matches: Vec<usize>,
+    /// Index into [`Self::matches`] of the focused entry (the live preview / the
+    /// one Enter loads). `0` when there are no matches.
+    pub current: usize,
 }
 
 /// The whole TUI state.
@@ -1962,6 +2099,13 @@ pub struct App {
     /// with the slash palette, the `@`-mention popover, history recall, or an
     /// overlay (each of those is checked/skipped while search owns the input).
     pub search: Option<SearchState>,
+    /// **I3 — reverse prompt-history search.** `Some` while the Ctrl+R history
+    /// search owns the input. Its own modal mode: the chat key handler routes
+    /// EVERY keystroke to [`Self::history_search_key`] while this is `Some`, so it
+    /// never collides with the transcript search, the slash palette, the
+    /// `@`-mention popover, or `↑↓` history recall (each is skipped while it owns
+    /// the keyboard). `None` when closed.
+    pub history_search: Option<HistorySearchState>,
     /// Handle to a running dev-server subprocess spawned by `/preview`, so we
     /// can kill it on `/stop-preview` or quit. `None` when no preview is live.
     pub preview_server: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
@@ -2306,6 +2450,7 @@ impl App {
             help_scroll: 0,
             overlay: None,
             search: None,
+            history_search: None,
             preview_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             project_root,
             pending_quit_confirm: false,
@@ -4524,39 +4669,66 @@ impl App {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        // Match by SUBSEQUENCE (every typed char appears in order) so a fuzzy stub
-        // like `/dpl` finds `/deploy`, not just a literal prefix — but only once ≥2
-        // chars are typed, so a single `/r` doesn't explode into every verb that
-        // merely contains an 'r'. Prefix matches still rank first (stable sort).
+        // I8 — rank each verb by an explicit exact→prefix→fuzzy tier, with the
+        // fzf positional score as the WITHIN-tier order (`/dpl` → `deploy`). A
+        // loose tier-2 fuzzy hit only kicks in at ≥2 typed chars, so a single
+        // `/r` doesn't explode into every verb that merely contains an 'r'; an
+        // exact/prefix command always sorts first.
         let fuzzy = typed.chars().count() >= 2;
-        let hit = |verb: &str| {
-            verb.starts_with(typed.as_str()) || (fuzzy && is_subsequence(&typed, verb))
+        let rank = |verb: &str| -> Option<(u8, i32)> {
+            let tier = if verb == typed {
+                0u8
+            } else if verb.starts_with(typed.as_str()) {
+                1
+            } else {
+                2
+            };
+            if tier == 2 && !fuzzy {
+                return None;
+            }
+            // The fzf score doubles as the subsequence existence test (None → no
+            // match); prefix/exact tiers are always a subsequence, so they pass.
+            fuzzy_score(&typed, verb).map(|s| (tier, s))
         };
-        let mut out: Vec<PaletteEntry> = Self::COMMANDS
+        let mut out: Vec<(u8, i32, PaletteEntry)> = Self::COMMANDS
             .iter()
-            .filter(|c| !c.hidden && hit(c.name))
-            .map(|c| PaletteEntry {
-                verb: c.name,
-                desc: umadev_i18n::t(self.lang, c.desc_key),
-                arg_hint: c.arg_hint,
+            .filter(|c| !c.hidden)
+            .filter_map(|c| {
+                rank(c.name).map(|(t, s)| {
+                    (
+                        t,
+                        s,
+                        PaletteEntry {
+                            verb: c.name,
+                            desc: umadev_i18n::t(self.lang, c.desc_key),
+                            arg_hint: c.arg_hint,
+                        },
+                    )
+                })
             })
             .collect();
         // Skip ids already covered by the registry (the three first-class
         // base CLIs) to avoid duplicate palette rows.
-        let known: std::collections::HashSet<&str> = out.iter().map(|p| p.verb).collect();
+        let known: std::collections::HashSet<&str> = out.iter().map(|(_, _, p)| p.verb).collect();
         for (id, hint) in backend_palette_verbs() {
-            if !known.contains(id) && hit(id) {
-                out.push(PaletteEntry {
-                    verb: id,
-                    desc: hint,
-                    arg_hint: None,
-                });
+            if !known.contains(id) {
+                if let Some((t, s)) = rank(id) {
+                    out.push((
+                        t,
+                        s,
+                        PaletteEntry {
+                            verb: id,
+                            desc: hint,
+                            arg_hint: None,
+                        },
+                    ));
+                }
             }
         }
-        // Prefix matches before looser subsequence matches (stable sort preserves
-        // the canonical verb order within each tier).
-        out.sort_by_key(|p| !p.verb.starts_with(typed.as_str()));
-        out
+        // Tier ascending (exact → prefix → fuzzy), then fzf score DESCENDING; a
+        // stable sort keeps the canonical verb order within an equal (tier, score).
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        out.into_iter().map(|(_, _, p)| p).collect()
     }
 
     /// Replace the input with `/{verb} ` (with trailing space so the
@@ -4697,28 +4869,41 @@ impl App {
         // Subsequence (fuzzy) only kicks in at ≥2 typed chars, so a lone `@a`
         // doesn't explode into every path containing an 'a' (mirrors the palette).
         let fuzzy = p.chars().count() >= 2;
-        let mut ranked: Vec<(u8, &String)> = Vec::new();
+        // I8 — keep the basename-prefix → path-prefix → fuzzy tier, but order
+        // WITHIN a tier by the fzf positional score (computed over the
+        // ORIGINAL-case basename / path so camelCase boundaries survive). So
+        // `@src/main.rs` ranks `src/main.rs` above an incidental subsequence hit.
+        let mut ranked: Vec<(u8, std::cmp::Reverse<i32>, &String)> = Vec::new();
         for f in files {
+            let base = f.rsplit('/').next().unwrap_or(f);
             let path_l = f.to_lowercase();
-            let base_l = f.rsplit('/').next().unwrap_or(f).to_lowercase();
-            // Rank: basename prefix (best) → path prefix → fuzzy subsequence.
-            let rank = if p.is_empty() || base_l.starts_with(&p) {
-                0
+            let base_l = base.to_lowercase();
+            let (tier, score) = if p.is_empty() {
+                (0u8, 0)
+            } else if base_l.starts_with(&p) {
+                (0, fuzzy_score(&partial, base).unwrap_or(0))
             } else if path_l.starts_with(&p) {
-                1
-            } else if fuzzy && (is_subsequence(&p, &base_l) || is_subsequence(&p, &path_l)) {
-                2
+                (1, fuzzy_score(&partial, f).unwrap_or(0))
+            } else if fuzzy {
+                // Score the basename first (the part a user usually targets),
+                // falling back to the full path; the fzf score is the subsequence
+                // test too, so a `None` on both is a real miss.
+                match fuzzy_score(&partial, base).or_else(|| fuzzy_score(&partial, f)) {
+                    Some(s) => (2, s),
+                    None => continue,
+                }
             } else {
                 continue;
             };
-            ranked.push((rank, f));
+            ranked.push((tier, std::cmp::Reverse(score), f));
         }
-        // Stable sort → alphabetical order preserved within each rank tier.
-        ranked.sort_by_key(|(rank, _)| *rank);
+        // Tier ascending, then fzf score descending; a stable sort keeps the
+        // alphabetical file order within an equal (tier, score).
+        ranked.sort_by_key(|(tier, score, _)| (*tier, *score));
         ranked
             .into_iter()
             .take(MENTION_MATCH_CAP)
-            .map(|(_, f)| f.clone())
+            .map(|(_, _, f)| f.clone())
             .collect()
     }
 
@@ -5913,6 +6098,13 @@ impl App {
         if self.search.is_some() {
             return self.search_key(key, mods);
         }
+        // I3 — reverse prompt-history search (Ctrl+R) is likewise its own modal
+        // mode: while open it owns EVERY keystroke (typing narrows; Enter loads;
+        // Ctrl+R/↑/↓ cycle; Esc cancels), mutually exclusive with the transcript
+        // search, the slash palette, the @-mention popover, and `↑↓` recall.
+        if self.history_search.is_some() {
+            return self.history_search_key(key, mods);
+        }
         if self.show_help {
             match key {
                 KeyCode::Esc => {
@@ -6379,12 +6571,20 @@ impl App {
                 self.open_search();
                 Action::None
             }
-            // Ctrl+R toggles the fold of the most recent collapsible row (a long
-            // Host/UmaDev text wall, or a finished tool row's result) — the
-            // "fold just the latest" lever, secondary to the global Ctrl+O. No-op
-            // when nothing is foldable.
+            // Ctrl+R is dual-purpose, disambiguated by transcript state so neither
+            // gesture clobbers the other:
+            //  • a foldable row in view → toggle its fold (the "fold just the
+            //    latest" lever, secondary to the global Ctrl+O); else
+            //  • nothing foldable → open the reverse prompt-history search (I3 —
+            //    the readline reverse-i-search convention).
+            // Suppressed entirely while the @-mention / slash palette own keys, so
+            // a Ctrl+R over `/run …` or `@src` doesn't steal their input.
             KeyCode::Char('r') if ctrl => {
-                self.toggle_last_collapsible();
+                if self.has_foldable() {
+                    self.toggle_last_collapsible();
+                } else if !has_mention && !has_palette {
+                    self.open_history_search();
+                }
                 Action::None
             }
             // Ctrl+L: force a full repaint (shell / Claude-Code convention). The
@@ -11049,6 +11249,188 @@ impl App {
             // search). Shift is allowed (uppercase chars).
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.search_input_char(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    // ── I3 — reverse prompt-history search (Ctrl+R) ─────────────────────────
+    // A modal incremental find over the submitted-prompt ring (what the user
+    // TYPED), distinct from the Ctrl+F transcript search (what's on screen).
+    // Newest-first, deduplicated, with a live preview; Enter loads the focused
+    // match into the input box for re-editing / resubmission, Esc cancels.
+
+    /// True when at least one transcript row is long enough to fold — drives the
+    /// Ctrl+R "fold the latest vs. open history search" disambiguation. Mirrors
+    /// [`Self::toggle_last_collapsible`]'s scan.
+    #[must_use]
+    fn has_foldable(&self) -> bool {
+        self.history.iter().any(message_is_collapsible)
+    }
+
+    /// Open the reverse prompt-history search (Ctrl+R). Snapshots the submitted-
+    /// prompt ring deduplicated + newest-first and starts with an empty query
+    /// (which matches everything, previewing the most-recent entry). No-op
+    /// (fail-open) when there is no history to search. Drops any in-flight drag
+    /// selection so the two highlight layers don't fight over the transcript.
+    pub fn open_history_search(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        // Dedup newest-first: walk the ring back-to-front, keeping the FIRST
+        // sighting of each distinct prompt (so a repeated command shows once, at
+        // its most-recent position).
+        let mut seen = std::collections::HashSet::new();
+        let mut entries: Vec<String> = Vec::new();
+        for e in self.input_history.iter().rev() {
+            if seen.insert(e.as_str()) {
+                entries.push(e.clone());
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let mut st = HistorySearchState {
+            entries,
+            ..HistorySearchState::default()
+        };
+        Self::recompute_history_matches(&mut st);
+        self.selection = None;
+        self.history_search = Some(st);
+    }
+
+    /// Close the reverse-history search (Esc / after an accept). Leaves the input
+    /// box untouched — the accept path loads the match first, then closes.
+    pub fn close_history_search(&mut self) {
+        self.history_search = None;
+    }
+
+    /// Refill `st.matches` with the indices of `st.entries` whose text contains
+    /// the query (case-insensitive substring). The empty query matches
+    /// everything; `current` is re-clamped so it never points past the end.
+    /// Fail-open (a static helper, so callers avoid a double mutable borrow).
+    fn recompute_history_matches(st: &mut HistorySearchState) {
+        let q = st.query.to_lowercase();
+        st.matches = st
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| q.is_empty() || e.to_lowercase().contains(q.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        if st.current >= st.matches.len() {
+            st.current = 0;
+        }
+    }
+
+    /// Append a char to the query, rescan, and re-anchor on the newest match.
+    fn history_search_input_char(&mut self, c: char) {
+        if let Some(st) = self.history_search.as_mut() {
+            st.query.push(c);
+            st.current = 0;
+            Self::recompute_history_matches(st);
+        }
+    }
+
+    /// Delete the last query char, rescan, and re-anchor on the newest match.
+    fn history_search_backspace(&mut self) {
+        if let Some(st) = self.history_search.as_mut() {
+            st.query.pop();
+            st.current = 0;
+            Self::recompute_history_matches(st);
+        }
+    }
+
+    /// Step to an OLDER match (Ctrl+R / ↓ / Ctrl+N), wrapping past the oldest.
+    /// No-op when there are no matches.
+    pub fn history_search_older(&mut self) {
+        if let Some(st) = self.history_search.as_mut() {
+            if !st.matches.is_empty() {
+                st.current = (st.current + 1) % st.matches.len();
+            }
+        }
+    }
+
+    /// Step to a NEWER match (↑ / Ctrl+P), wrapping past the newest. No-op when
+    /// there are no matches.
+    pub fn history_search_newer(&mut self) {
+        if let Some(st) = self.history_search.as_mut() {
+            if !st.matches.is_empty() {
+                let n = st.matches.len();
+                st.current = (st.current + n - 1) % n;
+            }
+        }
+    }
+
+    /// The currently-previewed history entry, if any (the focused match's text) —
+    /// what the live in-box preview shows and what Enter would load.
+    #[must_use]
+    pub fn history_search_preview(&self) -> Option<&str> {
+        let st = self.history_search.as_ref()?;
+        let idx = *st.matches.get(st.current)?;
+        st.entries.get(idx).map(String::as_str)
+    }
+
+    /// Accept the focused match (Enter): load it into the input box for editing /
+    /// resubmission and close the overlay. When nothing matches it just closes
+    /// (the prompt is left as-is). Resets the `↑↓` recall cursor + popover
+    /// highlights so the loaded text re-evaluates cleanly.
+    pub fn history_search_accept(&mut self) {
+        if let Some(text) = self.history_search_preview().map(str::to_string) {
+            self.input = text;
+            self.input_cursor = self.input_len();
+            self.input_history_idx = None;
+            self.palette_selected = 0;
+            self.mention_selected = 0;
+        }
+        self.close_history_search();
+    }
+
+    /// Key handler while the reverse prompt-history search is open (I3 — a
+    /// mutually-exclusive mode routed here from the top of [`Self::chat_key`]
+    /// before the palette / mention / recall paths). Esc cancels (prompt
+    /// untouched); Enter loads the focused match; Ctrl+R / ↓ / Ctrl+N step to an
+    /// older match, ↑ / Ctrl+P to a newer one; Backspace edits; any other
+    /// printable char narrows live. Everything else is swallowed (it owns the
+    /// keyboard).
+    fn history_search_key(&mut self, key: KeyCode, mods: crossterm::event::KeyModifiers) -> Action {
+        let ctrl = mods.contains(crossterm::event::KeyModifiers::CONTROL);
+        let alt = mods.contains(crossterm::event::KeyModifiers::ALT);
+        match key {
+            KeyCode::Esc => {
+                self.close_history_search();
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.history_search_accept();
+                Action::None
+            }
+            KeyCode::Down => {
+                self.history_search_older();
+                Action::None
+            }
+            KeyCode::Up => {
+                self.history_search_newer();
+                Action::None
+            }
+            // Repeated Ctrl+R steps to an older match (readline convention);
+            // Ctrl+N mirrors ↓. `r`/`n` still TYPE into the query (they're only
+            // navigation WITH Ctrl), so a query can contain them.
+            KeyCode::Char('r' | 'n') if ctrl => {
+                self.history_search_older();
+                Action::None
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.history_search_newer();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.history_search_backspace();
+                Action::None
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.history_search_input_char(c);
                 Action::None
             }
             _ => Action::None,
@@ -16504,6 +16886,86 @@ mod tests {
         assert_eq!(a.mention_selected, 1, "↓ moved the mention highlight");
     }
 
+    // ---- I8 — fzf-style positional fuzzy scorer ----
+
+    #[test]
+    fn fuzzy_score_ranks_boundary_path_above_incidental_subsequence() {
+        // `main` matched contiguously at a path boundary (`src/main.rs`) must
+        // outscore the same chars buried mid-word (`domain_libs.rs` — d-o-MAIN).
+        let boundary = fuzzy_score("main", "src/main.rs").expect("boundary match");
+        let incidental = fuzzy_score("main", "domain_libs.rs").expect("incidental match");
+        assert!(
+            boundary > incidental,
+            "boundary/path match ({boundary}) should beat incidental subsequence ({incidental})"
+        );
+    }
+
+    #[test]
+    fn fuzzy_score_rejects_non_subsequence_and_no_ops_empty_query() {
+        // Not a subsequence → None (the scan is also the existence test).
+        assert!(fuzzy_score("xyz", "src/main.rs").is_none());
+        assert!(fuzzy_score("nima", "src/main.rs").is_none()); // out of order
+                                                               // Empty query is a ranking no-op (callers short-circuit it).
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+        // Case-insensitive (ASCII fold).
+        assert!(fuzzy_score("MAIN", "src/main.rs").is_some());
+    }
+
+    #[test]
+    fn palette_ranks_exact_command_first() {
+        // An exact verb sorts ahead of looser fuzzy hits (tier wins over score).
+        let mut a = fresh_app(Some("offline"));
+        for c in "/clear".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let m = a.palette_matches();
+        assert_eq!(
+            m.first().map(|p| p.verb),
+            Some("clear"),
+            "exact `/clear` ranks first, got {:?}",
+            m.iter().map(|p| p.verb).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn palette_prefix_outranks_fuzzy() {
+        // `/cla` → `claude` is a prefix (tier 1); `clear` is only a fuzzy hit
+        // (c-l-e-A-r, tier 2). The prefix must rank first regardless of score.
+        let mut a = fresh_app(Some("offline"));
+        for c in "/cla".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let verbs: Vec<&str> = a.palette_matches().iter().map(|p| p.verb).collect();
+        let pc = verbs.iter().position(|v| *v == "claude");
+        let pl = verbs.iter().position(|v| *v == "clear");
+        assert_eq!(pc, Some(0), "prefix `claude` is first, got {verbs:?}");
+        if let (Some(pc), Some(pl)) = (pc, pl) {
+            assert!(pc < pl, "prefix outranks fuzzy: {verbs:?}");
+        }
+    }
+
+    #[test]
+    fn mention_fuzzy_ranks_path_match_above_incidental_hit() {
+        let mut a = fresh_app(Some("offline"));
+        let root = a.project_root.clone();
+        let _ = std::fs::create_dir_all(root.join("src"));
+        let _ = std::fs::write(root.join("src/main.rs"), "");
+        let _ = std::fs::write(root.join("domain_libs.rs"), "");
+        for c in "@main".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let m = a.mention_matches();
+        let pos_main = m.iter().position(|p| p == "src/main.rs");
+        let pos_dom = m.iter().position(|p| p == "domain_libs.rs");
+        assert!(pos_main.is_some(), "src/main.rs is a candidate: {m:?}");
+        if let (Some(pm), Some(pd)) = (pos_main, pos_dom) {
+            assert!(
+                pm < pd,
+                "the path/boundary match ranks above the incidental hit: {m:?}"
+            );
+        }
+    }
+
     #[test]
     fn arrow_up_with_input_not_in_palette_recalls_history() {
         let mut a = fresh_app(Some("offline"));
@@ -18491,11 +18953,153 @@ mod tests {
     fn ctrl_r_is_a_noop_when_nothing_is_foldable() {
         let mut a = fresh_app(Some("offline"));
         a.push(ChatRole::Host, "short");
+        a.input_history.clear(); // no prompt history to search either
         let before = a.clone();
         let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        // No foldable row → history unchanged (fail-open).
+        // Nothing foldable AND no prompt history → Ctrl+R stays a no-op
+        // (fail-open): no fold, and no history-search mode opens.
         assert_eq!(a.history.len(), before.history.len());
         assert!(!a.history.back().unwrap().collapsed);
+        assert!(
+            a.history_search.is_none(),
+            "no history → no reverse-search mode"
+        );
+    }
+
+    // ---- I3 — reverse prompt-history search (Ctrl+R) ----
+
+    /// Seed the prompt-history ring directly (front→back == oldest→newest) and
+    /// drop any transcript rows so nothing is foldable — the state in which
+    /// Ctrl+R opens the reverse history search.
+    fn seed_history(a: &mut App, prompts: &[&str]) {
+        a.history.clear();
+        a.input_history.clear();
+        for p in prompts {
+            a.input_history.push_back((*p).to_string());
+        }
+    }
+
+    #[test]
+    fn ctrl_r_opens_history_search_finds_and_cycles() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["alpha one", "beta two", "alpha three"]);
+        // Ctrl+R opens the reverse history search (nothing foldable in view).
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(
+            a.history_search.is_some(),
+            "Ctrl+R opened reverse history search"
+        );
+        // Empty query previews the NEWEST entry.
+        assert_eq!(a.history_search_preview(), Some("alpha three"));
+        // Typing narrows to the matching entries, newest-first.
+        for c in "alpha".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(
+            a.history_search_preview(),
+            Some("alpha three"),
+            "newest 'alpha' match is previewed"
+        );
+        // ↓ steps to the OLDER match; wraps back to the newest.
+        let _ = a.apply_key(KeyCode::Down);
+        assert_eq!(
+            a.history_search_preview(),
+            Some("alpha one"),
+            "cycled older"
+        );
+        let _ = a.apply_key(KeyCode::Down);
+        assert_eq!(
+            a.history_search_preview(),
+            Some("alpha three"),
+            "wrapped to newest"
+        );
+        // Ctrl+R inside the mode also cycles older (readline convention).
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(
+            a.history_search_preview(),
+            Some("alpha one"),
+            "Ctrl+R cycled older"
+        );
+    }
+
+    #[test]
+    fn history_search_enter_loads_match_into_input() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["fix the bug", "add a feature"]);
+        a.open_history_search();
+        for c in "bug".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.history_search_preview(), Some("fix the bug"));
+        let _ = a.apply_key(KeyCode::Enter);
+        assert!(a.history_search.is_none(), "Enter closed the mode");
+        assert_eq!(
+            a.input, "fix the bug",
+            "Enter loaded the match into the input box"
+        );
+        assert_eq!(a.input_cursor, a.input_len(), "caret lands at the end");
+    }
+
+    #[test]
+    fn history_search_esc_cancels_without_touching_input() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["an old prompt"]);
+        a.input = "draft".to_string();
+        a.input_cursor = a.input_len();
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(a.history_search.is_some(), "opened over a non-empty draft");
+        let _ = a.apply_key(KeyCode::Esc);
+        assert!(a.history_search.is_none(), "Esc closed the mode");
+        assert_eq!(a.input, "draft", "Esc left the prompt untouched");
+    }
+
+    #[test]
+    fn history_search_dedups_repeated_entries() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["run tests", "run tests", "deploy", "run tests"]);
+        a.open_history_search();
+        let entries = &a.history_search.as_ref().unwrap().entries;
+        // Deduped + newest-first: one "run tests" (its most-recent position), then
+        // "deploy".
+        assert_eq!(
+            entries,
+            &vec!["run tests".to_string(), "deploy".to_string()],
+            "repeated entries collapse to one, newest-first: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn history_search_does_not_open_while_palette_owns_keys() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["past prompt"]);
+        // Type a slash command so the palette owns the keyboard.
+        for c in "/cl".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert!(!a.palette_matches().is_empty(), "palette is active");
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(
+            a.history_search.is_none(),
+            "Ctrl+R suppressed while the palette owns keys"
+        );
+    }
+
+    #[test]
+    fn history_search_owns_keys_so_other_modes_cannot_open() {
+        // Once open, the mode is mutually exclusive: a Ctrl+F that would normally
+        // open the transcript search is swallowed (typing/nav only).
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["something"]);
+        a.open_history_search();
+        let _ = a.apply_key_with_mods(KeyCode::Char('f'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(
+            a.search.is_none(),
+            "transcript search did not open under history search"
+        );
+        assert!(
+            a.history_search.is_some(),
+            "history search still owns the keyboard"
+        );
     }
 
     #[test]

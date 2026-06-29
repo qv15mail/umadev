@@ -699,6 +699,9 @@
 "tui.search.count" = "第 {}/{} 處符合"
 "tui.search.none" = "無符合"
 "tui.hint.search" = "輸入過濾 · Enter/↓ 下一個 · ↑ 上一個 · Esc 關閉"
+# 歷史命令反向搜尋（Ctrl+R）：提示標籤，以及增量搜尋佔用輸入時的操作提示。
+"tui.histsearch.prompt" = "歷史:"
+"tui.hint.histsearch" = "輸入過濾 · Enter 載入 · Ctrl+R/↓ 更早 · ↑ 更新 · Esc 取消"
 # 狀態列
 "tui.status.complete" = "[ok] 已完成"
 # 中繼資訊列的常駐 token / 成本計量(Feature A)。{} 是精簡 token 數;成本為統一估算

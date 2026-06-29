@@ -699,6 +699,9 @@
 "tui.search.count" = "第 {}/{} 处匹配"
 "tui.search.none" = "无匹配"
 "tui.hint.search" = "输入过滤 · Enter/↓ 下一个 · ↑ 上一个 · Esc 关闭"
+# 历史命令反向搜索（Ctrl+R）：提示标签，以及增量搜索占用输入时的操作提示。
+"tui.histsearch.prompt" = "历史:"
+"tui.hint.histsearch" = "输入过滤 · Enter 载入 · Ctrl+R/↓ 更早 · ↑ 更新 · Esc 取消"
 # 状态栏
 "tui.status.complete" = "[ok] 已完成"
 # 元信息行的常驻 token / 成本计量(Feature A)。{} 是紧凑 token 数;成本为统一估算

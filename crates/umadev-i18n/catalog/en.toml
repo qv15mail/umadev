@@ -705,6 +705,10 @@
 "tui.search.count" = "{}/{} matches"
 "tui.search.none" = "no matches"
 "tui.hint.search" = "type to filter · Enter/↓ next · ↑ prev · Esc close"
+# Reverse prompt-history search (Ctrl+R): the prompt label + the operation hint
+# shown while the incremental history search owns the input.
+"tui.histsearch.prompt" = "history:"
+"tui.hint.histsearch" = "type to filter · Enter load · Ctrl+R/↓ older · ↑ newer · Esc cancel"
 # Status row
 "tui.status.complete" = "[ok] complete"
 # Persistent token/cost gauge in the meta row (Feature A). `{}` is the compact

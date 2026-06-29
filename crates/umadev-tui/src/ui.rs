@@ -2553,6 +2553,13 @@ fn render_chat(frame: &mut Frame, app: &App) {
         render_search_bar(frame, chunks[3], app);
         return;
     }
+    // I3 — the reverse prompt-history search (Ctrl+R) likewise owns the input
+    // mode: render its one-row bar (label + query + live preview of the focused
+    // entry) in the same spacer and skip the popovers.
+    if app.history_search.is_some() {
+        render_history_search_bar(frame, chunks[3], app);
+        return;
+    }
 
     // A popover floats above the prompt: the `@`-file-mention typeahead takes
     // precedence over the slash palette so the two are mutually exclusive — only
@@ -2623,6 +2630,67 @@ fn render_search_bar(frame: &mut Frame, area: Rect, app: &App) {
     // status is short and hugs the right edge, so on any reasonable width the two
     // never overlap (and if they did on a very narrow terminal, the count wins on
     // the right, which is the more useful half).
+    frame.render_widget(Paragraph::new(left), area);
+    frame.render_widget(right, area);
+}
+
+/// I3 — render the one-row reverse prompt-history search bar (Ctrl+R) into the
+/// spacer above the prompt: a `history:` label + the live query, then a muted
+/// italic preview of the focused past prompt (the "match context"), with the
+/// `current/total` counter (or "no matches") right-aligned. All colors come from
+/// the theme (no naked hex); fail-open when `app.history_search` is unexpectedly
+/// `None`.
+fn render_history_search_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(hs) = &app.history_search else {
+        return;
+    };
+    let lang = app.lang;
+    let bar_bg = theme::BG_ELEMENT();
+    frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
+
+    let label = umadev_i18n::t(lang, "tui.histsearch.prompt");
+    let mut spans = vec![
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(theme::ACCENT())
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            hs.query.clone(),
+            Style::default().fg(theme::TEXT()).bg(bar_bg),
+        ),
+    ];
+    // Live preview of the focused match so the user sees which past prompt Enter
+    // would load before committing. Newlines flattened to keep the bar one row.
+    if let Some(preview) = app.history_search_preview() {
+        spans.push(Span::styled("  ", Style::default().bg(bar_bg)));
+        spans.push(Span::styled(
+            preview.replace('\n', " "),
+            Style::default()
+                .fg(theme::TEXT_MUTED())
+                .bg(bar_bg)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let left = Line::from(spans);
+
+    let right_text = if hs.matches.is_empty() {
+        umadev_i18n::t(lang, "tui.search.none").to_string()
+    } else {
+        umadev_i18n::tf(
+            lang,
+            "tui.search.count",
+            &[&(hs.current + 1).to_string(), &hs.matches.len().to_string()],
+        )
+    };
+    let right = Paragraph::new(Line::from(Span::styled(
+        format!("{right_text} "),
+        Style::default().fg(theme::TEXT_MUTED()).bg(bar_bg),
+    )))
+    .alignment(Alignment::Right);
+
     frame.render_widget(Paragraph::new(left), area);
     frame.render_widget(right, area);
 }

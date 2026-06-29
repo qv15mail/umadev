@@ -370,6 +370,10 @@ mod tests {
             "tui.search.count",
             "tui.search.none",
             "tui.hint.search",
+            // Reverse prompt-history search (Ctrl+R): the prompt label + the
+            // operation hint shown while incremental history search owns the input.
+            "tui.histsearch.prompt",
+            "tui.hint.histsearch",
             "tui.status.complete",
             "tui.overlay.empty",
             "tui.overlay.progress",
