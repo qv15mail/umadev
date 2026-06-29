@@ -69,6 +69,7 @@ pub mod runner;
 pub mod runtime_proof;
 pub mod scaffolding;
 pub mod security;
+pub mod sizing_calibration;
 pub mod skills;
 pub mod state;
 pub mod tech_debt;
@@ -163,6 +164,11 @@ pub use runtime_proof::{
 pub use security::{
     run_security_scan, security_scan_rel_path, write_security_scan, ScanResult, ScanStatus,
     SecurityScan,
+};
+pub use sizing_calibration::{
+    advisory_nudge as sizing_advisory_nudge, calibrated_default as sizing_calibrated_default,
+    predicted_size, record_route as record_run_sizing, sizing_calibration, ClassSizing, SizeRank,
+    SizingAdjustment, SizingStats,
 };
 pub use skills::{
     graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,

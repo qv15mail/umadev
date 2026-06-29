@@ -627,6 +627,18 @@ pub async fn drive_director_loop_routed(
         ) {
             events.emit(EngineEvent::Note(nudge));
         }
+        // ADVISORY sizing-calibration consult (fail-open): if THIS route class has a
+        // measured, systematic SIZING miss (it historically under- or over-sizes the
+        // turn), surface a nudge toward a heavier / lighter DEFAULT. Pure advisory — it
+        // changes NOTHING about this run's already-decided route, plan, deterministic
+        // floor, gates, or termination; it only informs the user + a future default. No
+        // signal (too few runs / no systematic miss / a fresh project) → nothing emitted
+        // and behaviour is byte-for-byte unchanged.
+        if let Some(nudge) =
+            crate::sizing_calibration::advisory_nudge(&options.project_root, r.class.as_str())
+        {
+            events.emit(EngineEvent::Note(nudge));
+        }
     }
 
     // Read the idle watchdog window + the wall-clock build budget ONCE at the
@@ -968,7 +980,10 @@ async fn drive_director_loop_with_idle(
         //    and settle with the problems still unfixed. QC is read-only + cheap.
         if round == 0 && !crate::gates::claims_code_changes(&turn.text) {
             // No code claimed → nothing the plan describes actually ran; leave the
-            // steps as-is (the caller decides) and settle.
+            // steps as-is (the caller decides) and settle. SIZING calibration: a route
+            // that mutated nothing is a TRIVIAL actual outcome — a route sized as a real
+            // build here OVER-sized the turn (advisory, fail-open; see `record_run_sizing`).
+            record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Trivial);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -992,6 +1007,18 @@ async fn drive_director_loop_with_idle(
             // path — depth-gated, fail-open. A clean Build leaves a PRD /
             // architecture / UI-UX doc (+ a proof-pack on the deliberate path).
             director::finalize(options, events, route);
+            // SIZING calibration: a clean settle on round 0 (no rework) was a LIGHT
+            // actual outcome; a clean settle only AFTER bounded QC fix rounds means the
+            // cheap single turn under-sized the work → HEAVY. Advisory, fail-open.
+            record_run_sizing(
+                options,
+                route,
+                if round == 0 {
+                    crate::sizing_calibration::SizeRank::Light
+                } else {
+                    crate::sizing_calibration::SizeRank::Heavy
+                },
+            );
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -1010,6 +1037,9 @@ async fn drive_director_loop_with_idle(
             // advance only to the furthest phase that actually completed (no plan / no
             // Done step → keep the in-progress anchor). Fail-open.
             finalize_phase_from_plan_opt(&plan, options, false);
+            // SIZING calibration: the cheap path burned its whole QC fix budget without
+            // clearing → the work was HEAVIER than the single-turn sizing assumed.
+            record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -1023,6 +1053,9 @@ async fn drive_director_loop_with_idle(
     persist_plan(&plan, options);
     // Non-clean settle (the bounded rounds didn't fully clear): honest phase only.
     finalize_phase_from_plan_opt(&plan, options, false);
+    // SIZING calibration: exhausting the bounded rounds means the work outran the
+    // single-turn sizing → HEAVY actual outcome. Advisory, fail-open.
+    record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
     DirectorLoopOutcome::Done { reply: last_reply }
 }
 
@@ -1263,7 +1296,36 @@ async fn drive_plan_steps(
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
     // shareable delivery — core docs + proof-pack + scorecard. Fail-open inside.
     director::finalize(options, events, Some(route));
+    // SIZING calibration: a step-driven build is ALWAYS a deliberate route (predicted
+    // HEAVY). Measure the ACTUAL heaviness by how many Build steps did real work — a
+    // deliberate route that finished in <=1 real build step OVER-sized the turn (the
+    // "Greenfield that finished in one trivial step" case). Advisory + fail-open: this
+    // never altered any step's status, the floor, or the gate above.
+    crate::sizing_calibration::record_route(
+        &options.project_root,
+        route,
+        run_actual_size_from_plan(plan),
+    );
     Some(DirectorLoopOutcome::Done { reply: last_reply })
+}
+
+/// The ACTUAL [`crate::sizing_calibration::SizeRank`] a step-driven build settled at,
+/// read deterministically from the terminal plan: how many Build steps actually reached
+/// `Done`. Zero real build steps → `Trivial`; exactly one → `Light` (finished in a
+/// single trivial step); two or more → `Heavy` (a genuine multi-step build). Review
+/// steps don't count — only doer-seat work moves the dial. Pure; advisory telemetry.
+fn run_actual_size_from_plan(plan: &Plan) -> crate::sizing_calibration::SizeRank {
+    use crate::sizing_calibration::SizeRank;
+    let done_build = plan
+        .steps
+        .iter()
+        .filter(|s| s.kind == plan_state::StepKind::Build && s.status == StepStatus::Done)
+        .count();
+    match done_build {
+        0 => SizeRank::Trivial,
+        1 => SizeRank::Light,
+        _ => SizeRank::Heavy,
+    }
 }
 
 /// The observable result of driving one plan step — what the scheduler reads to set
@@ -1524,6 +1586,25 @@ fn record_step_first_pass(
                 rate * 100.0
             )));
         }
+    }
+}
+
+/// Record this run's SIZING-calibration outcome (the single-turn loop's entry point):
+/// the router's PREDICTED size for `route` vs. the `actual` size the run settled at,
+/// keyed by route-class ([`crate::sizing_calibration`]). A `None` route (the
+/// backward-compatible no-route entry) records nothing.
+///
+/// ADVISORY + FAIL-OPEN: recording never changes the run's route, plan, the
+/// deterministic floor, loop termination, or any gate — by the time the actual size is
+/// known the route is long-decided. It only feeds the per-class calibration that informs
+/// a FUTURE default (see [`crate::sizing_calibration::calibrated_default`]).
+fn record_run_sizing(
+    options: &RunOptions,
+    route: Option<&RoutePlan>,
+    actual: crate::sizing_calibration::SizeRank,
+) {
+    if let Some(r) = route {
+        crate::sizing_calibration::record_route(&options.project_root, r, actual);
     }
 }
 
