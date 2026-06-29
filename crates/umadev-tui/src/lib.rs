@@ -4616,6 +4616,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // Left-drag: extend the live selection's cursor.
                                     MouseEventKind::Drag(MouseButton::Left) => {
                                         app.selection_extend(col, row);
+                                        // A drag that began OUTSIDE the transcript
+                                        // (the input box / padding) never opened a
+                                        // selection, so nothing highlights or copies
+                                        // — that reads as "copy is broken". Surface
+                                        // the native-selection / `/mouse` hint once.
+                                        app.hint_native_copy_once();
                                     }
                                     // Left-up: if a non-empty selection was made, copy its
                                     // text to the system clipboard via OSC 52 and toast.
@@ -5125,6 +5131,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // bar / prompt don't keep showing the old gate
                                     // (and its timers) during the rework.
                                     app.active_gate = None;
+                                    app.gate_choice = None;
                                     // P1-D: on a continuous run, feed the revision back
                                     // into the SAME held director session by re-driving
                                     // the producing block on the continuous engine —

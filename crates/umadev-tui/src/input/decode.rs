@@ -77,7 +77,10 @@ impl Decoder {
             Token::Text(text) => {
                 if self.in_paste {
                     self.paste_buf.push_str(&text);
-                    Vec::new()
+                    // A split end marker can arrive as plain text AFTER a flushed
+                    // partial (see `close_paste_if_terminated`), so re-check the
+                    // accumulated tail here — not only on a clean PASTE_END token.
+                    self.close_paste_if_terminated()
                 } else {
                     decode_text(&text)
                 }
@@ -98,11 +101,42 @@ impl Decoder {
             return vec![InputEvent::Paste(body)];
         }
         if self.in_paste {
-            // A sequence inside a paste is treated as literal body text.
+            // A sequence inside a paste is treated as literal body text — UNLESS
+            // it is (the start of) an end marker the reader's flush split apart,
+            // which `close_paste_if_terminated` recognises once the tail is whole.
             self.paste_buf.push_str(&String::from_utf8_lossy(bytes));
-            return Vec::new();
+            return self.close_paste_if_terminated();
         }
         decode_sequence(bytes)
+    }
+
+    /// Fail-open backstop for a bracketed-paste END marker that the reader's
+    /// lone-ESC flush SPLIT across reads.
+    ///
+    /// The clean case (`CSI 201 ~` arriving as one [`Token::Sequence`]) is caught
+    /// by the `bytes == PASTE_END` match in [`Self::feed_sequence`]. But if a read
+    /// boundary lands mid-marker and the ESC-flush timer fires before the
+    /// continuation arrives, the marker reaches the decoder as a force-flushed
+    /// partial sequence (e.g. `\x1b[20`) followed by plain text (`1~`) — the
+    /// explicit match never fires, so `in_paste` would wedge `true` FOREVER,
+    /// silently swallowing every later keystroke (the input box goes dead, a
+    /// fail-CLOSED trap). Bracketed paste guarantees the terminal strips a literal
+    /// `\x1b[201~` from the body, so a trailing end-marker byte string in the
+    /// accumulated buffer can ONLY be the real terminator: strip it and close the
+    /// paste. Returns the completed paste, or empty if not yet terminated.
+    fn close_paste_if_terminated(&mut self) -> Vec<InputEvent> {
+        if self.paste_buf.as_bytes().ends_with(PASTE_END) {
+            let keep = self.paste_buf.len() - PASTE_END.len();
+            // The marker bytes are all single-byte (ESC + ASCII), so `keep` is
+            // always a char boundary; guard anyway so this can never panic.
+            if self.paste_buf.is_char_boundary(keep) {
+                let mut body = std::mem::take(&mut self.paste_buf);
+                body.truncate(keep);
+                self.in_paste = false;
+                return vec![InputEvent::Paste(body)];
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -607,6 +641,76 @@ mod tests {
             [InputEvent::Paste(body)] => assert_eq!(body, "hello\u{1b}[A"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn owned_path_bracketed_paste_is_one_paste_at_every_split() {
+        // End-to-end through the OWNED input pipeline (tokenizer → decoder): a
+        // bracketed paste `\x1b[200~<body>\x1b[201~` must decode to exactly ONE
+        // `Paste(body)` no matter where the stdin reads chunk it — the property a
+        // user pasting a multi-line requirement relies on.
+        use super::super::tokenize::Tokenizer;
+        let input = b"\x1b[200~build me a dashboard\nwith login\x1b[201~";
+        let want = "build me a dashboard\nwith login";
+        for split in 0..=input.len() {
+            let mut tk = Tokenizer::for_stdin();
+            let mut dec = Decoder::new();
+            let mut events = Vec::new();
+            for part in [&input[..split], &input[split..]] {
+                for token in tk.feed(part) {
+                    events.extend(dec.feed_token(token));
+                }
+            }
+            match events.as_slice() {
+                [InputEvent::Paste(body)] => {
+                    assert_eq!(body, want, "split at {split}: body must be intact");
+                }
+                other => panic!("split at {split}: expected one Paste, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn split_end_marker_via_flush_still_closes_the_paste() {
+        // Regression: the reader's lone-ESC flush can split the `\x1b[201~` end
+        // marker into a force-flushed partial sequence (`\x1b[20`) + trailing text
+        // (`1~`). The explicit PASTE_END match never fires for either fragment, so
+        // without the suffix backstop `in_paste` would wedge forever and swallow
+        // all later input. The backstop must still close the paste exactly once.
+        let mut d = Decoder::new();
+        assert!(d
+            .feed_token(Token::Sequence(PASTE_START.to_vec()))
+            .is_empty());
+        assert!(d.feed_token(Token::Text("requirement".into())).is_empty());
+        // Flushed partial of the end marker — accumulated as literal, not yet whole.
+        assert!(d
+            .feed_token(Token::Sequence(b"\x1b[20".to_vec()))
+            .is_empty());
+        // The continuation arrives as plain text (tokenizer is back in Ground).
+        let out = d.feed_token(Token::Text("1~".into()));
+        match out.as_slice() {
+            [InputEvent::Paste(body)] => assert_eq!(body, "requirement"),
+            other => panic!("expected the paste to close with a clean body, got {other:?}"),
+        }
+        // And the decoder is no longer wedged: ordinary text decodes to keys again.
+        assert_eq!(
+            one_key(&d.feed_token(Token::Text("x".into()))).code,
+            KeyCode::Char('x')
+        );
+    }
+
+    #[test]
+    fn split_end_marker_does_not_double_emit_when_clean() {
+        // The clean path (one PASTE_END token) must still emit exactly one paste —
+        // the suffix backstop only runs on the in-paste APPEND branches, which the
+        // explicit PASTE_END match returns before ever reaching.
+        let mut d = Decoder::new();
+        assert!(d
+            .feed_token(Token::Sequence(PASTE_START.to_vec()))
+            .is_empty());
+        assert!(d.feed_token(Token::Text("hi".into())).is_empty());
+        let out = d.feed_token(Token::Sequence(PASTE_END.to_vec()));
+        assert_eq!(out, vec![InputEvent::Paste("hi".into())]);
     }
 
     #[test]

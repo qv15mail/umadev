@@ -861,6 +861,8 @@
 "slash.skill_header" = "[skill] 技能包:\n\n{}"
 "slash.mouse_on" = "滑鼠滾輪捲動已開啟 —— Shift+拖曳可用終端原生文字選取"
 "slash.mouse_off" = "滑鼠滾輪捲動已關閉 —— 已恢復終端原生文字選取"
+# 當滑鼠捕獲開啟(原生選取被接管)時,使用者在紀錄區以外(如輸入框)拖曳選擇會觸發一次此提示,指向複製的備援方式。
+"tui.copy_hint" = "要複製文字(包括這個輸入框):按住 Shift 拖曳用終端原生選取,或輸入 /mouse 關閉滑鼠捕獲。貼上照常即可 —— 文字會整段插入。"
 "slash.redraw" = "已重繪螢幕 —— 清除了殘留或錯亂的字元儲存格"
 # /spec 浮層標題
 "spec.overlay_title" = " UMADEV_HOST_SPEC_V1 —— 按 Esc 關閉,↑↓ 捲動 "

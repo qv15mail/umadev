@@ -1882,6 +1882,14 @@ pub struct App {
     /// lives here so it survives across redraws.
     pub mouse_scroll: bool,
 
+    /// Whether the one-time "how to copy" hint has been surfaced this session.
+    /// The in-app drag-select layer only covers the TRANSCRIPT, so a drag in the
+    /// input box (or any non-transcript region) selects nothing while mouse
+    /// capture is on — which reads as "copy is broken". The first such drag
+    /// surfaces [`Self::hint_native_copy_once`] (Shift+drag / `/mouse`), then this
+    /// latches so the tip never nags again.
+    native_copy_hint_shown: bool,
+
     /// **In-app text selection** over the transcript (the Claude-Code layer).
     /// `Some` while the user has a live / just-copied drag selection; `None`
     /// when there's nothing selected. Coordinates are `(content_row, col)` into
@@ -2510,6 +2518,7 @@ impl App {
             // native scrollback). `/mouse` toggles capture OFF for users who prefer
             // the terminal's native click-drag selection.
             mouse_scroll: true,
+            native_copy_hint_shown: false,
             selection: None,
             selection_dragging: false,
             last_drag_mouse: None,
@@ -3635,6 +3644,27 @@ impl App {
                 sel.cursor = p;
             }
         }
+    }
+
+    /// Surface the copy/paste escape-hatch hint **once** per session.
+    ///
+    /// Called when the user drags to select but no in-app selection is active —
+    /// i.e. the drag began OUTSIDE the transcript (the input box / padding), where
+    /// the in-app drag-copy layer can't reach and, with mouse capture on, the
+    /// terminal's own click-drag is suppressed. That moment reads exactly as "I
+    /// can't copy", so point at the working paths: Shift+drag for native selection
+    /// (which DOES cover the input box) or `/mouse` to release capture entirely.
+    /// Latches after the first show so it never nags; no-op once shown or when a
+    /// real transcript selection is in progress. Fail-open: pure state + a toast.
+    pub fn hint_native_copy_once(&mut self) {
+        if self.native_copy_hint_shown || self.selection.is_some() {
+            return;
+        }
+        self.native_copy_hint_shown = true;
+        self.push(
+            ChatRole::System,
+            umadev_i18n::t(self.lang, "tui.copy_hint").to_string(),
+        );
     }
 
     /// Mouse-down (left button) at screen `(col, row)`: begin a fresh selection
@@ -17782,6 +17812,55 @@ mod tests {
             before,
             "no active drag → the selection is left untouched",
         );
+    }
+
+    #[test]
+    fn drag_outside_transcript_surfaces_copy_hint_once() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        let before = a.history.len();
+        // A drag whose mouse-down landed OUTSIDE the transcript (the input box)
+        // never opened an in-app selection.
+        assert!(a.selection.is_none());
+        a.hint_native_copy_once();
+        assert!(
+            a.native_copy_hint_shown,
+            "the first outside-drag latches the hint"
+        );
+        assert_eq!(a.history.len(), before + 1, "the copy hint is posted once");
+        // A SECOND outside-drag must NOT nag again.
+        a.hint_native_copy_once();
+        assert_eq!(a.history.len(), before + 1, "the hint never repeats");
+    }
+
+    #[test]
+    fn copy_hint_suppressed_during_a_real_transcript_selection() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        // A drag that began INSIDE the transcript opened a selection — that path
+        // copies via the in-app layer, so the native-selection hint stays silent.
+        a.selection_begin(9, 3);
+        assert!(a.selection.is_some());
+        let before = a.history.len();
+        a.hint_native_copy_once();
+        assert_eq!(
+            a.history.len(),
+            before,
+            "no hint while a real selection is live"
+        );
+        assert!(!a.native_copy_hint_shown, "and it does not latch");
+    }
+
+    #[test]
+    fn handle_paste_inserts_a_multiline_block_verbatim() {
+        // The legacy + owned paths both end at `handle_paste` with the full text
+        // (crossterm `Event::Paste` / a decoded bracketed paste). A small
+        // multi-line paste must land in the input box as ONE block — embedded
+        // newlines kept, nothing dropped — not fragmented into submitted lines.
+        let mut a = fresh_app(Some("offline"));
+        a.handle_paste("first line\nsecond line");
+        assert_eq!(a.input, "first line\nsecond line");
+        assert_eq!(a.input_cursor, a.input_len());
     }
 
     #[test]

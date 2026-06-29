@@ -871,6 +871,8 @@
 "slash.skill_header" = "[skill] Skills:\n\n{}"
 "slash.mouse_on" = "mouse-wheel scrolling on — Shift+drag for native text selection"
 "slash.mouse_off" = "mouse-wheel scrolling off — native text selection restored"
+# Shown once when the user drags to select OUTSIDE the transcript (e.g. the input box) while mouse capture is on (which suppresses native selection) — points at the copy escape hatch.
+"tui.copy_hint" = "To copy text (including this input line): hold Shift and drag for your terminal's native selection, or run /mouse to turn mouse capture off. Pasting works as usual — the text is inserted as one block."
 "slash.redraw" = "screen repainted — cleared any stale or garbled cells"
 # /spec overlay title
 "spec.overlay_title" = " UMADEV_HOST_SPEC_V1 — press Esc to close, ↑↓ scroll "
