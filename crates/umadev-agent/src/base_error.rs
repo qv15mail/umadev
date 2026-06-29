@@ -165,6 +165,107 @@ pub fn diagnose_turn_failure(reason: &str, backend: &str) -> String {
     }
 }
 
+/// Strip ANSI escape sequences from `s`, returning clean, human-readable text.
+///
+/// A base CLI writes COLORED diagnostics to its stderr (the codex idle banner,
+/// claude's error lines), so the captured stderr tail can carry raw ANSI control
+/// bytes (`\x1b[31;1m…\x1b[0m`). Folded verbatim into a user-facing failure
+/// message they surface as garble (`[31;1m[36;1m…`). This removes them so the
+/// surfaced stderr reads as plain text.
+///
+/// Recognised + dropped:
+/// - **CSI / SGR** — `ESC [` then any number of parameter bytes (`0x30..=0x3F`),
+///   then intermediate bytes (`0x20..=0x2F`), then one final byte (`0x40..=0x7E`).
+///   This is the color/cursor family that causes the reported garble.
+/// - **OSC** — `ESC ]` … terminated by `BEL` (`0x07`) or `ST` (`ESC \`) — e.g. a
+///   window-title set; otherwise its payload would leak as text.
+/// - **A bare / trailing `ESC`**, and any **other short `ESC`-prefixed sequence**
+///   (`ESC` + one following byte, e.g. a charset selector `ESC ( B`).
+///
+/// All control / escape bytes are ASCII, so iterating by `char` is UTF-8 safe: a
+/// multi-byte CJK char is one `char` and can never be mistaken for an escape byte.
+/// **Fail-open:** an incomplete / malformed sequence consumes only what it can and
+/// the rest passes through unchanged; never panics, never errors.
+#[must_use]
+pub fn strip_ansi(s: &str) -> String {
+    const ESC: char = '\u{1b}';
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI / SGR: ESC [ params* intermediates* final.
+            Some('[') => {
+                chars.next();
+                while chars
+                    .peek()
+                    .is_some_and(|&p| ('\u{30}'..='\u{3F}').contains(&p))
+                {
+                    chars.next();
+                }
+                while chars
+                    .peek()
+                    .is_some_and(|&p| ('\u{20}'..='\u{2F}').contains(&p))
+                {
+                    chars.next();
+                }
+                if chars
+                    .peek()
+                    .is_some_and(|&f| ('\u{40}'..='\u{7E}').contains(&f))
+                {
+                    chars.next();
+                }
+            }
+            // OSC: ESC ] … BEL | ESC \ (ST).
+            Some(']') => {
+                chars.next();
+                while let Some(&p) = chars.peek() {
+                    if p == '\u{07}' {
+                        chars.next();
+                        break;
+                    }
+                    if p == ESC {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            // Any other ESC-prefixed short sequence.
+            Some(&other) => {
+                chars.next();
+                // An nF escape (charset designator etc.): ESC intermediate(s)
+                // (`0x20..=0x2F`) then one final byte (`0x30..=0x7E`) — e.g.
+                // `ESC ( B`. Otherwise it is a two-byte `ESC <Fe>` (e.g. `ESC c`)
+                // and dropping ESC + that one byte is enough.
+                if ('\u{20}'..='\u{2F}').contains(&other) {
+                    while chars
+                        .peek()
+                        .is_some_and(|&p| ('\u{20}'..='\u{2F}').contains(&p))
+                    {
+                        chars.next();
+                    }
+                    if chars
+                        .peek()
+                        .is_some_and(|&f| ('\u{30}'..='\u{7E}').contains(&f))
+                    {
+                        chars.next();
+                    }
+                }
+            }
+            // Bare trailing ESC: drop it.
+            None => {}
+        }
+    }
+    out
+}
+
 /// Pick the per-base i18n key for an auth failure. Falls back to a base-agnostic
 /// key for an unknown / empty backend id.
 fn auth_key(backend: &str) -> &'static str {
@@ -579,6 +680,51 @@ mod tests {
         assert_eq!(diagnose_turn_failure(raw, "codex"), raw);
         // An empty reason never panics and yields an empty string.
         assert_eq!(diagnose_turn_failure("   ", "codex"), "");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sgr_and_keeps_plain_text() {
+        // The reported garble: an SGR color run around the text.
+        assert_eq!(strip_ansi("\x1b[31;1mfoo\x1b[0m"), "foo");
+        // A run of stacked SGR codes (the codex banner shape) → clean text.
+        assert_eq!(
+            strip_ansi("\x1b[31;1m\x1b[36;1m\x1b[36;1m\x1b[0mhello"),
+            "hello"
+        );
+        // Cursor-move CSI (non-SGR final byte) is also dropped.
+        assert_eq!(strip_ansi("a\x1b[2Kb"), "ab");
+        // No escapes → unchanged (fail-open identity).
+        assert_eq!(strip_ansi("plain readable text"), "plain readable text");
+        // Multibyte CJK is never mistaken for an escape byte.
+        assert_eq!(
+            strip_ansi("\x1b[33m底座未登录 标准MES平台\x1b[0m"),
+            "底座未登录 标准MES平台"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_bare_esc_and_short_sequences() {
+        // OSC (window-title set) terminated by BEL — its payload is dropped.
+        assert_eq!(strip_ansi("\x1b]0;my title\x07done"), "done");
+        // OSC terminated by ST (ESC \).
+        assert_eq!(strip_ansi("\x1b]0;t\x1b\\done"), "done");
+        // A bare trailing ESC is dropped, not panicked on (fail-open).
+        assert_eq!(strip_ansi("tail\x1b"), "tail");
+        // A charset-selector short sequence (ESC ( B) is dropped.
+        assert_eq!(strip_ansi("\x1b(Bx"), "x");
+        // An incomplete CSI at EOF consumes what it can, never panics.
+        assert_eq!(strip_ansi("y\x1b[31"), "y");
+    }
+
+    #[test]
+    fn surfaced_turn_failure_is_clean_after_stripping() {
+        // End-to-end: a base error wrapped in ANSI classifies AND surfaces clean.
+        let raw = "\x1b[31;1mAPI Error: Request rejected (429)\x1b[0m";
+        let cleaned = strip_ansi(raw);
+        assert!(!cleaned.contains('\u{1b}'), "no ESC remains: {cleaned:?}");
+        assert_eq!(cleaned, "API Error: Request rejected (429)");
+        // The classifier still fires on the cleaned text.
+        assert_eq!(classify(None, Some(&cleaned), None), BaseFailure::RateLimit);
     }
 
     #[test]

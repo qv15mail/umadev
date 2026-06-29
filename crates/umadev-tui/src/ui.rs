@@ -3248,6 +3248,14 @@ fn fold_general_text(body: &str, lang: umadev_i18n::Lang) -> String {
 ///   circle `⏺` (U+23FA) crisply, elsewhere the plain filled circle `●`
 ///   (U+25CF). Built from the codepoint so the source carries no literal
 ///   pictographic glyph. Fail-open: an unmappable codepoint degrades to `*`.
+/// - **Text-presentation pin** — the glyph is followed by `U+FE0E` (VARIATION
+///   SELECTOR-15) to force 1-cell TEXT presentation. Both circle codepoints have
+///   `unicode-width` 1, but an emoji-capable terminal (notably macOS) paints them
+///   as a 2-cell *emoji*, which `char_width` / ratatui still model as 1 — a
+///   one-column gutter desync on the turn's first row that visually eats the next
+///   (often wide CJK) glyph, e.g. `标准MES平台` → `准 MES 平台`. VS15 is zero
+///   display width, so the marker still measures exactly [`GUTTER_W`] columns and
+///   the model layout is unchanged; it only pins the terminal to the narrow form.
 ///
 /// Any non-assistant role passed here falls back to the Host marker (the
 /// callers only ever pass `Host` / `UmaDev`).
@@ -3257,8 +3265,9 @@ fn assistant_marker(role: ChatRole) -> (String, Color) {
     } else {
         0x25CF // ● plain filled circle — widest terminal support
     };
-    let mut s = String::with_capacity(2);
+    let mut s = String::with_capacity(3);
     s.push(char::from_u32(cp).unwrap_or('*'));
+    s.push('\u{FE0E}'); // VS15 — pin TEXT (1-cell) presentation (see docstring).
     s.push(' ');
     let color = match role {
         ChatRole::UmaDev => theme::ACCENT(),
@@ -4264,7 +4273,38 @@ fn prefold_line_filled(
         }
     }
     push_padded(&mut out, cur, col);
+    // Keep every zero-width combining mark / variation selector welded to the
+    // base char it modifies. The fold flattens spans to chars and re-emits, so a
+    // mark (e.g. the marker's VS15 text-presentation pin, or a user's accent)
+    // would otherwise land in its OWN span — which a renderer paints in a separate
+    // cell, splitting the grapheme and letting the base glyph revert to its wide
+    // (emoji) presentation. Re-weld so each base+mark stays one grapheme. No-op
+    // for text without combining marks (the common case), so existing folds are
+    // byte-for-byte unchanged.
+    for line in &mut out {
+        coalesce_combining_marks(&mut line.spans);
+    }
     out
+}
+
+/// Fold every non-empty **zero display-width** span (a combining mark / variation
+/// selector) onto the span immediately before it, so a base char and its marks
+/// stay one grapheme in one span. Pure; a leading mark with no predecessor is left
+/// as-is, and a row of ordinary text (no zero-width spans) is untouched.
+fn coalesce_combining_marks(spans: &mut Vec<Span<'static>>) {
+    let mut i = 1;
+    while i < spans.len() {
+        let is_mark = !spans[i].content.is_empty() && disp_width(spans[i].content.as_ref()) == 0;
+        if is_mark {
+            let moved = spans[i].content.to_string();
+            let mut welded = spans[i - 1].content.to_string();
+            welded.push_str(&moved);
+            spans[i - 1].content = welded.into();
+            spans.remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Reduce one painted (decorated) transcript row to the LOGICAL text a drag-copy
@@ -5142,6 +5182,104 @@ mod tests {
     use ratatui::Terminal;
     use umadev_agent::{EngineEvent, Gate};
     use umadev_spec::Phase;
+
+    #[test]
+    fn cjk_ascii_mixed_text_renders_complete_in_every_inline_context() {
+        // The reported drop: a leading wide CJK char eaten + spaces injected at a
+        // CJK↔ASCII boundary (`标准MES平台` → `准 MES 平台`). Lock that the compiled
+        // spans preserve the run intact across every inline context — alone, inside
+        // inline-code, inside a blockquote, and embedded in a sentence with quotes.
+        const NEEDLE: &str = "标准MES平台";
+        for case in [
+            "标准MES平台",
+            "`标准MES平台`",
+            "> 标准MES平台",
+            "把产品名统一为\"标准MES平台\"",
+        ] {
+            let text: String = markdown_to_lines(case, theme::TEXT())
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(
+                text.contains(NEEDLE),
+                "mixed CJK+ASCII must render complete + unspaced for {case:?}; got {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_ascii_mixed_text_survives_the_width_fold() {
+        // The same run must stay intact through `prefold` at any width, including a
+        // narrow width that wraps it onto a hanging (spine-gutter) continuation row.
+        const NEEDLE: &str = "标准MES平台";
+        let line = markdown_to_lines("统一产品名为 标准MES平台 收尾", theme::TEXT())
+            .into_iter()
+            .next()
+            .unwrap();
+        for w in [80usize, 24, 14, 10] {
+            let spine = spine_glyph();
+            let joined: String = prefold_line(&line, w, GUTTER_W, Some(theme::TEXT()))
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .flat_map(|s| s.content.chars())
+                // a wrap can legitimately insert a break inside the run; what must
+                // never happen is a DROPPED or RESPACED char, so compare ignoring
+                // the spine glyph + spaces the fold adds for the gutter.
+                .filter(|&c| c != ' ' && c != spine)
+                .collect();
+            assert!(
+                joined.contains(NEEDLE),
+                "the CJK run lost a char at width {w}: {joined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_marker_pins_text_presentation_and_keeps_gutter_width() {
+        // VS15 forces the record-circle marker to 1-cell TEXT presentation so an
+        // emoji-capable terminal can't paint it 2 cells wide and desync the gutter
+        // (the root of the eaten leading CJK glyph).
+        let (marker, _) = assistant_marker(crate::app::ChatRole::Host);
+        assert!(
+            marker.contains('\u{FE0E}'),
+            "marker carries VS15: {marker:?}"
+        );
+        // The selector is zero-width, so the marker still measures GUTTER_W — the
+        // model layout is byte-for-byte unchanged.
+        assert_eq!(disp_width(&marker), GUTTER_W);
+    }
+
+    #[test]
+    fn prefold_keeps_a_zero_width_selector_welded_to_its_base_char() {
+        // A base glyph + VS15 must stay ONE span through the fold; otherwise the
+        // selector lands in its own cell and the base glyph reverts to wide (emoji)
+        // presentation — the gutter desync that drops the next glyph.
+        let line = Line::from(vec![
+            Span::raw("\u{23FA}\u{FE0E} "),
+            Span::raw("标准MES平台"),
+        ]);
+        let rows = prefold_line(&line, 40, 0, None);
+        let joined: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            joined.contains("\u{23FA}\u{FE0E}"),
+            "selector stays welded to its base glyph: {joined:?}"
+        );
+        // No span is left as a lone zero-width selector.
+        for row in &rows {
+            for sp in &row.spans {
+                assert!(
+                    sp.content.is_empty() || disp_width(sp.content.as_ref()) > 0,
+                    "no orphan zero-width span: {:?}",
+                    sp.content
+                );
+            }
+        }
+    }
 
     /// Line-for-line span+style equality, used to lock the P5a invariant.
     fn lines_eq(a: &[Line<'static>], b: &[Line<'static>]) -> bool {

@@ -488,6 +488,10 @@ pub(crate) fn enrich_idle_reason(
         _ => base_reason.to_string(),
     };
     if let Some(tail) = stderr_tail {
+        // Strip ANSI color/control sequences first — a base writes COLORED errors
+        // to stderr, so the raw tail carries `\x1b[…m` runs that would surface as
+        // garble inside the failure message.
+        let tail = crate::base_error::strip_ansi(&tail);
         let lines: Vec<&str> = tail
             .lines()
             .map(str::trim)

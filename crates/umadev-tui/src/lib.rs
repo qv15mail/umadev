@@ -2697,6 +2697,11 @@ fn enrich_base_turn_failure(reason: &str, stderr_tail: Option<String>, backend: 
 /// tail safe to fold into a one-line failure note. Shared by the idle/EOF
 /// ([`enrich_base_failure`]) and turn-failure ([`enrich_base_turn_failure`]) paths.
 fn stderr_snippet(tail: &str) -> String {
+    // Strip ANSI color/control sequences first — a base writes COLORED errors to
+    // stderr, so the raw tail carries `\x1b[…m` runs that would otherwise surface
+    // as garble inside the failure message. This is the single chat-side mint
+    // point (both `enrich_base_failure` and `enrich_base_turn_failure` fold here).
+    let tail = umadev_agent::base_error::strip_ansi(tail);
     let lines: Vec<&str> = tail
         .lines()
         .map(str::trim)
