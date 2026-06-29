@@ -1114,6 +1114,36 @@ impl Overlay {
     }
 }
 
+/// **Feature B — in-transcript search state.** A live incremental find over the
+/// folded/visual transcript rows (the same `transcript_rows` cache the
+/// drag-to-copy selection uses). Owned by [`App::search`]; while it is `Some`
+/// the search bar is open and it is the active modal input mode.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// The live query — matched case-insensitively as a substring of each row.
+    pub query: String,
+    /// Matches from the last scan over `transcript_rows`, in painted-row order.
+    /// Recomputed on every query edit; read by the renderer to paint highlights.
+    pub matches: Vec<SearchMatch>,
+    /// Index into [`Self::matches`] of the focused match — the one scrolled into
+    /// view and painted with the brighter "current" wash. `0` when no matches.
+    pub current: usize,
+}
+
+/// One search hit: a char span on a single folded/visual transcript row, in
+/// LOGICAL (gutter-stripped) coordinates — the same space `transcript_rows`
+/// stores, so the renderer maps it to the decorated line by adding the row's
+/// gutter width (exactly as the selection highlight does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Visual-row index into the folded transcript (== `transcript_rows` index).
+    pub row: usize,
+    /// First char (inclusive) of the match in the logical row text.
+    pub start: usize,
+    /// One-past-the-last char (exclusive) of the match.
+    pub end: usize,
+}
+
 /// The whole TUI state.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1379,6 +1409,22 @@ pub struct App {
     /// longer masquerades as idle "ready / 0/9". Cleared when a new run starts.
     pub aborted: bool,
 
+    /// **Feature A — completion notification.** When `false`, the terminal bell
+    /// is silenced (env `UMADEV_BELL=0` / `false` / `off` / `no`). Default `true`.
+    /// Read once at construction so a test can flip the field directly without
+    /// racing process env.
+    pub bell_enabled: bool,
+    /// A completion bell is armed and waiting to ride the next between-frames
+    /// gap. Set by [`Self::arm_completion_bell`] on a terminal transition (a run
+    /// finished / aborted, a long agentic turn settled, or a gate paused needing
+    /// the user) that took long enough that the user may have stepped away;
+    /// drained + emitted by the event loop via [`Self::take_bell`] through the
+    /// render's single backend writer (never mid-frame). Fail-open.
+    pub bell_pending: bool,
+    /// Monotonic count of bells armed this session — a cheap assertion handle for
+    /// tests (a quick turn leaves it at `0`; a long one bumps it). Never reset.
+    pub bell_count: usize,
+
     /// Whether the cold-start greeting has already been shown this session.
     /// Makes `push_greeting` idempotent so re-entering chat (e.g. picking a base
     /// again via `/setup`) never stacks a second welcome banner on the transcript.
@@ -1460,6 +1506,12 @@ pub struct App {
     /// `/diff`). When `Some`, key input is routed to the overlay
     /// (scroll, close); when `None`, normal chat input.
     pub overlay: Option<Overlay>,
+    /// **Feature B — in-transcript search.** `Some` while the Ctrl+F search bar
+    /// is open. Its own modal mode: the chat key handler routes EVERY keystroke
+    /// to [`Self::search_key`] while this is `Some`, so search never collides
+    /// with the slash palette, the `@`-mention popover, history recall, or an
+    /// overlay (each of those is checked/skipped while search owns the input).
+    pub search: Option<SearchState>,
     /// Handle to a running dev-server subprocess spawned by `/preview`, so we
     /// can kill it on `/stop-preview` or quit. `None` when no preview is live.
     pub preview_server: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
@@ -1722,6 +1774,9 @@ impl App {
             finished: false,
             run_started: false,
             aborted: false,
+            bell_enabled: bell_enabled_from_env(std::env::var("UMADEV_BELL").ok().as_deref()),
+            bell_pending: false,
+            bell_count: 0,
             greeted: false,
             thinking: false,
             thinking_started: None,
@@ -1737,6 +1792,7 @@ impl App {
             show_help: false,
             help_scroll: 0,
             overlay: None,
+            search: None,
             preview_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             project_root,
             pending_quit_confirm: false,
@@ -2400,6 +2456,10 @@ impl App {
     /// terminal state instead of the misleading idle "ready / 0/9" look. A new
     /// `/run` (which fires `PipelineStarted`) clears the flag.
     fn mark_block_aborted(&mut self, body: String) {
+        // Feature A — an honest abort/hard-stop (the run errored out, not a user
+        // cancel) is a terminal state the away user should hear. Arm before the
+        // timers are cleared, gated on how long the run had been going.
+        self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
         self.aborted = true;
         self.active_gate = None;
         self.run_started_at = None;
@@ -3955,6 +4015,10 @@ impl App {
             }
             EngineEvent::GateOpened { gate } => {
                 self.active_gate = Some(gate);
+                // Feature A — snapshot the run's elapsed BEFORE the live counters
+                // are stopped below, so the gate-pause bell (armed only on the
+                // manual-pause path) can gate on how long the run has been going.
+                let run_started_before_gate = self.run_started_at;
                 // A gate is a CHECKPOINT, not a work phase, so it never receives a
                 // PhaseCompleted — its dot would sit at ○ (indistinguishable from
                 // "skipped / not reached") while later phases run, which reads as
@@ -4018,6 +4082,11 @@ impl App {
                     return;
                 }
 
+                // Feature A — the run is now PAUSED at a gate awaiting the user's
+                // decision (guarded/plan tier; the auto-approve + queued-steer
+                // paths already returned above). Bell the possibly-away user so
+                // they come back to act. Gated on the run's pre-gate elapsed.
+                self.arm_completion_bell(run_started_before_gate);
                 self.push(
                     ChatRole::Gate,
                     gate_card(gate, &self.slug, &self.project_root, self.lang),
@@ -4041,6 +4110,9 @@ impl App {
                 paused_at,
             } => {
                 if paused_at.is_none() && final_phase == Phase::Delivery {
+                    // Feature A — a full run reached delivery; bell the away user
+                    // (gated on the run's elapsed, before the timer is cleared).
+                    self.arm_completion_bell(self.run_started_at);
                     self.finished = true;
                     // A message queued during a late phase (after both gates)
                     // never hit a gap — surface it rather than silently drop it,
@@ -4691,6 +4763,13 @@ impl App {
         if self.overlay.is_some() {
             return self.overlay_key(key);
         }
+        // Feature B — search is its own modal mode: while the bar is open it owns
+        // EVERY keystroke (typing filters; Enter/↑↓/Ctrl+N/P navigate; Esc
+        // closes), so it can't collide with the slash palette, the @-mention
+        // popover, history recall, or the editing keys below.
+        if self.search.is_some() {
+            return self.search_key(key, mods);
+        }
         if self.show_help {
             match key {
                 KeyCode::Esc => {
@@ -5081,6 +5160,13 @@ impl App {
                 self.verbose = !self.verbose;
                 Action::None
             }
+            // Ctrl+F — open the in-transcript search bar (Feature B). Free key
+            // (no bare-Ctrl+F binding existed; Ctrl+Alt+F is the half-page-down
+            // combo, a different modifier set). Search then owns input until Esc.
+            KeyCode::Char('f') if ctrl => {
+                self.open_search();
+                Action::None
+            }
             // Ctrl+R toggles the fold of the most recent collapsible row (a long
             // Host/UmaDev text wall, or a finished tool row's result) — the
             // "fold just the latest" lever, secondary to the global Ctrl+O. No-op
@@ -5292,6 +5378,10 @@ impl App {
     /// System note. Also clears `agentic_in_flight`: a failed agentic execution
     /// call flows through here, so this is its terminal cleanup too.
     pub(crate) fn record_route_failed(&mut self, note: String) {
+        // Feature A — a turn that ran a while then errored out is still a terminal
+        // outcome worth a beep (gated on elapsed, so a fast base-init failure is
+        // silent). Arm before clearing the timer.
+        self.arm_completion_bell(self.thinking_started.or(self.run_started_at));
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -5324,6 +5414,9 @@ impl App {
         director_build: bool,
         base_session_id: Option<String>,
     ) {
+        // Feature A — a long agentic turn just settled; alert the (possibly away)
+        // user. Arm BEFORE clearing `thinking_started`, gated on its elapsed.
+        self.arm_completion_bell(self.thinking_started);
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -9141,6 +9234,243 @@ impl App {
     pub fn thinking_elapsed_secs(&self) -> u64 {
         self.thinking_started.map_or(0, |t| t.elapsed().as_secs())
     }
+
+    // ---- Feature A: completion notification (terminal bell) --------------
+    //
+    // A run / long agentic turn reaching a terminal state — finished, aborted,
+    // or paused at a gate needing the user — arms a bell IFF (a) it's enabled and
+    // (b) the work ran long enough (≥ `BELL_MIN_ELAPSED`) that the user may have
+    // stepped away, so a quick chat reply never beeps. The actual BEL byte is
+    // written by the event loop between frames (single-writer R3 discipline); we
+    // only set a flag here. Every path is fail-open.
+
+    /// Arm the completion bell if it's enabled and `since` (the turn/run's start
+    /// instant, captured BEFORE the settle clears it) is at least
+    /// [`BELL_MIN_ELAPSED`] in the past. A `None` start or a too-short turn arms
+    /// nothing — no beep on a quick turn.
+    pub(crate) fn arm_completion_bell(&mut self, since: Option<std::time::Instant>) {
+        if !self.bell_enabled {
+            return;
+        }
+        if since.is_some_and(|t| t.elapsed() >= BELL_MIN_ELAPSED) {
+            self.bell_pending = true;
+            self.bell_count = self.bell_count.saturating_add(1);
+        }
+    }
+
+    /// Drain the pending-bell flag. The event loop calls this each iteration and,
+    /// when `true`, writes the BEL byte through the render's own backend writer
+    /// between frames. Returns `false` once drained (idempotent).
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_pending)
+    }
+
+    // ---- Feature B: in-transcript search --------------------------------
+    //
+    // A modal find over the folded transcript rows cached in `transcript_rows`
+    // (one logical, gutter-stripped string per visual row — the same coordinate
+    // space the drag-to-copy selection uses). Matches carry the visual-row index,
+    // so navigating one scrolls it into view and the renderer paints the span.
+
+    /// Open the search bar (Ctrl+F). Starts empty; an empty query has no matches.
+    pub fn open_search(&mut self) {
+        self.search = Some(SearchState::default());
+        // Drop any in-flight drag selection so the two highlight layers don't
+        // fight over the same rows while search owns the transcript.
+        self.selection = None;
+        self.recompute_search_matches();
+    }
+
+    /// Close the search bar (Esc) and clear all match state.
+    pub fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Append a char to the query, rescan, and jump to the first match.
+    fn search_input_char(&mut self, c: char) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.push(c);
+            s.current = 0;
+        }
+        self.recompute_search_matches();
+        self.search_focus_current();
+    }
+
+    /// Delete the last query char, rescan, and re-anchor on the first match.
+    fn search_backspace(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.pop();
+            s.current = 0;
+        }
+        self.recompute_search_matches();
+        self.search_focus_current();
+    }
+
+    /// Advance to the next match (wraps past the end), scrolling it into view.
+    /// No-op when there are no matches.
+    pub fn search_next(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            if s.matches.is_empty() {
+                return;
+            }
+            s.current = (s.current + 1) % s.matches.len();
+        }
+        self.search_focus_current();
+    }
+
+    /// Step to the previous match (wraps past the start), scrolling it into view.
+    /// No-op when there are no matches.
+    pub fn search_prev(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            if s.matches.is_empty() {
+                return;
+            }
+            let n = s.matches.len();
+            s.current = (s.current + n - 1) % n;
+        }
+        self.search_focus_current();
+    }
+
+    /// Rescan the cached transcript rows for the current query and refill the
+    /// match list (case-insensitive, non-overlapping). Called on every query
+    /// edit and once on open; cheap (a substring sweep over the published rows).
+    /// `current` is re-clamped so it never points past the end. Fail-open: an
+    /// empty/absent query yields zero matches.
+    pub fn recompute_search_matches(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        let query: Vec<char> = self
+            .search
+            .as_ref()
+            .map(|s| s.query.chars().collect())
+            .unwrap_or_default();
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        if !query.is_empty() {
+            let rows = self.transcript_rows.borrow();
+            for (ri, row) in rows.iter().enumerate() {
+                let rc: Vec<char> = row.chars().collect();
+                if rc.len() < query.len() {
+                    continue;
+                }
+                let mut start = 0usize;
+                while start + query.len() <= rc.len() {
+                    if (0..query.len()).all(|k| chars_ci_eq(query[k], rc[start + k])) {
+                        matches.push(SearchMatch {
+                            row: ri,
+                            start,
+                            end: start + query.len(),
+                        });
+                        start += query.len(); // non-overlapping
+                    } else {
+                        start += 1;
+                    }
+                }
+            }
+        }
+        if let Some(s) = self.search.as_mut() {
+            if s.current >= matches.len() {
+                s.current = 0;
+            }
+            s.matches = matches;
+        }
+    }
+
+    /// The rows-from-bottom scroll offset that brings visual row `row` into the
+    /// transcript viewport, roughly centered. Reads the renderer-published
+    /// `transcript_max_scroll` (total hidden-above rows) and
+    /// `transcript_viewport_rows`; the renderer re-clamps, so a stale bound is
+    /// self-correcting.
+    #[must_use]
+    pub fn search_scroll_offset_for(&self, row: usize) -> usize {
+        let max = self.transcript_max_scroll.get();
+        let viewport = self.transcript_viewport_rows.get().max(1);
+        let top_target = row.saturating_sub(viewport / 2);
+        max.saturating_sub(top_target)
+    }
+
+    /// Scroll the transcript so the focused match is in view. No-op when there
+    /// is no current match.
+    fn search_focus_current(&self) {
+        let Some(s) = self.search.as_ref() else {
+            return;
+        };
+        if let Some(m) = s.matches.get(s.current) {
+            self.set_transcript_scroll(self.search_scroll_offset_for(m.row));
+        }
+    }
+
+    /// Key handler while the search bar is open (a mutually-exclusive mode —
+    /// routed here from the top of [`Self::chat_key`] before the palette /
+    /// mention / recall paths). Esc closes; Enter/↓ and Ctrl+N go to the next
+    /// match, ↑ and Ctrl+P to the previous; Backspace edits; any other printable
+    /// char filters live. Anything else is swallowed (search owns the keyboard).
+    fn search_key(&mut self, key: KeyCode, mods: crossterm::event::KeyModifiers) -> Action {
+        let ctrl = mods.contains(crossterm::event::KeyModifiers::CONTROL);
+        let alt = mods.contains(crossterm::event::KeyModifiers::ALT);
+        match key {
+            KeyCode::Esc => {
+                self.close_search();
+                Action::None
+            }
+            KeyCode::Enter | KeyCode::Down => {
+                self.search_next();
+                Action::None
+            }
+            KeyCode::Up => {
+                self.search_prev();
+                Action::None
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.search_next();
+                Action::None
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.search_prev();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.search_backspace();
+                Action::None
+            }
+            // Printable char (no ctrl/alt) filters the query live. `n`/`N` type
+            // into the box rather than navigating, so a query can contain them —
+            // navigation lives on Enter/↑/↓/Ctrl+N/Ctrl+P (standard incremental
+            // search). Shift is allowed (uppercase chars).
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.search_input_char(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+}
+
+/// Minimum elapsed time a turn/run must have taken before its completion bell
+/// fires (Feature A). A quick chat reply (a couple seconds) shouldn't beep —
+/// only work the user likely stepped away from.
+const BELL_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Parse the `UMADEV_BELL` env value into the completion-bell enable flag.
+/// Default ON; `0` / `false` / `off` / `no` (case-insensitive, trimmed) silence
+/// it. Pure (takes the value) so it's unit-testable without mutating process env.
+#[must_use]
+fn bell_enabled_from_env(val: Option<&str>) -> bool {
+    match val {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// Case-insensitive single-char equality that never changes the char count
+/// (so match offsets stay aligned with the original row's char indices).
+/// ASCII folds via `eq_ignore_ascii_case`; other scripts fall back to full
+/// Unicode lowercase folding compared iterator-to-iterator.
+fn chars_ci_eq(a: char, b: char) -> bool {
+    a == b || a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
 }
 
 /// Parse a `## <heading>` section out of a markdown body and return the first
@@ -16077,5 +16407,217 @@ mod tests {
                 row(pending)
             );
         }
+    }
+
+    // ===== Feature A — completion notification (terminal bell) =====
+
+    #[test]
+    fn bell_env_parsing_default_on_and_falsy_off() {
+        // Unset → default ON.
+        assert!(bell_enabled_from_env(None));
+        // Truthy / unrecognized → ON.
+        assert!(bell_enabled_from_env(Some("1")));
+        assert!(bell_enabled_from_env(Some("on")));
+        assert!(bell_enabled_from_env(Some("")));
+        // The documented OFF values (case-insensitive, trimmed).
+        assert!(!bell_enabled_from_env(Some("0")));
+        assert!(!bell_enabled_from_env(Some("false")));
+        assert!(!bell_enabled_from_env(Some(" OFF ")));
+        assert!(!bell_enabled_from_env(Some("No")));
+    }
+
+    /// Build an `Instant` `secs` in the past (saturating at "now" on the rare
+    /// host where the monotonic clock is younger than `secs`).
+    fn secs_ago(secs: u64) -> Option<std::time::Instant> {
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .or_else(|| Some(std::time::Instant::now()))
+    }
+
+    #[test]
+    fn a_long_finished_run_rings_the_bell_a_quick_one_does_not() {
+        // A run that's been going well past the threshold reaching delivery rings.
+        let mut app = fresh_app(Some("offline"));
+        app.bell_enabled = true;
+        app.run_started = true;
+        app.run_started_at = secs_ago(6);
+        app.apply_engine(EngineEvent::BlockCompleted {
+            final_phase: Phase::Delivery,
+            paused_at: None,
+        });
+        assert!(app.finished);
+        assert!(app.bell_pending, "a long finished run arms the bell");
+        assert_eq!(app.bell_count, 1);
+        // `take_bell` drains it (the event loop emits the BEL once).
+        assert!(app.take_bell());
+        assert!(!app.bell_pending);
+        assert!(!app.take_bell(), "drained — no second beep");
+
+        // A run that JUST started reaching delivery must not beep (quick turn).
+        let mut quick = fresh_app(Some("offline"));
+        quick.bell_enabled = true;
+        quick.run_started = true;
+        quick.run_started_at = Some(std::time::Instant::now());
+        quick.apply_engine(EngineEvent::BlockCompleted {
+            final_phase: Phase::Delivery,
+            paused_at: None,
+        });
+        assert!(quick.finished);
+        assert!(!quick.bell_pending, "a quick run does not beep");
+        assert_eq!(quick.bell_count, 0);
+    }
+
+    #[test]
+    fn an_aborted_long_run_rings_and_umadev_bell_zero_silences() {
+        // A long run that aborts (the ABORT_SENTINEL note) rings the away user.
+        let mut app = fresh_app(Some("offline"));
+        app.bell_enabled = true;
+        app.run_started = true;
+        app.run_started_at = secs_ago(7);
+        app.apply_engine(EngineEvent::Note(format!("{}boom", crate::ABORT_SENTINEL)));
+        assert!(app.aborted, "the sentinel note flips the run into aborted");
+        assert!(app.bell_pending, "an aborted long run arms the bell");
+
+        // bell_enabled = false (UMADEV_BELL=0) silences even a long abort.
+        let mut silent = fresh_app(Some("offline"));
+        silent.bell_enabled = false;
+        silent.run_started = true;
+        silent.run_started_at = secs_ago(7);
+        silent.apply_engine(EngineEvent::Note(format!("{}boom", crate::ABORT_SENTINEL)));
+        assert!(silent.aborted);
+        assert!(!silent.bell_pending, "UMADEV_BELL=0 silences the bell");
+        assert_eq!(silent.bell_count, 0);
+    }
+
+    #[test]
+    fn a_long_agentic_turn_rings_a_short_chat_reply_does_not() {
+        // A long agentic turn settling (the common chat path) rings.
+        let mut app = fresh_app(Some("offline"));
+        app.bell_enabled = true;
+        app.thinking = true;
+        app.thinking_started = secs_ago(6);
+        app.record_agentic_done("done".into(), false, None);
+        assert!(app.bell_pending, "a long agentic turn arms the bell");
+        assert_eq!(app.bell_count, 1);
+
+        // A snappy chat reply (a second or two) does NOT beep.
+        let mut quick = fresh_app(Some("offline"));
+        quick.bell_enabled = true;
+        quick.thinking = true;
+        quick.thinking_started = Some(std::time::Instant::now());
+        quick.record_agentic_done("hi".into(), false, None);
+        assert!(!quick.bell_pending, "a quick reply does not beep");
+        assert_eq!(quick.bell_count, 0);
+    }
+
+    // ===== Feature B — search-in-transcript =====
+
+    /// Seed the folded-row cache + scroll bounds the search normally reads off a
+    /// render, so search logic is testable without a terminal frame.
+    fn seed_transcript(app: &App, rows: &[&str]) {
+        *app.transcript_rows.borrow_mut() = rows.iter().map(|s| (*s).to_string()).collect();
+        *app.transcript_gutters.borrow_mut() = vec![0; rows.len()];
+    }
+
+    #[test]
+    fn search_finds_case_insensitive_matches_and_nav_wraps() {
+        let mut app = fresh_app(Some("offline"));
+        seed_transcript(
+            &app,
+            &["the quick brown fox", "jumps over the lazy dog", "THE END"],
+        );
+        // Renderer-published scroll bounds, so focus-into-view has math to do.
+        app.transcript_max_scroll.set(10);
+        app.transcript_viewport_rows.set(4);
+
+        app.open_search();
+        assert!(app.search.is_some());
+        // Type "the" through the key path (routed to the modal search handler).
+        for c in "the".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
+        }
+        {
+            let s = app.search.as_ref().unwrap();
+            assert_eq!(s.matches.len(), 3, "three case-insensitive matches");
+            assert_eq!(s.current, 0);
+            // Each match carries its (visual-row, char-span) coordinate.
+            assert_eq!(
+                (s.matches[0].row, s.matches[0].start, s.matches[0].end),
+                (0, 0, 3)
+            );
+            assert_eq!(s.matches[1].row, 1);
+            assert_eq!(s.matches[2].row, 2, "uppercase THE matched too");
+        }
+
+        // n/N (next/prev) cycle the current index and WRAP.
+        app.search_next();
+        assert_eq!(app.search.as_ref().unwrap().current, 1);
+        app.search_next();
+        assert_eq!(app.search.as_ref().unwrap().current, 2);
+        app.search_next();
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            0,
+            "next wraps past the end"
+        );
+        app.search_prev();
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            2,
+            "prev wraps past the start"
+        );
+
+        // The current match's position is turned into a scroll offset that brings
+        // its row into view, and navigating actually applied it.
+        let row = app.search.as_ref().unwrap().matches[2].row;
+        let off = app.search_scroll_offset_for(row);
+        assert_eq!(
+            off,
+            app.transcript_scroll(),
+            "focus set the transcript scroll"
+        );
+        // max(10) - (row 2 - viewport/2 (=2) → 0) = 10.
+        assert_eq!(off, 10);
+
+        // Esc clears search entirely.
+        let _ = app.apply_key(crossterm::event::KeyCode::Esc);
+        assert!(app.search.is_none(), "Esc closes + clears search");
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_modally_and_swallows_typing() {
+        let mut app = fresh_app(Some("offline"));
+        seed_transcript(&app, &["alpha beta gamma"]);
+        // Ctrl+F opens the bar.
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(app.search.is_some(), "Ctrl+F opens search");
+        // While open, typing filters the query and never reaches the input box
+        // (so it can't collide with the slash palette / @-mention popover).
+        let before = app.input.clone();
+        for c in "beta".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
+        }
+        assert_eq!(
+            app.input, before,
+            "typing goes to search, not the input box"
+        );
+        let s = app.search.as_ref().unwrap();
+        assert_eq!(s.query, "beta");
+        assert_eq!(s.matches.len(), 1);
+        assert_eq!(s.matches[0].row, 0);
+
+        // Enter advances to the next match (single match → stays put, no panic).
+        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+
+        // A query with no hits clears matches but keeps search open.
+        for c in "ZZZ".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
+        }
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+        assert!(app.search.is_some());
     }
 }

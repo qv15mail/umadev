@@ -188,6 +188,19 @@ mod theme {
             Color::Rgb(0x1d, 0x4e, 0x5e)
         }
     }
+    /// Background wash for the FOCUSED in-transcript search match (Feature B) —
+    /// a warm amber that pops against [`SELECTION_BG`]'s cyan (used for the other,
+    /// non-current matches), so the user can tell which hit `n`/`N` will jump
+    /// from. Same dark/light premix policy; never a naked color at the call site.
+    pub fn MATCH_CUR_BG() -> Color {
+        if IS_LIGHT.load(Ordering::Relaxed) {
+            // amber mixed into the light panel bg — readable behind black text.
+            Color::Rgb(0xfd, 0xe2, 0x8a)
+        } else {
+            // amber mixed into the dark panel bg — visible behind light text.
+            Color::Rgb(0x6b, 0x52, 0x0e)
+        }
+    }
     pub fn MD_HEADING() -> Color {
         pick(&SECONDARY_P)
     }
@@ -2271,6 +2284,15 @@ fn render_chat(frame: &mut Frame, app: &App) {
     // this gap costs no net vertical space.
     render_prompt(frame, chunks[4], app);
 
+    // Feature B — when the search bar is open it OWNS the input mode, so it
+    // replaces the popovers entirely: render the one-row search bar in the spacer
+    // above the prompt (no extra vertical cost) and skip the mention/palette
+    // typeahead (they read the unchanged input box behind the bar).
+    if app.search.is_some() {
+        render_search_bar(frame, chunks[3], app);
+        return;
+    }
+
     // A popover floats above the prompt: the `@`-file-mention typeahead takes
     // precedence over the slash palette so the two are mutually exclusive — only
     // one opens, chosen by what is under the cursor.
@@ -2284,6 +2306,64 @@ fn render_chat(frame: &mut Frame, app: &App) {
     } else {
         render_mention_popover(frame, chunks[4], app, &mention);
     }
+}
+
+/// Feature B — render the one-row in-transcript search bar (Ctrl+F) into the
+/// spacer above the prompt: a `search:` label + the live query on the left, and
+/// either the open-search hint (empty query), a "no matches" note, or the
+/// `current/total matches` counter right-aligned. All colors come from the theme
+/// (no naked hex); fail-open when `app.search` is unexpectedly `None`.
+fn render_search_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(search) = &app.search else {
+        return;
+    };
+    let lang = app.lang;
+    let bar_bg = theme::BG_ELEMENT();
+    // Tint the whole row so the bar reads as a distinct strip, not floating text.
+    frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
+
+    let label = umadev_i18n::t(lang, "tui.search.prompt");
+    let left = Line::from(vec![
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(theme::ACCENT())
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            search.query.clone(),
+            Style::default().fg(theme::TEXT()).bg(bar_bg),
+        ),
+    ]);
+
+    // Right-side status: hint while empty, count when matching, "none" otherwise.
+    let right_text = if search.query.is_empty() {
+        umadev_i18n::t(lang, "tui.hint.search").to_string()
+    } else if search.matches.is_empty() {
+        umadev_i18n::t(lang, "tui.search.none").to_string()
+    } else {
+        umadev_i18n::tf(
+            lang,
+            "tui.search.count",
+            &[
+                &(search.current + 1).to_string(),
+                &search.matches.len().to_string(),
+            ],
+        )
+    };
+    let right = Paragraph::new(Line::from(Span::styled(
+        format!("{right_text} "),
+        Style::default().fg(theme::TEXT_MUTED()).bg(bar_bg),
+    )))
+    .alignment(Alignment::Right);
+
+    // Left content first, then the right-aligned status over the same row — the
+    // status is short and hugs the right edge, so on any reasonable width the two
+    // never overlap (and if they did on a very narrow terminal, the count wins on
+    // the right, which is the more useful half).
+    frame.render_widget(Paragraph::new(left), area);
+    frame.render_widget(right, area);
 }
 
 /// Hard cap on the live plan / team-review panel height so a 20-step plan can't
@@ -3660,6 +3740,15 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    // Feature B — paint the in-transcript search matches over the same folded
+    // rows. The matches were computed against `transcript_rows` (their indices
+    // ARE these visual-row coords), so the spans land exactly where the text is.
+    if let Some(search) = &app.search {
+        if !search.matches.is_empty() {
+            apply_search_highlight(&mut folded, search, &app.transcript_gutters.borrow());
+        }
+    }
+
     let para = Paragraph::new(folded).scroll((scroll, 0));
 
     // Two-way scroll indicator: how many rows are hidden ABOVE the current view
@@ -4286,7 +4375,41 @@ fn apply_selection_highlight_cols(
 /// span's fg + modifiers and gains the selection bg. Fail-open: a `to <= from`
 /// or out-of-range range simply highlights nothing.
 fn highlight_row(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
-    let sel_bg = theme::SELECTION_BG();
+    highlight_row_bg(line, from, to, theme::SELECTION_BG())
+}
+
+/// Paint the in-transcript search matches (Feature B) onto the already-folded
+/// rows, mirroring [`apply_selection_highlight`]: each match's logical char span
+/// is shifted right by its row's gutter width and washed — the FOCUSED match
+/// (`search.current`) with [`theme::MATCH_CUR_BG`], every other match with
+/// [`theme::SELECTION_BG`]. Fail-open: an out-of-range row index is skipped.
+fn apply_search_highlight(
+    folded: &mut [Line<'static>],
+    search: &crate::app::SearchState,
+    gutters: &[usize],
+) {
+    let other_bg = theme::SELECTION_BG();
+    let cur_bg = theme::MATCH_CUR_BG();
+    for (i, m) in search.matches.iter().enumerate() {
+        let shift = gutters.get(m.row).copied().unwrap_or(0);
+        let from = m.start.saturating_add(shift);
+        let to = m.end.saturating_add(shift);
+        let bg = if i == search.current {
+            cur_bg
+        } else {
+            other_bg
+        };
+        if let Some(row) = folded.get_mut(m.row) {
+            *row = highlight_row_bg(row, from, to, bg);
+        }
+    }
+}
+
+/// The color-parameterized core of [`highlight_row`]: rebuild one `Line`,
+/// applying background `bg` to the chars whose (line-wide) char index falls in
+/// `[from, to)`. See [`highlight_row`] for the coordinate-space contract.
+fn highlight_row_bg(line: &Line<'static>, from: usize, to: usize, bg: Color) -> Line<'static> {
+    let sel_bg = bg;
     let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
     let mut idx = 0usize; // running char index across the whole line
     for span in &line.spans {

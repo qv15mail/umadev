@@ -631,6 +631,12 @@
 # @-file-mention typeahead popover title + prompt hint
 "tui.mention.title" = "files"
 "tui.hint.mention" = "↑↓ choose · Tab/Enter insert · Esc close"
+# In-transcript search (Ctrl+F): the prompt label, the live match counter, the
+# empty-result note, and the prompt hint shown while the search bar is open.
+"tui.search.prompt" = "search:"
+"tui.search.count" = "{}/{} matches"
+"tui.search.none" = "no matches"
+"tui.hint.search" = "type to filter · Enter/↓ next · ↑ prev · Esc close"
 # Status row
 "tui.status.complete" = "[ok] complete"
 # Scrollable content overlay progress

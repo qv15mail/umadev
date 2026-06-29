@@ -627,6 +627,11 @@
 # @文件引用 输入联想浮层标题 + 提示
 "tui.mention.title" = "文件"
 "tui.hint.mention" = "↑↓ 选择 · Tab/Enter 插入 · Esc 关闭"
+# 转录内搜索（Ctrl+F）：提示标签、实时匹配计数、无结果提示，以及搜索栏打开时的操作提示。
+"tui.search.prompt" = "搜索:"
+"tui.search.count" = "第 {}/{} 处匹配"
+"tui.search.none" = "无匹配"
+"tui.hint.search" = "输入过滤 · Enter/↓ 下一个 · ↑ 上一个 · Esc 关闭"
 # 状态栏
 "tui.status.complete" = "[ok] 已完成"
 # 可滚动内容浮层进度

@@ -354,6 +354,12 @@ mod tests {
             "tui.hint.running",
             "tui.hint.idle",
             "tui.palette.title",
+            // Phase-2-C-P1: in-transcript search (Ctrl+F) — prompt label, live
+            // match counter, empty-result note, and the open-search prompt hint.
+            "tui.search.prompt",
+            "tui.search.count",
+            "tui.search.none",
+            "tui.hint.search",
             "tui.status.complete",
             "tui.overlay.empty",
             "tui.overlay.progress",

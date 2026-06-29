@@ -4133,6 +4133,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             last_drawn_size = Some((drawn.width, drawn.height));
         }
 
+        // Feature A — completion notification. A turn/run that reached a terminal
+        // state (finished / aborted / paused at a gate) in the PREVIOUS iteration
+        // armed a bell; the frame above has now painted that settled state, so
+        // emit the BEL byte HERE, BETWEEN frames, through the render's OWN backend
+        // writer (R3 single-writer discipline — never a fresh `stdout()` handle,
+        // never mid-paint, outside the BSU/ESU block). `execute` flushes it
+        // immediately. Fail-open: a write error never blocks the loop.
+        if app.take_bell() {
+            let _ = terminal
+                .backend_mut()
+                .execute(crossterm::style::Print('\u{7}'));
+        }
+
         tokio::select! {
             maybe_route = route_rx.recv() => {
                 match maybe_route {
