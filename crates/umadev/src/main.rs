@@ -4414,6 +4414,23 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
 /// Fail-open throughout: any failing precondition or external-command error
 /// prints the manual recipe and returns Ok — never a crash, never a force-push,
 /// never a rewrite of the user's existing commits.
+/// The allowlist of the run's OWN deliverable paths (workspace-relative) that
+/// `pr --create` stages — the docs UmaDev wrote under `output/` and any
+/// proof-pack under `release/`, each only when it exists on disk.
+///
+/// `pr --create` stages EXACTLY these, NEVER `git add -A`: sweeping the whole
+/// dirty tree would commit and PUSH unrelated WIP, a stray secret, or build junk
+/// into the published PR branch — and under `--yes` there is no prompt to catch
+/// it (UD-FLOW-008 reversibility floor). Returns the existing subset, so an empty
+/// result means there is nothing of the run's to commit.
+fn pr_artifact_paths(project_root: &Path) -> Vec<String> {
+    ["output", "release"]
+        .iter()
+        .filter(|rel| project_root.join(rel).exists())
+        .map(|rel| (*rel).to_string())
+        .collect()
+}
+
 fn cmd_pr(
     slug: Option<String>,
     project_root: Option<PathBuf>,
@@ -4495,12 +4512,26 @@ fn cmd_pr(
     // escalates to a confirmation REGARDLESS of mode (auto cannot skip it). We
     // protect the user's repo, so in doubt we confirm. `--yes` is the explicit
     // script/CI bypass; the push + PR-create are audited regardless.
+    // The EXACT artifact set this PR will stage + commit (never the whole tree).
+    // If nothing of the run's exists, there's nothing to publish → manual recipe.
+    let artifacts = pr_artifact_paths(&project_root);
+    if artifacts.is_empty() {
+        println!(
+            "No run artifacts (output/ or release/) to stage — nothing to commit for a PR. \
+             没有可提交的运行产物。"
+        );
+        return pr_fallback(&readiness, &slug, &body_rel, lang);
+    }
     let push_cmd = format!("git push -u origin {}", plan.head_branch);
     let mode = umadev_agent::TrustMode::Auto; // strictest caller; floor still gates
     if umadev_agent::requires_confirmation(mode, &push_cmd, "") && !yes {
+        // List EXACTLY what will be staged/committed so the user can see we are
+        // not sweeping their whole tree (only the run's own deliverables).
         let prompt = format!(
-            "About to push `{}` and open a PR (IRREVERSIBLE network action). Proceed? \
-             即将推送分支并开 PR(不可逆网络动作),确认继续?",
+            "About to stage + commit ONLY these run artifacts: {}\n\
+             then push `{}` and open a PR (IRREVERSIBLE network action). Proceed? \
+             即将仅提交以上运行产物并推送分支开 PR(不可逆网络动作),确认继续?",
+            artifacts.join(", "),
             plan.head_branch
         );
         if !confirm(&prompt) {
@@ -4537,7 +4568,13 @@ fn cmd_pr(
         }
     }
     println!("{}", umadev_i18n::t(lang, "pr.committing"));
-    if !run_pr_git(&project_root, &["add", "-A"]) {
+    // Stage ONLY the run's artifacts (output/ + release/) — pathspec-scoped,
+    // never `git add -A`. `add -- <paths>` cannot reach outside this allowlist,
+    // so unrelated WIP / stray secrets / build junk in the dirty tree are never
+    // committed or pushed.
+    let mut add_args: Vec<&str> = vec!["add", "--"];
+    add_args.extend(artifacts.iter().map(String::as_str));
+    if !run_pr_git(&project_root, &add_args) {
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
     let commit_msg = format!("{slug}: UmaDev pipeline output");
@@ -4774,6 +4811,40 @@ mod tests {
             !resolved.as_os_str().is_empty(),
             "fallback must yield a usable path, never panic"
         );
+    }
+
+    #[test]
+    fn pr_artifact_paths_is_an_allowlist_never_the_whole_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // The run's deliverables...
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output/app-pr-body.md"), "# body").unwrap();
+        std::fs::create_dir_all(root.join("release")).unwrap();
+        // ...alongside unrelated WIP / a stray secret / build junk in the tree.
+        std::fs::write(root.join(".env"), "SECRET=hunter2").unwrap();
+        std::fs::write(root.join("scratch.tmp"), "junk").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        let staged = pr_artifact_paths(root);
+        // ONLY the run's artifact dirs are staged — never `-A`, `.`, or the junk.
+        assert!(staged.contains(&"output".to_string()));
+        assert!(staged.contains(&"release".to_string()));
+        assert!(!staged.iter().any(|p| p == "-A" || p == "."));
+        assert!(!staged.iter().any(|p| p.contains(".env")));
+        assert!(!staged.iter().any(|p| p.contains("scratch.tmp")));
+        assert!(!staged.iter().any(|p| p.contains("node_modules")));
+    }
+
+    #[test]
+    fn pr_artifact_paths_lists_only_existing_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // No output/ or release/ → empty (nothing of the run's to commit).
+        assert!(pr_artifact_paths(root).is_empty());
+        // Only output/ present → exactly that.
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        assert_eq!(pr_artifact_paths(root), vec!["output".to_string()]);
     }
 
     /// The JSON key the base reports a tool's target path under. Built at runtime

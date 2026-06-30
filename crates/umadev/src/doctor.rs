@@ -155,23 +155,81 @@ fn check_claude_hook(workspace: &Path) -> CheckResult {
             detail: ".claude/settings.json exists but is unreadable".to_string(),
         };
     };
-    if content.contains("hook pre-write") {
-        CheckResult {
+    // PARSE the JSON and confirm a LIVE PreToolUse matcher whose command is
+    // UmaDev's own hook (and ideally resolves to an on-disk binary). A bare
+    // `content.contains("hook pre-write")` substring PASSes even when the string
+    // only appears in a comment, in a user's unrelated wrapper, or in a matcher
+    // pointing at a now-dead binary path — false confidence the user has live
+    // governance when they don't.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return CheckResult {
+            name: "Claude Code hook".to_string(),
+            status: Status::Warning,
+            detail: ".claude/settings.json exists but is not valid JSON — the PreToolUse hook \
+                     cannot be confirmed. Fix the JSON, then run `umadev install --host claude-code`."
+                .to_string(),
+        };
+    };
+    let umadev_cmd = value
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+        .and_then(|matchers| {
+            matchers.iter().find_map(|m| {
+                m.get("hooks").and_then(|h| h.as_array()).and_then(|hooks| {
+                    hooks.iter().find_map(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .filter(|c| crate::hook::is_umadev_hook_command(c, None))
+                            .map(str::to_string)
+                    })
+                })
+            })
+        });
+    match umadev_cmd {
+        Some(cmd) if hook_command_resolves(&cmd) => CheckResult {
             name: "Claude Code hook".to_string(),
             status: Status::Passed,
             detail:
                 "PreToolUse governance hook registered (UD-CODE-001/002/005 enforced at write time)"
                     .to_string(),
-        }
-    } else {
-        CheckResult {
+        },
+        Some(_) => CheckResult {
+            name: "Claude Code hook".to_string(),
+            status: Status::Warning,
+            detail: ".claude/settings.json registers the UmaDev PreToolUse hook but its command \
+                     does not resolve to an existing binary (stale path after an upgrade/move). \
+                     Run `umadev install --host claude-code` to repair it."
+                .to_string(),
+        },
+        None => CheckResult {
             name: "Claude Code hook".to_string(),
             status: Status::Warning,
             detail: ".claude/settings.json exists but the UmaDev PreToolUse hook is not registered. \
                      Run `umadev install --host claude-code` for real-time emoji/color/slop interception."
                 .to_string(),
-        }
+        },
     }
+}
+
+/// Does this UmaDev hook `command` point at a program that resolves on disk? The
+/// program token is everything before the `hook <sub>` tail; an absolute/relative
+/// path must be an existing file, a bare name must be on `PATH`. Fail-open: an
+/// empty token is treated as unresolved (a Warning, never a crash).
+fn hook_command_resolves(command: &str) -> bool {
+    let cmd = command.trim();
+    let prog = ["hook pre-write", "hook pre-bash", "hook tool-audit"]
+        .iter()
+        .find_map(|s| cmd.strip_suffix(s))
+        .map_or(cmd, str::trim_end);
+    if prog.is_empty() {
+        return false;
+    }
+    let path = Path::new(prog);
+    if prog.contains(std::path::MAIN_SEPARATOR) || path.is_absolute() {
+        return path.is_file();
+    }
+    which_on_path(prog)
 }
 
 fn check_spec_manifest(workspace: &Path) -> CheckResult {
@@ -899,5 +957,64 @@ mod tests {
         let r = check_ecosystem(tmp.path());
         assert_eq!(r.status, Status::Warning);
         assert!(r.detail.contains("knowledge.json"));
+    }
+
+    fn write_claude_settings(tmp: &Path, command: &str) {
+        let dir = tmp.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Write|Edit|MultiEdit",
+                    "hooks": [{"type": "command", "command": command}]
+                }]
+            }
+        });
+        std::fs::write(dir.join("settings.json"), json.to_string()).unwrap();
+    }
+
+    #[test]
+    fn claude_hook_passes_only_for_a_live_resolving_umadev_command() {
+        let tmp = TempDir::new().unwrap();
+        // Point the registered hook at a real on-disk "binary" so it resolves.
+        let bin = tmp.path().join("umadev");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let cmd = format!("{} hook pre-write", bin.display());
+        write_claude_settings(tmp.path(), &cmd);
+        let r = check_claude_hook(tmp.path());
+        assert_eq!(r.status, Status::Passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn claude_hook_warns_when_registered_command_points_at_dead_binary() {
+        let tmp = TempDir::new().unwrap();
+        // A precisely-ours command, but the binary path does not exist.
+        write_claude_settings(tmp.path(), "/nonexistent/path/umadev hook pre-write");
+        let r = check_claude_hook(tmp.path());
+        assert_eq!(r.status, Status::Warning);
+        assert!(r.detail.contains("does not resolve"), "{}", r.detail);
+    }
+
+    #[test]
+    fn claude_hook_does_not_false_pass_on_substring_or_foreign_wrapper() {
+        // A substring match would PASS on a user's unrelated wrapper; the JSON
+        // parse + precise program match must NOT.
+        let tmp = TempDir::new().unwrap();
+        write_claude_settings(tmp.path(), "/usr/bin/my-wrapper hook pre-write");
+        let r = check_claude_hook(tmp.path());
+        assert_eq!(r.status, Status::Warning);
+        assert!(r.detail.contains("not registered"), "{}", r.detail);
+    }
+
+    #[test]
+    fn claude_hook_warns_on_invalid_json_instead_of_false_pass() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Substring "hook pre-write" present, but the file is not valid JSON.
+        std::fs::write(dir.join("settings.json"), "{ not json: hook pre-write ").unwrap();
+        let r = check_claude_hook(tmp.path());
+        assert_eq!(r.status, Status::Warning);
+        assert!(r.detail.contains("not valid JSON"), "{}", r.detail);
     }
 }

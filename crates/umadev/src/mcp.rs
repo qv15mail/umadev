@@ -516,6 +516,13 @@ fn contract_check_tool(args: &Value) -> (String, bool) {
 fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(String, String)> {
     let output = root.join("output");
     if let Some(slug) = explicit_slug {
+        // A caller-supplied slug is interpolated straight into a filename, so a
+        // value like `../../../../etc/foo` would escape `output/` and read an
+        // arbitrary host file. Reject anything that isn't a single safe path
+        // component before touching the filesystem (fail-open → None).
+        if !is_safe_slug(slug) {
+            return None;
+        }
         let path = output.join(format!("{slug}-architecture.md"));
         let text = std::fs::read_to_string(path).ok()?;
         if text.trim().is_empty() {
@@ -539,6 +546,19 @@ fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(St
         }
     }
     None
+}
+
+/// Is `slug` a single safe path component (no `..`, separators, root, or
+/// prefix)? Anything else, interpolated into a filename and `join`ed under
+/// `output/`, could traverse out of the workspace — so we reject it. Mirrors the
+/// `safe_component` guard in `skill_manager` / `knowledge_manager`.
+fn is_safe_slug(slug: &str) -> bool {
+    use std::path::{Component, Path};
+    if slug.is_empty() {
+        return false;
+    }
+    let mut comps = Path::new(slug).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
 
 /// Stable wire string for a contract-violation kind.
@@ -1259,5 +1279,38 @@ mod tests {
         };
         let resp = handle_request(&req, &Policy::default()).unwrap();
         assert_eq!(resp.error.expect("unknown tool errors").code, -32602);
+    }
+
+    #[test]
+    fn is_safe_slug_rejects_traversal_and_separators() {
+        assert!(is_safe_slug("my-app"));
+        assert!(is_safe_slug("checkout_v2"));
+        assert!(!is_safe_slug(""));
+        assert!(!is_safe_slug(".."));
+        assert!(!is_safe_slug("../../../../etc/foo"));
+        assert!(!is_safe_slug("a/b"));
+        assert!(!is_safe_slug("/etc/passwd"));
+    }
+
+    #[test]
+    fn find_architecture_doc_rejects_slug_traversal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        // A real architecture doc for a SAFE slug is found...
+        std::fs::write(
+            root.join("output/app-architecture.md"),
+            "# API\n| Method | Path |\n",
+        )
+        .unwrap();
+        assert!(find_architecture_doc(root, Some("app")).is_some());
+
+        // ...but a traversal slug that would escape `output/` is refused (None),
+        // even when a target file is placed where the `..` would resolve.
+        std::fs::write(root.join("secret-architecture.md"), "# escaped\nx\n").unwrap();
+        assert!(
+            find_architecture_doc(root, Some("../secret")).is_none(),
+            "a `..` slug must not escape output/"
+        );
     }
 }

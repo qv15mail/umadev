@@ -88,9 +88,22 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
             .unwrap_or(file)
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        // Read the file (best-effort; skip unreadable files).
-        let Ok(content) = std::fs::read_to_string(file) else {
-            continue;
+        // Read the content to scan. In `--changed-only` mode (the pre-commit
+        // hook) we read the STAGED blob (`git show :<file>`), NOT the on-disk
+        // file: the commit captures the index, so judging the dirty working copy
+        // would block a commit on an unstaged hunk and pass a clean staged
+        // version by its dirty working state. Otherwise read on disk. Best-effort:
+        // skip an unreadable file (a binary blob, a path removed from the index).
+        let content = if opts.changed_only {
+            let Some(staged) = read_staged_blob(&opts.project_root, &rel) else {
+                continue;
+            };
+            staged
+        } else {
+            let Ok(disk) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            disk
         };
         let decision = scan_content_with_policy(&rel, &content, &policy);
         if decision.block {
@@ -237,16 +250,22 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Get git-tracked changed files (staged + unstaged + untracked).
+/// Get the files in the STAGED index that differ from `HEAD` — the exact set a
+/// commit would capture. This powers the pre-commit hook, so it must be the
+/// staged scope (`--cached`), NOT the working tree: a `git diff HEAD` would also
+/// include unstaged edits, blocking a commit on a violation that isn't part of
+/// it. With no commits yet, `--cached` compares against the empty tree (all
+/// staged files appear as new), so it still works without the ls-files fallback;
+/// that fallback covers only the "not a git repo" case.
 fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
+        .args(["diff", "--name-only", "--cached"])
         .current_dir(root)
         .output();
     let out = match output {
         Ok(o) if o.status.success() => o.stdout,
         _ => {
-            // Not a git repo or no commits yet — fall back to ls-files.
+            // Not a git repo — fall back to ls-files (tracked, index == HEAD).
             let ls = std::process::Command::new("git")
                 .args(["ls-files"])
                 .current_dir(root)
@@ -270,6 +289,24 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
         .map(|l| root.join(l))
         .collect();
     Ok(files)
+}
+
+/// Read the STAGED content of `rel` (a workspace-relative, forward-slash path)
+/// from the git index via `git show :<rel>`. Returns `None` when the path isn't
+/// staged, the blob is binary/unreadable, or git is unavailable (fail-open: the
+/// caller skips the file).
+fn read_staged_blob(root: &Path, rel: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!(":{rel}")])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // A staged binary blob isn't valid UTF-8 — treat as unreadable (skip), the
+    // same as the on-disk `read_to_string` path does.
+    String::from_utf8(output.stdout).ok()
 }
 
 #[cfg(test)]
@@ -372,6 +409,86 @@ mod tests {
         assert!(names.contains(&"app.ts".to_string()));
         assert!(!names.contains(&"readme.md".to_string()));
         assert!(!names.contains(&"data.json".to_string()));
+    }
+
+    // --- M2: changed-only uses the STAGED index, not the working tree -------
+
+    /// Run a git command in `dir`; returns false if git is missing/fails.
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Init a throwaway repo with a committed identity, or `false` if git is
+    /// unavailable (the caller then skips — no hard git dependency in tests).
+    fn init_repo(dir: &Path) -> bool {
+        git(dir, &["init", "-q"])
+            && git(dir, &["config", "user.email", "t@t.test"])
+            && git(dir, &["config", "user.name", "test"])
+    }
+
+    #[test]
+    fn changed_only_scans_staged_blob_not_dirty_working_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        let file = root.join("app.tsx");
+        // Commit a clean baseline.
+        std::fs::write(&file, "export const x = 1;\n").unwrap();
+        assert!(git(root, &["add", "app.tsx"]));
+        assert!(git(root, &["commit", "-q", "-m", "base"]));
+        // STAGE a different but still CLEAN version (so it appears in --cached).
+        std::fs::write(&file, "export const y = 2;\n").unwrap();
+        assert!(git(root, &["add", "app.tsx"]));
+        // Dirty the WORKING TREE with an emoji violation — but do NOT stage it.
+        std::fs::write(&file, "<b>\u{1f50d}</b>\n").unwrap();
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        // The staged version is clean → no block, even though the working copy
+        // (which the OLD `git diff HEAD` + on-disk read judged) is dirty.
+        assert_eq!(
+            result.files_blocked, 0,
+            "must judge the STAGED blob, not the dirty working copy"
+        );
+        assert!(!result.failed);
+    }
+
+    #[test]
+    fn changed_only_flags_a_violation_in_the_staged_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        let file = root.join("app.tsx");
+        std::fs::write(&file, "export const x = 1;\n").unwrap();
+        assert!(git(root, &["add", "app.tsx"]));
+        assert!(git(root, &["commit", "-q", "-m", "base"]));
+        // STAGE a version WITH a violation; clean it up in the working tree.
+        std::fs::write(&file, "<b>\u{1f50d}</b>\n").unwrap();
+        assert!(git(root, &["add", "app.tsx"]));
+        std::fs::write(&file, "export const ok = 3;\n").unwrap(); // clean working copy
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        // The STAGED blob carries the violation → blocked, regardless of the
+        // now-clean working copy.
+        assert_eq!(result.files_blocked, 1, "staged violation must be flagged");
+        assert!(result.failed);
     }
 
     // --- UD-SEC-016: npm audit parsing ----------------------------------

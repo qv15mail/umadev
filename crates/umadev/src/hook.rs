@@ -538,6 +538,45 @@ fn is_home_claude(project_root: &Path) -> bool {
     canon(project_root) == canon(&home)
 }
 
+/// The hook subcommands UmaDev registers as a host (Pre/PostToolUse `command`s).
+const HOOK_SUBCOMMANDS: [&str; 3] = ["hook pre-write", "hook pre-bash", "hook tool-audit"];
+
+/// True only when `command` is UmaDev's OWN hook invocation — NOT a user's
+/// custom wrapper that merely ends in the same subcommand.
+///
+/// A bare suffix match (`command.ends_with("hook pre-write")`) also matches a
+/// user's `my-wrapper hook pre-write`, so the self-healing install/uninstall
+/// retain-strip would silently DELETE that user's hook. We instead identify the
+/// program token precisely: it is "ours" when its file name is `umadev`
+/// (any install path — upgrade-safe, since an upgrade moves the binary) or it
+/// equals this exact binary (`self_bin`, which also covers a renamed install).
+pub(crate) fn is_umadev_hook_command(command: &str, self_bin: Option<&str>) -> bool {
+    let command = command.trim();
+    for sub in HOOK_SUBCOMMANDS {
+        let Some(prog) = command.strip_suffix(sub) else {
+            continue;
+        };
+        let prog = prog.trim_end();
+        if prog.is_empty() {
+            continue; // no program token — not a real invocation of ours
+        }
+        if self_bin.is_some_and(|b| b.trim() == prog) {
+            return true;
+        }
+        // `Path::file_name` splits on the path separator (not whitespace), so a
+        // space-bearing install path keeps its real basename while a wrapper like
+        // `node shim.js hook pre-write` resolves to `shim.js` (correctly NOT ours).
+        let name = std::path::Path::new(prog)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.eq_ignore_ascii_case("umadev") || name.eq_ignore_ascii_case("umadev.exe") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Install the PreToolUse hook into `<project_root>/.claude/settings.json`
 /// (workspace-level). Idempotent — if the hook is already registered, does
 /// nothing. Returns the settings path on install, or `None` when the install was
@@ -602,18 +641,16 @@ pub fn install_claude_hook(
         return Ok(Some(settings_path));
     };
 
-    // Self-healing install: first REMOVE any existing UmaDev matcher
-    // (matched by the command SUFFIX, so a stale entry from a PRIOR binary path
-    // is purged), then add the current-binary hook. This is idempotent AND
-    // upgrade-safe — full-path matching would (a) fail to dedup after an upgrade
-    // and append a duplicate, and (b) leave the old, now-dead binary path in the
-    // settings so Claude Code execs a nonexistent binary on every write.
-    let is_ours = |c: &str| {
-        let c = c.trim_end();
-        c.ends_with("hook pre-write")
-            || c.ends_with("hook pre-bash")
-            || c.ends_with("hook tool-audit")
-    };
+    // Self-healing install: first REMOVE any existing UmaDev matcher (matched by
+    // its PROGRAM TOKEN — `umadev` at any install path, or this exact binary — so
+    // a stale entry from a PRIOR binary path is purged), then add the
+    // current-binary hook. This is idempotent AND upgrade-safe — a full-path
+    // match would (a) fail to dedup after an upgrade and append a duplicate, and
+    // (b) leave the old, now-dead binary path in the settings so Claude Code
+    // execs a nonexistent binary on every write. A BARE-SUFFIX match would
+    // instead delete a user's own `my-wrapper hook pre-write`, so we match the
+    // program precisely (see `is_umadev_hook_command`).
+    let is_ours = |c: &str| is_umadev_hook_command(c, Some(&bin));
     matchers.retain(|m| {
         m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
             !arr.iter().any(|h| {
@@ -682,15 +719,15 @@ pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<
     let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) else {
         return Ok(());
     };
-    // Match by command SUFFIX so hooks from ANY prior binary path are removed
-    // (an upgrade changes the path — a full-path match would orphan the old,
-    // now-dead hook with no CLI way to clean it up).
-    let is_ours = |c: &str| {
-        let c = c.trim_end();
-        c.ends_with("hook pre-write")
-            || c.ends_with("hook pre-bash")
-            || c.ends_with("hook tool-audit")
-    };
+    // Match by PROGRAM TOKEN so hooks from ANY prior `umadev` path are removed
+    // (an upgrade changes the path — a full-path-only match would orphan the old,
+    // now-dead hook with no CLI way to clean it up) WITHOUT deleting a user's own
+    // `my-wrapper hook pre-write` (a bare-suffix match would). `self_bin` lets us
+    // also recognise this exact install even if renamed.
+    let self_bin = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let is_ours = |c: &str| is_umadev_hook_command(c, self_bin.as_deref());
 
     // Strip our entries from BOTH lifecycle phases: the PreToolUse guards and the
     // PostToolUse audit hook. A retain that leaves a user's own hooks untouched.
@@ -1396,4 +1433,42 @@ mod tests {
     /// Serializes the env-mutating test above so it can't race a sibling test
     /// that also reads `UMADEV_GOVERN_ROOT`.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn is_umadev_hook_command_is_precise_not_a_bare_suffix() {
+        // Ours: the bare program name, any install path, the `.exe` form, and the
+        // exact current binary (even if renamed) — all retain-stripped on install.
+        assert!(is_umadev_hook_command("umadev hook pre-write", None));
+        assert!(is_umadev_hook_command(
+            "/usr/local/bin/umadev hook pre-bash",
+            None
+        ));
+        assert!(is_umadev_hook_command(
+            "/old/path/umadev hook tool-audit",
+            None
+        ));
+        assert!(is_umadev_hook_command("umadev.exe hook pre-write", None));
+        // A space-bearing install path keeps its real basename.
+        assert!(is_umadev_hook_command(
+            "/Applications/My Tools/umadev hook pre-write",
+            None
+        ));
+        // A renamed install is recognised via the exact `self_bin` path.
+        assert!(is_umadev_hook_command(
+            "/opt/renamed-binary hook pre-write",
+            Some("/opt/renamed-binary")
+        ));
+
+        // NOT ours: a user's custom wrapper must NOT be silently deleted, even
+        // though it ends in the same subcommand.
+        assert!(!is_umadev_hook_command("my-wrapper hook pre-write", None));
+        assert!(!is_umadev_hook_command(
+            "node /home/me/umadev-shim.js hook pre-bash",
+            None
+        ));
+        assert!(!is_umadev_hook_command("umadev-fork hook tool-audit", None));
+        // No program token, or an unrelated command, is never ours.
+        assert!(!is_umadev_hook_command("hook pre-write", None));
+        assert!(!is_umadev_hook_command("umadev run", None));
+    }
 }

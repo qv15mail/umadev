@@ -133,6 +133,7 @@ pub fn add_knowledge(
 
     let mut files_copied = 0;
     let mut skipped_non_md = 0;
+    let mut skipped_symlink = 0;
     if source.is_dir() {
         for entry in walk_source(source) {
             // ONLY `.md` is indexed: the runtime RAG walker is markdown-only, so
@@ -140,6 +141,14 @@ pub fn add_knowledge(
             // find it while the BASE never sees it — a silent non-delivery.
             // Restrict here so what we accept is exactly what the base indexes.
             if is_markdown(&entry) {
+                // A SYMLINK with an innocuous `.md` name can point at any host
+                // file; SKIP it (continue) rather than abort the whole add via
+                // `?`, so legit `.md` siblings still get indexed. `symlink_metadata`
+                // does NOT follow the link. (Mirrors skill_manager's skip.)
+                if std::fs::symlink_metadata(&entry).map_or(true, |m| m.file_type().is_symlink()) {
+                    skipped_symlink += 1;
+                    continue;
+                }
                 // Preserve the source's subdirectory structure — flattening to
                 // the basename would silently overwrite same-named files from
                 // different subdirs (a/x.md and b/x.md collide).
@@ -155,14 +164,16 @@ pub fn add_knowledge(
             }
         }
         if files_copied == 0 {
-            // Don't leave an empty registered entry that the base will never
-            // index — tell the user plainly that only markdown is supported.
+            // Don't leave an empty registered entry (or a stray dest dir) that the
+            // base will never index — clean up and tell the user plainly what was
+            // skipped (non-markdown and/or symlinked files).
             let _ = std::fs::remove_dir_all(&dest_dir);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "no .md files found under {} ({skipped_non_md} non-markdown file(s) skipped). \
-                     UmaDev only indexes Markdown (.md); convert .txt/other docs to .md first.",
+                    "no .md files found under {} ({skipped_non_md} non-markdown, \
+                     {skipped_symlink} symlinked file(s) skipped). UmaDev only indexes regular \
+                     Markdown (.md); convert other docs to .md and avoid symlinks.",
                     source.display()
                 ),
             ));
@@ -417,6 +428,42 @@ mod tests {
         let _ = copied; // (sanity) the destination under CUSTOM_DIR holds nothing.
         let dest = tmp.path().join(CUSTOM_DIR).join("docs").join("link.md");
         assert!(!dest.exists(), "symlinked secret must not be copied in");
+        // And the dest dir must NOT be left behind on the rejected add.
+        assert!(
+            !tmp.path().join(CUSTOM_DIR).join("docs").exists(),
+            "stray dest dir must be cleaned up"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_skips_symlinked_markdown_but_still_indexes_legit_siblings() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A secret OUTSIDE the source tree (the symlink target).
+        let secret = tmp.path().join("secret.md");
+        std::fs::write(&secret, "# host secret").unwrap();
+        // Source dir with TWO legit `.md` files AND one symlink to the secret.
+        let src_dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("real-a.md"), "# A").unwrap();
+        std::fs::write(src_dir.join("real-b.md"), "# B").unwrap();
+        symlink(&secret, src_dir.join("link.md")).unwrap();
+
+        // The whole add must NOT abort on the symlink — the two real .md siblings
+        // are still indexed, the symlink is skipped (not copied).
+        let result = add_knowledge(tmp.path(), &src_dir, Some("docs")).unwrap();
+        assert_eq!(
+            result.files_copied, 2,
+            "legit siblings indexed, symlink skipped"
+        );
+        let base = tmp.path().join(CUSTOM_DIR).join("docs");
+        assert!(base.join("real-a.md").exists());
+        assert!(base.join("real-b.md").exists());
+        assert!(
+            !base.join("link.md").exists(),
+            "the symlinked secret must never be copied in"
+        );
     }
 
     #[test]
