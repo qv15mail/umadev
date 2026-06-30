@@ -64,8 +64,10 @@ pub struct ClaudeSession {
     /// Bounded tail of the base's STDERR, captured by the drain task, surfaced
     /// via [`BaseSession::stderr_tail`] to explain *why* a base went idle.
     stderr: StderrTail,
-    /// The pinned conversation id (also usable for `--resume` on recovery, and
-    /// for `--resume <id> --fork-session` to open a read-only critic fork).
+    /// The pinned conversation id (also usable for `--resume` on recovery). A
+    /// read-only critic fork does NOT reuse this — it opens a FRESH independent
+    /// session instead (see [`fork`](BaseSession::fork)), so the critic never
+    /// inherits the main line's deliberation.
     session_id: String,
     /// The resolved `claude` program string this session was spawned with, kept
     /// so [`fork`](BaseSession::fork) re-spawns the SAME binary (honoring a test
@@ -241,15 +243,21 @@ impl ClaudeSession {
 #[async_trait]
 impl BaseSession for ClaudeSession {
     async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-        // A read-only critic fork: resume the MAIN session id and branch it with
-        // `--fork-session` (a new id, the main line untouched), in
-        // `--permission-mode plan` so the fork can READ the workspace + the prior
-        // context but can NEVER write (single-writer invariant — only the main
-        // session writes the blackboard). A fresh fork id is generated so the new
-        // branch gets its own pinned conversation. Fail-open: a spawn failure
-        // surfaces as `Start`, which the caller treats like `ForkUnsupported`.
+        // A read-only critic fork: a FRESH, INDEPENDENT session — a brand-new
+        // `--session-id`, NOT `--resume <main> --fork-session`. Branching the main
+        // line (resume + fork-session) re-loads the doer's FULL transcript into the
+        // critic's context (the self-preference / framing leak); a fresh session
+        // starts on a genuinely clean context at the HOST level and reviews only the
+        // on-disk artifact (the produced `output/*.md` + the source tree, read via
+        // `Read,Grep,Glob`) plus the judge directive it's handed. Spawned with
+        // `current_dir(workspace)`, so the clean session still sees the same on-disk
+        // blackboard the main line wrote. `--permission-mode plan` + the read-only
+        // allowlist fence it so it can READ the workspace but can NEVER write the
+        // blackboard (single-writer invariant — only the main session writes). This
+        // mirrors opencode's fresh-independent-session fork. Fail-open: a spawn
+        // failure surfaces as `Start`, which the caller treats like `ForkUnsupported`.
         let fork_id = new_session_id();
-        let args = fork_session_args(&self.session_id, &fork_id);
+        let args = fork_session_args(&fork_id);
         let s = Self::spawn_with_args(&self.program, &self.workspace, &args, &fork_id).await?;
         Ok(Box::new(s))
     }
@@ -467,14 +475,21 @@ pub fn resume_session_args(
     args
 }
 
-/// The argument vector for a READ-ONLY critic fork: resume `main_session_id` and
-/// branch it with `--fork-session` (so the main line is never disturbed), pin the
-/// new branch to `fork_session_id`, and force `--permission-mode plan` so the
-/// fork can read context + the workspace but can NEVER write a file (the
-/// single-writer invariant). `--allowedTools "Read,Grep,Glob"` further fences it
-/// to read tools. Exposed for tests.
+/// The argument vector for a READ-ONLY critic fork: a FRESH, INDEPENDENT session
+/// pinned to `fork_session_id` with **NO** `--resume <main>` and **NO**
+/// `--fork-session`. Both of those branch the LIVE main conversation, so the
+/// critic would inherit the doer's full deliberation/transcript — the
+/// maker-checker reasoning leak this fixes at the HOST level. A fresh session
+/// starts on a genuinely clean context and reviews only the on-disk artifact (the
+/// produced `output/*.md` + the source tree, read via `Read,Grep,Glob`) plus the
+/// judge directive. It is spawned with `current_dir(workspace)` (see
+/// [`ClaudeSession::spawn_with_args`]), so the clean session still SEES the same
+/// on-disk blackboard the main line wrote. `--permission-mode plan` +
+/// `--allowedTools "Read,Grep,Glob"` are two independent fences on the
+/// single-writer invariant (read the workspace, never write a file). Mirrors
+/// opencode's fresh-independent-session fork. Exposed for tests.
 #[must_use]
-pub fn fork_session_args(main_session_id: &str, fork_session_id: &str) -> Vec<String> {
+pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
     vec![
         "--print".to_string(),
         "--input-format".to_string(),
@@ -486,10 +501,10 @@ pub fn fork_session_args(main_session_id: &str, fork_session_id: &str) -> Vec<St
         // text-suppression invariant: text always comes via `stream_event` deltas.
         "--include-partial-messages".to_string(),
         "--verbose".to_string(),
-        // Branch off the main conversation; the new branch gets its own id.
-        "--resume".to_string(),
-        main_session_id.to_string(),
-        "--fork-session".to_string(),
+        // A FRESH pinned conversation — NO `--resume <main>` (that re-loads the
+        // doer's transcript) and NO `--fork-session` (that branches the live main
+        // line). The critic's context is genuinely clean at the host level; it reads
+        // the artifact from disk + the directive instead of the main deliberation.
         "--session-id".to_string(),
         fork_session_id.to_string(),
         // Read-only: plan mode never applies an edit; the tool allowlist is
@@ -913,13 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn fork_session_args_resume_branch_and_read_only() {
-        let args = fork_session_args("main-sid", "fork-sid");
-        // Branches off the main conversation without disturbing it.
-        assert!(args.contains(&"--resume".to_string()));
-        assert!(args.contains(&"main-sid".to_string()));
-        assert!(args.contains(&"--fork-session".to_string()));
-        // The new branch gets its own pinned id.
+    fn fork_session_args_is_a_fresh_independent_read_only_session() {
+        let args = fork_session_args("fork-sid");
+        // The host-level fix for the maker-checker reasoning leak: a critic fork
+        // must NOT resume the main session id nor branch the live main line —
+        // either would inherit the doer's full deliberation/transcript.
+        assert!(
+            !args.contains(&"--resume".to_string()),
+            "fork must NOT --resume the main conversation: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--fork-session".to_string()),
+            "fork must NOT branch the live main line: {args:?}"
+        );
+        // It still gets its own pinned id so the fresh conversation is independent.
         assert!(args.contains(&"--session-id".to_string()));
         assert!(args.contains(&"fork-sid".to_string()));
         // Read-only: plan mode + a read-only tool allowlist (no Write / Edit).
@@ -933,10 +955,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn fork_spawns_a_read_only_branch_session() {
+    async fn fork_spawns_a_fresh_read_only_session() {
         // The fork is a real, independent BaseSession the critic can drive: the
         // fake `claude` replies to a judge directive with a JSON verdict and ends
-        // the turn. Proves fork() spawns a usable session and the verdict streams.
+        // the turn. Proves fork() spawns a usable FRESH session and the verdict
+        // streams (the fresh session never resumed the main line "sid-main").
         let tmp = tempfile_dir();
         let fake = write_fake_claude(
             &tmp,
@@ -952,7 +975,7 @@ mod tests {
         let mut fork = main
             .fork()
             .await
-            .expect("fork must spawn a read-only branch");
+            .expect("fork must spawn a fresh read-only session");
         fork.send_turn("review from the architect seat, return JSON".to_string())
             .await
             .expect("fork send");
@@ -1012,7 +1035,7 @@ mod tests {
         assert!(session_args("sid", None, false)
             .iter()
             .any(|a| a == "--include-partial-messages"));
-        assert!(fork_session_args("m", "f")
+        assert!(fork_session_args("f")
             .iter()
             .any(|a| a == "--include-partial-messages"));
     }

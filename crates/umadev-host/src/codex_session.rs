@@ -52,8 +52,9 @@
 //!
 //! Control: `turn/interrupt {threadId, turnId}` (interrupt),
 //! `turn/steer {threadId, turnId, input}` (queue input mid-turn),
-//! `thread/fork {threadId, ephemeral:true}` (read-only critic fork),
-//! `thread/resume {threadId}` (crash recovery).
+//! a fresh read-only `thread/start` on its own app-server (the read-only critic
+//! fork — a clean, independent thread, NOT a branch/resume of the main line),
+//! `thread/resume {threadId}` (writable crash recovery).
 //!
 //! **Fail-open by contract:** any parse failure, a JSON-RPC `error` (e.g. the
 //! `-32001` "overloaded" surface), or the child process dying mid-turn
@@ -100,8 +101,8 @@ fn codex_app_server_subcmd() -> String {
 /// directly. Fail-open: unset / unknown → the safe `workspace-write` baseline,
 /// so default behaviour is UNCHANGED and a typo can never widen the sandbox.
 ///
-/// (The read-only critic fork — [`thread_resume_params`] — is NEVER driven by
-/// this: its `read-only` sandbox is the single-writer invariant, not a knob.)
+/// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
+/// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
 fn codex_sandbox_mode() -> &'static str {
     resolve_codex_sandbox(std::env::var("UMADEV_CODEX_SANDBOX").ok().as_deref())
 }
@@ -136,8 +137,10 @@ fn codex_approval_policy(sandbox: &str, autonomous: bool) -> &'static str {
     }
 }
 
-/// How long the `initialize` / `thread/start` (and fork `thread/resume`)
-/// handshake may take before [`start`](CodexSession::start) gives up. WITHOUT
+/// How long the `initialize` / `thread/start` (the writable main start, the
+/// writable cross-session resume, and the read-only critic fork's fresh
+/// `thread/start`) handshake may take before [`start`](CodexSession::start) gives
+/// up. WITHOUT
 /// this bound a `codex app-server` that spawns but never replies (a wedged
 /// login / config) would hang `start()` forever; the bound surfaces it as a
 /// [`SessionError::Start`] instead. Mirrors opencode's `serve_start_timeout`:
@@ -149,21 +152,6 @@ fn handshake_timeout() -> Duration {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
         .map_or_else(|| Duration::from_secs(30), Duration::from_secs)
-}
-
-/// How long [`fork`](CodexSession::fork) waits for the app-server's `thread/fork`
-/// REPLY before deciding the method is unsupported and falling back to a
-/// read-only resume. A real fork replies in well under a second; this only bounds
-/// a server that SILENTLY IGNORES the method (no result, no error) — without the
-/// bound `fork()` awaits the response forever. Kept short (independent of
-/// [`handshake_timeout`], which still budgets the resume fallback) so the critic
-/// degrades fast; tunable via `UMADEV_CODEX_FORK_PROBE_SECS`.
-fn fork_probe_timeout() -> Duration {
-    std::env::var("UMADEV_CODEX_FORK_PROBE_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .map_or_else(|| Duration::from_secs(10), Duration::from_secs)
 }
 
 /// How long [`interrupt`](CodexSession::interrupt) waits for the turn id to be
@@ -241,10 +229,11 @@ pub struct CodexSession {
     /// [`fork`](BaseSession::fork) spawns the SAME binary (honoring a test fake /
     /// `UMADEV_CODEX_BIN`).
     program: String,
-    /// The workspace, so a fork resumes the thread in the same project dir.
+    /// The workspace, so a fork opens its fresh read-only thread in the same
+    /// project dir (`cwd`) and can read the on-disk blackboard.
     workspace: std::path::PathBuf,
-    /// The model id this session was started with, forwarded to a fork's
-    /// `thread/resume` so the critic uses the same brain.
+    /// The model id this session was started with, forwarded to a fork's fresh
+    /// read-only `thread/start` so the critic uses the same brain.
     model: String,
     /// The `codex app-server` child. Behind a [`std::sync::Mutex`] so the
     /// `&self` [`BaseSession::try_exit_status`] can do a non-blocking
@@ -362,8 +351,9 @@ impl CodexSession {
     /// existing `thread_id` WRITABLE (`thread/resume` with a workspace-write
     /// sandbox), so a `/continue` after the TUI closed mid-build re-opens the SAME
     /// thread with its OWN accumulated context instead of cold-priming a new one.
-    /// The opposite of [`start_fork`](Self::start_fork) (which resumes read-only for
-    /// a critic). `UMADEV_CODEX_BIN` override honored.
+    /// The opposite of [`start_fork`](Self::start_fork) (which opens a FRESH
+    /// read-only thread for a critic, inheriting NO context).
+    /// `UMADEV_CODEX_BIN` override honored.
     ///
     /// Fail-open by contract: a spawn / handshake / resume failure surfaces as
     /// [`SessionError::Start`] — the caller degrades to a fresh [`start`](Self::start),
@@ -439,13 +429,16 @@ impl CodexSession {
     }
 
     /// Start a READ-ONLY critic fork: a fresh, independent `codex app-server`
-    /// that RESUMES the main thread (`fork_thread_id`) in a read-only sandbox.
+    /// that opens a BRAND-NEW thread (`thread/start`) in a `read-only` sandbox —
+    /// it does NOT resume or branch the main thread, so the critic never inherits
+    /// the doer's deliberation/transcript at the host level (the maker-checker
+    /// reasoning leak this fixes).
     ///
     /// Forking onto its OWN process means the critic can never collide with the
     /// main writer session's in-flight turn (single-writer invariant), and
     /// `sandbox:"read-only"` + `approvalPolicy:"never"` fence it so it can read the
-    /// blackboard + the prior context but can NEVER write a file. Resuming the
-    /// main thread id gives the seat the main line's accumulated context.
+    /// blackboard (in `cwd:workspace`) + be handed the artifact via the directive
+    /// but can NEVER write a file. The fresh thread starts on a clean context.
     ///
     /// Fail-open: a spawn / handshake failure surfaces as [`SessionError::Start`],
     /// which the caller treats exactly like `ForkUnsupported` (degrade, never
@@ -454,7 +447,6 @@ impl CodexSession {
         program: &str,
         workspace: &Path,
         model: &str,
-        fork_thread_id: &str,
         handshake_budget: Duration,
     ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
@@ -478,14 +470,16 @@ impl CodexSession {
             latest_usage,
             event_tx.clone(),
         ));
-        let session = Self {
+        let mut session = Self {
             stdin,
             events: event_rx,
             event_tx,
             pending,
             approvals,
             next_id: AtomicI64::new(1),
-            thread_id: fork_thread_id.to_string(),
+            // Filled by the read-only `thread/start` handshake below (a FRESH
+            // thread id, not the main thread's).
+            thread_id: String::new(),
             turn_id,
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
@@ -493,9 +487,7 @@ impl CodexSession {
             child: std::sync::Mutex::new(child),
             stderr: stderr_tail,
         };
-        session
-            .fork_handshake(fork_thread_id, handshake_budget)
-            .await?;
+        session.fork_start_handshake(handshake_budget).await?;
         Ok(session)
     }
 
@@ -550,12 +542,11 @@ impl CodexSession {
         Ok(())
     }
 
-    /// Run `initialize → initialized → thread/resume` for a read-only fork.
-    async fn fork_handshake(
-        &self,
-        fork_thread_id: &str,
-        budget: Duration,
-    ) -> Result<(), SessionError> {
+    /// Run `initialize → initialized → thread/start` (read-only sandbox) for a
+    /// read-only critic fork, capturing the FRESH `thread.id`. Unlike a resume
+    /// this opens a brand-new thread, so the critic starts on a genuinely clean
+    /// context that never inherits the main (doer) line's deliberation.
+    async fn fork_start_handshake(&mut self, budget: Duration) -> Result<(), SessionError> {
         self.request_bounded(
             "initialize",
             &initialize_params(),
@@ -566,14 +557,17 @@ impl CodexSession {
         self.notify("initialized", json!({}))
             .await
             .map_err(|e| SessionError::Start(format!("codex fork initialized: {e}")))?;
-        // Resume the main thread on this independent server, read-only.
-        self.request_bounded(
-            "thread/resume",
-            &thread_resume_params(fork_thread_id, &self.workspace, &self.model),
-            budget,
-            "codex thread/resume",
-        )
-        .await?;
+        // A FRESH thread on this independent server, read-only — NOT a resume or
+        // branch of the main thread (that would inherit the doer's transcript).
+        let started = self
+            .request_bounded(
+                "thread/start",
+                &thread_start_params_readonly(&self.workspace, &self.model),
+                budget,
+                "codex fork thread/start",
+            )
+            .await?;
+        self.thread_id = extract_thread_id(&started)?;
         Ok(())
     }
 
@@ -759,13 +753,15 @@ fn thread_start_params_for(
     params
 }
 
-/// Build the `thread/resume` params for a READ-ONLY critic fork: resume
-/// `thread_id` in `workspace` with `sandbox:"read-only"` + `approvalPolicy:"never"`
-/// so the seat reads context + the blackboard but can NEVER write a file (the
-/// single-writer invariant). The model is forwarded only when codex-native.
-fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value {
+/// Build the `thread/start` params for a READ-ONLY critic fork: a FRESH thread in
+/// `workspace` with `sandbox:"read-only"` + `approvalPolicy:"never"` so the seat
+/// reads the blackboard (in `cwd`) but can NEVER write a file (the single-writer
+/// invariant) — and, because it is a fresh `thread/start` (not a resume/branch of
+/// the main thread), it never inherits the doer's deliberation/transcript (the
+/// host-level fix for the maker-checker reasoning leak). The model is forwarded
+/// only when codex-native.
+fn thread_start_params_readonly(workspace: &Path, model: &str) -> Value {
     let mut params = json!({
-        "threadId": thread_id,
         "cwd": workspace.to_string_lossy(),
         "approvalPolicy": "never",
         // Kebab-case (see `thread_start_params`): `readOnly` → `read-only`.
@@ -781,8 +777,8 @@ fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value
 /// `thread_id` with `sandbox:"workspace-write"` + the autonomy-tiered
 /// `approvalPolicy` (mirroring [`thread_start_params`]), so the resumed thread can
 /// keep WRITING the workspace with its OWN accumulated context — the opposite of
-/// the read-only critic [`thread_resume_params`]. The model is forwarded only when
-/// codex-native.
+/// the fresh read-only critic [`thread_start_params_readonly`]. The model is
+/// forwarded only when codex-native.
 fn thread_resume_params_writable(
     thread_id: &str,
     workspace: &Path,
@@ -820,13 +816,6 @@ fn thread_resume_params_writable_for(
         params["model"] = json!(m);
     }
     params
-}
-
-/// Build the `thread/fork` params: branch `thread_id` into an EPHEMERAL thread
-/// (`ephemeral:true`) for a read-only critic review — the new branch is
-/// throwaway and never mutates the main line.
-fn thread_fork_params(thread_id: &str) -> Value {
-    json!({ "threadId": thread_id, "ephemeral": true })
 }
 
 /// A JSON-RPC request envelope (the `"jsonrpc"` member is omitted on the wire).
@@ -1554,34 +1543,25 @@ fn truncate(s: &str, max: usize) -> String {
 #[async_trait]
 impl BaseSession for CodexSession {
     async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-        // Ask the live app-server to fork the main thread into an EPHEMERAL
-        // branch (`thread/fork {threadId, ephemeral:true}`), so the critic
-        // reviews a snapshot that never affects the main line. If the running
-        // base doesn't support `thread/fork`, fall back to resuming the main
-        // thread id directly — still read-only + on its own server, so still
-        // isolated. Either way the critic runs on a SEPARATE read-only process.
-        // BOUND the fork request: `request()` awaits the oneshot UNBOUNDED, and the
-        // "unsupported → resume" fallback assumes a JSON-RPC *error reply*. An
-        // app-server that SILENTLY IGNORES `thread/fork` (no result, no error) would
-        // hang `fork()` forever. Time-bound it so an elapse is treated exactly like
-        // "unsupported" → the read-only resume fallback (fail-open, still isolated).
-        let fork_thread_id = match tokio::time::timeout(
-            fork_probe_timeout(),
-            self.request("thread/fork", &thread_fork_params(&self.thread_id)),
-        )
-        .await
-        {
-            Ok(Ok(result)) => extract_thread_id(&result).unwrap_or_else(|_| self.thread_id.clone()),
-            // `thread/fork` unsupported / errored / silently ignored (elapsed) →
-            // resume the main thread read-only instead (fail-open, still isolated
-            // + non-writing).
-            Ok(Err(_)) | Err(_) => self.thread_id.clone(),
-        };
+        // A read-only critic fork: a FRESH, INDEPENDENT thread on its OWN
+        // `codex app-server` — a brand-new `thread/start` in a `read-only`
+        // sandbox, NOT a `thread/fork`/`thread/resume` of the LIVE main thread.
+        // Both `thread/fork {ephemeral}` and resuming the main thread re-load the
+        // doer's full deliberation/transcript into the critic's context (the
+        // self-preference / framing leak this fixes at the HOST level). A fresh
+        // thread starts genuinely clean and reviews only the on-disk artifact (the
+        // produced `output/*.md` + the source tree, read in `cwd:workspace`) plus
+        // the judge directive it's handed. Its own app-server process means it can
+        // never collide with the main writer's in-flight turn (single-writer
+        // invariant), and `sandbox:"read-only"` fences it so it can read the
+        // blackboard but can NEVER write a file. Mirrors opencode's
+        // fresh-independent-session fork. Fail-open: a spawn / handshake failure
+        // surfaces as `Start`, which the caller treats exactly like
+        // `ForkUnsupported` (degrade, never block).
         let s = Self::start_fork(
             &self.program,
             &self.workspace,
             &self.model,
-            &fork_thread_id,
             handshake_timeout(),
         )
         .await?;
@@ -1868,23 +1848,26 @@ mod tests {
     }
 
     #[test]
-    fn thread_fork_params_marks_ephemeral() {
-        let p = thread_fork_params("thr_main");
-        assert_eq!(p["threadId"], "thr_main");
-        assert_eq!(p["ephemeral"], true);
-    }
-
-    #[test]
-    fn thread_resume_params_is_read_only_sandbox() {
-        // A critic fork resumes the thread read-only: never-approve + readOnly
-        // sandbox so it can never write the workspace (single-writer invariant).
-        let p = thread_resume_params("thr_main", Path::new("/tmp/p"), "gpt-5-codex");
-        assert_eq!(p["threadId"], "thr_main");
+    fn thread_start_params_readonly_is_a_fresh_read_only_thread() {
+        // The host-level fix for the maker-checker reasoning leak: a critic fork
+        // opens a FRESH thread (`thread/start`), it does NOT resume or branch the
+        // main thread. So the params must carry NO `threadId` (nothing to inherit)
+        // and must be read-only: never-approve + read-only sandbox so it can never
+        // write the workspace (single-writer invariant).
+        let p = thread_start_params_readonly(Path::new("/tmp/p"), "gpt-5-codex");
+        assert!(
+            p.get("threadId").is_none(),
+            "a fresh critic thread must NOT resume/branch a main thread id: {p}"
+        );
+        assert_eq!(
+            p["cwd"], "/tmp/p",
+            "fresh thread reads the on-disk blackboard"
+        );
         assert_eq!(p["approvalPolicy"], "never");
         assert_eq!(p["sandbox"], "read-only");
         assert_eq!(p["model"], "gpt-5-codex");
         // A non-codex model is dropped (account default), same as thread/start.
-        let p2 = thread_resume_params("thr_main", Path::new("/tmp/p"), "claude-sonnet-4-6");
+        let p2 = thread_start_params_readonly(Path::new("/tmp/p"), "claude-sonnet-4-6");
         assert!(p2.get("model").is_none());
     }
 
@@ -1892,7 +1875,7 @@ mod tests {
     fn thread_resume_params_writable_is_workspace_write() {
         // A cross-session resume re-opens the thread WRITABLE: workspace-write
         // sandbox + the autonomy-tiered approval policy, so it can keep building
-        // (the opposite of the read-only critic resume above).
+        // (the opposite of the fresh read-only critic thread/start above).
         let auto =
             thread_resume_params_writable("thr_main", Path::new("/tmp/p"), "gpt-5-codex", true);
         assert_eq!(auto["threadId"], "thr_main");
@@ -2721,43 +2704,45 @@ done
         let _ = session.end().await;
     }
 
-    /// A fake app-server that replies to initialize / thread/start / thread/resume
-    /// but SILENTLY IGNORES `thread/fork` (no result, no error) — the bug trigger.
+    /// A fake app-server that LOGS every JSON-RPC `method` it receives to
+    /// `codex-methods.log` in its cwd (the per-test workspace dir), then replies.
+    /// It can answer `thread/start` AND `thread/fork` / `thread/resume` — so if the
+    /// fork path still branched/resumed the main thread, the log would reveal it.
+    /// With the fix the fork only ever sends `initialize` + `thread/start`.
     #[cfg(unix)]
-    const FAKE_APP_SERVER_IGNORES_FORK: &str = r#"#!/bin/sh
+    const FAKE_APP_SERVER_RECORDS_METHODS: &str = r#"#!/bin/sh
 extract_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+extract_method() { printf '%s' "$1" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p'; }
 while IFS= read -r line; do
+  m=$(extract_method "$line")
+  [ -n "$m" ] && printf '%s\n' "$m" >> codex-methods.log
   case "$line" in
-    *'"method":"thread/fork"'*) : ;;
     *'"method":"initialize"'*)
       printf '{"id":%s,"result":{"userAgent":"fake"}}\n' "$(extract_id "$line")" ;;
     *'"method":"initialized"'*) : ;;
     *'"method":"thread/start"'*)
-      printf '{"id":%s,"result":{"thread":{"id":"thr_test","sessionId":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+      printf '{"id":%s,"result":{"thread":{"id":"thr_fresh","sessionId":"thr_fresh"}}}\n' "$(extract_id "$line")" ;;
     *'"method":"thread/resume"'*)
-      printf '{"id":%s,"result":{"thread":{"id":"thr_test","sessionId":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+      printf '{"id":%s,"result":{"thread":{"id":"thr_resumed","sessionId":"thr_resumed"}}}\n' "$(extract_id "$line")" ;;
+    *'"method":"thread/fork"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_forked","sessionId":"thr_forked"}}}\n' "$(extract_id "$line")" ;;
   esac
 done
 "#;
 
-    /// Serialises the one test that mutates the process-global fork-probe env so a
-    /// concurrent test can't observe it.
-    #[cfg(unix)]
-    static FORK_PROBE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    // M5: `fork()` asks the app-server to `thread/fork`. If the server SILENTLY
-    // ignores that method, the old UNBOUNDED `request()` await hung fork() forever.
-    // The bounded fork probe must elapse → fall back to the read-only resume, so
-    // fork() returns a working session promptly. Only the fork-probe budget is made
-    // tiny; the resume fallback keeps the full handshake budget (robust under load).
-    // The outer timeout turns a regression (hang) into a clean FAIL.
+    // The host-level fix for the maker-checker reasoning leak: `fork()` must open a
+    // FRESH, INDEPENDENT thread (a new `thread/start`) on its own app-server — it
+    // must NOT `thread/fork` or `thread/resume` the LIVE main thread, either of
+    // which would inherit the doer's deliberation/transcript into the read-only
+    // critic. The fake records every method it sees, so we can prove the fork sent
+    // a `thread/start` and never a `thread/fork` / `thread/resume`. The outer
+    // timeout turns a regression (hang) into a clean FAIL.
     #[cfg(unix)]
     #[tokio::test]
-    async fn fork_falls_back_to_resume_when_thread_fork_is_silently_ignored() {
-        let _env = FORK_PROBE_ENV_LOCK.lock().await;
+    async fn fork_opens_a_fresh_thread_not_a_fork_or_resume_of_the_main() {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("codex");
-        write_fake_codex(&script, FAKE_APP_SERVER_IGNORES_FORK);
+        write_fake_codex(&script, FAKE_APP_SERVER_RECORDS_METHODS);
 
         let mut session = CodexSession::start_with_program_timeout(
             script.to_str().unwrap(),
@@ -2768,21 +2753,43 @@ done
         )
         .await
         .expect("main handshake should succeed");
+        assert_eq!(session.thread_id, "thr_fresh", "main thread.id captured");
 
-        // Make ONLY the fork probe tiny — the resume fallback still uses the
-        // generous default handshake budget so it can't flake under load.
-        std::env::set_var("UMADEV_CODEX_FORK_PROBE_SECS", "1");
-        let started = std::time::Instant::now();
-        let forked = tokio::time::timeout(Duration::from_secs(60), session.fork()).await;
-        std::env::remove_var("UMADEV_CODEX_FORK_PROBE_SECS");
+        // Isolate the fork's JSON-RPC methods: clear the log the main start wrote
+        // (the main app-server is idle — we send it nothing between start and fork).
+        let log = dir.path().join("codex-methods.log");
+        std::fs::write(&log, "").unwrap();
 
-        let mut forked = forked
-            .expect("fork() must NOT hang on a silently-ignored thread/fork")
-            .expect("fork() must fall back to a read-only resume");
+        let mut forked = tokio::time::timeout(Duration::from_secs(60), session.fork())
+            .await
+            .expect("fork() must NOT hang")
+            .expect("fork() opens a fresh read-only thread");
+
+        // The fork handshake awaits the `thread/start` reply, so by the time `fork()`
+        // returns the fake has already logged the fork's methods. A tiny bounded poll
+        // guards against any read-before-flush jitter.
+        let mut methods = String::new();
+        for _ in 0..50 {
+            methods = std::fs::read_to_string(&log).unwrap_or_default();
+            if methods.contains("thread/start") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
-            started.elapsed() < Duration::from_secs(45),
-            "fork should fall back after the ~1s probe, not hang"
+            methods.contains("thread/start"),
+            "fork must open a FRESH thread via thread/start: {methods:?}"
         );
+        assert!(
+            !methods.contains("thread/fork"),
+            "fork must NOT branch the live main thread (thread/fork): {methods:?}"
+        );
+        assert!(
+            !methods.contains("thread/resume"),
+            "fork must NOT resume the main thread (thread/resume): {methods:?}"
+        );
+        // The fork is itself a working, independent read-only session.
+        assert_eq!(forked.session_id(), Some("thr_fresh"));
         let _ = forked.end().await;
         let _ = session.end().await;
     }
