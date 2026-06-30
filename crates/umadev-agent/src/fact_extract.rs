@@ -119,8 +119,9 @@ fn extraction_directive() -> String {
 /// leading list marker (dash / star / bullet / an ordered "n." or "n)"), split on
 /// its FIRST colon (ASCII `:` or full-width `：` so a Chinese reply parses too), and
 /// its key + value are de-fenced of surrounding markdown (`` ` `` / `*`). A line
-/// with no colon, an empty key/value, or a bare `none` token is skipped — so a
-/// sentence, a header (`facts:` with an empty value), or a `none` reply all yield
+/// with no colon, an empty key/value, or a bare `none` token on EITHER side (key
+/// OR value) is skipped — so a sentence, a header (`facts:` with an empty value),
+/// a `none` reply, AND a "no fact established" line like `node: none` all yield
 /// nothing. The result is bounded to [`MAX_FACTS_PER_EXTRACTION`]; further
 /// dedup-by-key plus field truncation happen in
 /// [`crate::project_facts::record_facts`].
@@ -146,7 +147,9 @@ pub(crate) fn parse_facts(reply: &str) -> Vec<Fact> {
             .nth(1)
             .map_or("", |(off, _)| &line[idx + off..]);
         let value = clean_field(after);
-        if key.is_empty() || value.is_empty() || is_none_token(&key) {
+        // Skip an empty key/value, OR a `none` on EITHER side: a `none: …` header
+        // and a `node: none` "no fact established" line are both no-ops.
+        if key.is_empty() || value.is_empty() || is_none_token(&key) || is_none_token(&value) {
             continue;
         }
         out.push(Fact::new(key, value, None::<String>));
@@ -442,6 +445,20 @@ mod tests {
         for r in ["none", "None.", "  (none)  ", "NONE", ""] {
             assert!(parse_facts(r).is_empty(), "{r:?} → no facts");
         }
+    }
+
+    #[test]
+    fn parse_skips_a_none_valued_line() {
+        // Low: a `key: none` line means "no fact established" for that key — it must
+        // NOT record a fact with the literal value "none". A real fact alongside it
+        // still parses.
+        let facts = parse_facts("node: none\napi_port: 8787\njdk: None.");
+        let keys: Vec<&str> = facts.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["api_port"], "only the real fact survives: {facts:?}");
+        assert!(
+            !facts.iter().any(|f| f.value.eq_ignore_ascii_case("none")),
+            "no fact may carry a bare 'none' value: {facts:?}"
+        );
     }
 
     #[test]

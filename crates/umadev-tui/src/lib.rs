@@ -681,6 +681,16 @@ impl ResidentChat {
 /// chat tracks the warm/primed state the director path does not need.
 type ChatSessionHolder = Arc<tokio::sync::Mutex<Option<ResidentChat>>>;
 
+/// Holds the base's most-recent **`AskUserQuestion`** across turns so the user's
+/// NEXT chat line is relayed back as a resolved, framed answer rather than the raw
+/// (and easily-misread) bare option number. Set when the chat drain surfaces a
+/// base question; taken + cleared at the start of the next turn, which relays the
+/// user's reply through [`umadev_agent::ask_question_relay_or_passthrough`]. Shared
+/// `Arc` between the event loop and the spawned chat-turn tasks (a
+/// `tokio::sync::Mutex` so a task can take it across `.await`). Fail-open: an empty
+/// holder means the line is sent verbatim.
+type PendingAskHolder = Arc<tokio::sync::Mutex<Option<umadev_runtime::AskUserQuestion>>>;
+
 /// Decide whether the TUI's `run` intent flows through the **continuous
 /// long-session path** (one persistent director session) or the legacy per-phase
 /// single-shot path. The continuous path is now the DEFAULT (mirrors
@@ -2286,6 +2296,7 @@ async fn drive_agentic_stream(
 fn fire_agentic(
     app: &mut App,
     chat_session: &ChatSessionHolder,
+    pending_ask: &PendingAskHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     task: String,
@@ -2346,6 +2357,7 @@ fn fire_agentic(
             autonomous,
             resume_session_id,
             chat_session: chat_session.clone(),
+            pending_ask: pending_ask.clone(),
             sink: sink.clone(),
             route_tx: route_tx.clone(),
         }))
@@ -2456,6 +2468,7 @@ struct RoutedTurnInputs {
 async fn run_routed_turn(
     inputs: RoutedTurnInputs,
     chat_session: ChatSessionHolder,
+    pending_ask: PendingAskHolder,
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
@@ -2491,6 +2504,7 @@ async fn run_routed_turn(
             autonomous,
             resume_session_id,
             chat_session,
+            pending_ask,
             sink,
             route_tx,
         })
@@ -2554,6 +2568,10 @@ struct ChatSessionTurn {
     /// the pre-load (or the first turn's lazy-open) lands it; parked back after each
     /// `TurnDone`.
     chat_session: ChatSessionHolder,
+    /// The base's pending `AskUserQuestion` (set by a PRIOR turn's drain). Taken +
+    /// cleared at the start of THIS turn so the user's reply is relayed back as a
+    /// resolved, framed answer; re-set if THIS turn surfaces a new question.
+    pending_ask: PendingAskHolder,
     /// Live event sink (the same `WorkerStream` render path the director uses).
     sink: Arc<ChannelSink>,
     /// Terminal-decision channel back to the event loop.
@@ -2943,9 +2961,21 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         autonomous,
         resume_session_id,
         chat_session,
+        pending_ask,
         sink,
         route_tx,
     } = turn;
+
+    // RELAY a pending base `AskUserQuestion`: if a PRIOR turn surfaced a structured
+    // question, the user's reply this turn is their ANSWER — resolve a bare option
+    // number to its label and frame it as the explicit choice so the base continues
+    // with it instead of misreading the raw index. Taken + cleared here (one-shot);
+    // a fresh question THIS turn re-sets it below. Fail-open: no pending question →
+    // the line is sent verbatim.
+    let text = {
+        let pending = pending_ask.lock().await.take();
+        umadev_agent::ask_question_relay_or_passthrough(pending.as_ref(), &text)
+    };
 
     // Pre-turn git snapshot (fail-open: git missing → None → the fact line is
     // skipped). Used after the turn to report the real changed-file set.
@@ -3118,13 +3148,15 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 // non-interactively, so that call can't pop up its picker and
                 // auto-cancels — it used to render as a bare optionless stub and read
                 // as cancelled. Surface the question + numbered options as a Note +
-                // give the tool row a real detail, so the user sees what's asked and
-                // can answer it (the reply flows back into THIS same session — the
-                // base kept the question in its own context). Fail-open: a
-                // non-question / unreadable call → None → the plain tool row.
-                if let Some(surface) = umadev_agent::ask_question_surface(&name, &input) {
-                    detail = surface.detail;
-                    sink.emit(EngineEvent::Note(surface.note));
+                // give the tool row a real detail, AND STORE the parsed question so
+                // the user's NEXT line is relayed back as a resolved, framed answer
+                // (the reply flows into THIS same session — the base kept the question
+                // in its own context). Fail-open: a non-question / unreadable call →
+                // None → the plain tool row, nothing stored.
+                if let Some(q) = umadev_runtime::AskUserQuestion::from_tool_input(&name, &input) {
+                    detail = q.summary();
+                    sink.emit(EngineEvent::Note(umadev_agent::ask_question_note(&q)));
+                    *pending_ask.lock().await = Some(q);
                 }
                 // P1: forward the structured before/after for a Write/Edit so the
                 // TUI draws a live diff card on the reactive session path too.
@@ -3338,11 +3370,19 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
 fn drain_next_queued_chat(
     app: &mut App,
     chat_session: &ChatSessionHolder,
+    pending_ask: &PendingAskHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let text = app.take_next_queued_chat()?;
-    Some(fire_agentic(app, chat_session, sink, route_tx, text))
+    Some(fire_agentic(
+        app,
+        chat_session,
+        pending_ask,
+        sink,
+        route_tx,
+        text,
+    ))
 }
 
 /// The terminal outcome of a spawned token-budgeted compaction job, sent back to
@@ -4227,6 +4267,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // a backend switch (see those arms). Distinct from `session_holder` (the
     // director-run continuous session) — chat and `/run` keep separate brains.
     let chat_session_holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    // Cross-turn pending base `AskUserQuestion` (the relay): set when a chat turn
+    // surfaces a structured question, consumed by the NEXT turn to frame the user's
+    // reply as a resolved answer. Shared with every spawned chat-turn task.
+    let pending_ask_holder: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
     // Pre-load the resident chat session NOW if we launched straight into chat with a
     // host CLI already configured (a returning user — first launch lands on the
     // picker, which fires the pre-load on `Action::BackendChanged` once a base is
@@ -4437,7 +4481,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         if director_build {
                             finalize_build_completion(app, &sink);
                         }
-                        run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
                         // The exchange just landed — if the working transcript has
                         // crossed the token budget, fold the older turns into one
                         // structured summary on a forked base (the recent tail stays
@@ -4450,7 +4494,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // typed behind it.
                     Some(RouteDecision::Failed(note)) => {
                         app.record_route_failed(note);
-                        run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
                     }
                     None => {}
                 }
@@ -4795,6 +4839,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     {
                                         stale.end().await;
                                     }
+                                    // The old session is gone — drop any pending base
+                                    // question pinned to it so the next message on the
+                                    // fresh session isn't mis-relayed as its answer.
+                                    *pending_ask_holder.lock().await = None;
                                     spawn_chat_session_preload(
                                         app.backend.as_deref(),
                                         app.effective_model(),
@@ -5153,6 +5201,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     run_task = Some(tokio::spawn(run_routed_turn(
                                         inputs,
                                         chat_session_holder.clone(),
+                                        pending_ask_holder.clone(),
                                         sink.clone(),
                                         route_tx.clone(),
                                     )));
@@ -8238,8 +8287,26 @@ mod tests {
             autonomous: false,
             resume_session_id: None,
             chat_session,
+            pending_ask: Arc::new(tokio::sync::Mutex::new(None)),
             sink,
             route_tx,
+        }
+    }
+
+    /// Like [`chat_turn`] but pins the turn to a CALLER-OWNED `pending_ask` holder so
+    /// a test can drive two turns that share the cross-turn question state (the relay
+    /// path): turn 1 stores a surfaced base question, turn 2 consumes it.
+    fn chat_turn_with_pending(
+        text: &str,
+        chat_session: ChatSessionHolder,
+        pending_ask: PendingAskHolder,
+        sink: Arc<ChannelSink>,
+        route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+        project_root: std::path::PathBuf,
+    ) -> ChatSessionTurn {
+        ChatSessionTurn {
+            pending_ask,
+            ..chat_turn(text, chat_session, sink, route_tx, project_root)
         }
     }
 
@@ -8388,6 +8455,108 @@ mod tests {
         assert!(
             note.contains("2. OAuth (Google)"),
             "every option present: {note}"
+        );
+    }
+
+    /// #3: the AskUserQuestion RELAY is wired into the chat send-path. Turn 1
+    /// surfaces a base question (stored in the shared `pending_ask` holder); on
+    /// turn 2 the user types a bare `1`, and the directive actually SENT to the base
+    /// is the RESOLVED + framed answer ("Email + password", "chose/answered") — NOT
+    /// the ambiguous bare `1` the base could misread. The pending question is then
+    /// cleared so a later turn passes through verbatim (fail-open).
+    #[tokio::test]
+    async fn chat_ask_user_question_reply_is_relayed_as_resolved_answer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut _route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let ask = umadev_runtime::SessionEvent::ToolCall {
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({
+                "questions": [{
+                    "header": "Auth",
+                    "question": "Which auth method should the app use?",
+                    "options": [
+                        {"label": "Email + password"},
+                        {"label": "OAuth (Google)"}
+                    ]
+                }]
+            }),
+        };
+        let done = || umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        };
+        // Turn 1 asks; turn 2 (the user's reply "1") just completes; turn 3 is an
+        // ordinary follow-up with no pending question.
+        let (fake, sent, _ended) = FakeChatSession::new(vec![
+            vec![ask, done()],
+            vec![umadev_runtime::SessionEvent::TextDelta("ok".into()), done()],
+            vec![
+                umadev_runtime::SessionEvent::TextDelta("sure".into()),
+                done(),
+            ],
+        ]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let pending: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
+
+        // Turn 1: the base asks → the question is stored for the next turn.
+        drive_chat_session_turn(chat_turn_with_pending(
+            "set up auth",
+            holder.clone(),
+            pending.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        assert!(
+            pending.lock().await.is_some(),
+            "turn 1 must store the pending base question"
+        );
+
+        // Turn 2: the user answers with a bare "1" — it must be relayed resolved.
+        drive_chat_session_turn(chat_turn_with_pending(
+            "1",
+            holder.clone(),
+            pending.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        let relayed = sent.lock().unwrap()[1].clone();
+        assert_ne!(relayed.trim(), "1", "the bare index must NOT be sent raw");
+        assert!(
+            relayed.contains("Email + password"),
+            "the resolved option label is sent: {relayed}"
+        );
+        assert!(
+            relayed.to_lowercase().contains("chose") || relayed.to_lowercase().contains("answered"),
+            "framed as the user's explicit answer: {relayed}"
+        );
+        assert!(
+            pending.lock().await.is_none(),
+            "the pending question is consumed (cleared) after the relay"
+        );
+
+        // Turn 3: no pending question → the user's line passes through verbatim.
+        drive_chat_session_turn(chat_turn_with_pending(
+            "thanks, what's next?",
+            holder.clone(),
+            pending.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        assert_eq!(
+            sent.lock().unwrap()[2],
+            "thanks, what's next?",
+            "with no pending question the reply is sent raw (fail-open passthrough)"
         );
     }
 

@@ -95,6 +95,24 @@ pub fn relay_directive(q: &AskUserQuestion, reply: &str) -> String {
     }
 }
 
+/// Resolve the directive to send for a user `reply` given the OPTIONAL pending
+/// question the base last asked: `Some(q)` → the resolved + framed relay directive
+/// ([`relay_directive`], so a bare `1` becomes the chosen label framed as the
+/// user's explicit answer); `None` → the raw `reply` passes through unchanged.
+///
+/// The single seam the chat send-path calls so a numbered answer to a base
+/// `AskUserQuestion` is relayed as the resolved choice instead of the ambiguous
+/// bare index, while an ordinary turn (no question pending) is untouched.
+/// **Fail-open:** no pending question → passthrough; an unresolvable reply still
+/// passes through inside [`relay_directive`] (it never drops the user's words).
+#[must_use]
+pub fn relay_or_passthrough(pending: Option<&AskUserQuestion>, reply: &str) -> String {
+    match pending {
+        Some(q) => relay_directive(q, reply),
+        None => reply.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +181,25 @@ mod tests {
         // Free-text passes through.
         let d2 = relay_directive(&q, "use passkeys");
         assert!(d2.contains("use passkeys"), "directive: {d2}");
+    }
+
+    #[test]
+    fn relay_or_passthrough_relays_when_pending_else_passes_raw() {
+        let q = sample();
+        // A pending question + a numeric reply sends the RESOLVED + framed
+        // directive — NOT the bare "1" (the exact misinterpret the relay prevents).
+        let relayed = relay_or_passthrough(Some(&q), "1");
+        assert_ne!(relayed.trim(), "1", "must not send the bare index");
+        assert!(relayed.contains("Email + password"), "resolved: {relayed}");
+        assert!(
+            relayed.to_lowercase().contains("chose") || relayed.to_lowercase().contains("answered"),
+            "framed as the user's answer: {relayed}"
+        );
+        // No pending question → the raw reply passes through verbatim.
+        assert_eq!(relay_or_passthrough(None, "just chatting"), "just chatting");
+        // Fail-open: an unresolvable reply with a pending question still carries the
+        // user's words (free-text is honored, never dropped).
+        let free = relay_or_passthrough(Some(&q), "use whatever is simplest");
+        assert!(free.contains("use whatever is simplest"), "free: {free}");
     }
 }

@@ -257,21 +257,35 @@ const NETWORK_TOKENS: &[&str] = &[
     "https://",
 ];
 
-/// Indirection / encoding constructs that HIDE an action's real effect from the
-/// token classifier — any of them could smuggle a destructive payload past
-/// [`DESTRUCTIVE_TOKENS`] / [`NETWORK_TOKENS`] / the VCS scan. Their presence means
-/// the command **cannot be confidently classified as safe** ([`command_is_obfuscated`]),
-/// so the fail-CLOSED boundary treats it as [`Reversibility::Uncertain`].
-///
-/// Deliberately scoped to HIGH-SIGNAL markers (an inline-interpreter `-c`/`-e`
-/// payload, a pipe into a shell) so an ordinary reversible build/dev command never
-/// trips this — the four invariants + the "a guarded/auto run is never wedged
-/// DENY-ing reversible work" contract stay intact; only a genuinely opaque command
-/// goes fail-closed.
-const PIPE_TO_SHELL_MARKERS: &[&str] = &[
-    "| sh", "|sh", "| bash", "|bash", "| zsh", "|zsh", "| dash", "|dash", "| ksh", "|ksh",
-    "| fish", "|fish", "| csh", "|csh",
-];
+/// Shell interpreters that, when a command pipes INTO them, mean the piped data is
+/// being EXECUTED as a script — the classic `… | sh` obfuscation that
+/// [`pipes_into_shell`] guards. Matched as a WHOLE pipe-target token (never a bare
+/// substring) so a benign read-only `… | sha256sum` / `| shasum` / `| sha1sum` /
+/// `| shuf` / `| shellcheck` / `| shfmt` (all `sh…`-prefixed but NOT a shell) is
+/// not mis-flagged into [`Reversibility::Uncertain`] and wedge-DENY-ed under
+/// Guarded/Auto — the "a guarded/auto run is never wedged DENY-ing reversible
+/// work" contract (F3).
+const PIPE_TARGET_SHELLS: &[&str] = &["sh", "bash", "zsh", "ksh", "dash", "fish", "csh"];
+
+/// Whether `cmd` pipes into a shell interpreter — `… | sh`, `…|bash -c …`, etc.
+/// The pipe target is matched as a WHOLE token: the first token AFTER a `|`
+/// (skipping a doubled `||` and any spaces), bounded by whitespace or a shell
+/// metacharacter. So `cat dist/app.js | sha256sum`, `| shuf`, `| shellcheck`,
+/// `| shfmt` do NOT trip it (the token is `sha256sum` / `shuf` / …, not `sh`),
+/// while `| sh`, `|sh -c …`, `| bash` do. `cmd` is already lowercased by the
+/// caller; dependency-free and fail-safe (an odd input simply yields `false`).
+fn pipes_into_shell(cmd: &str) -> bool {
+    // Each `|`-delimited segment after the first is a pipe TARGET. Its leading
+    // token (after trimming spaces, up to the next boundary) must be a bare shell.
+    cmd.split('|').skip(1).any(|seg| {
+        let token = seg
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '<' | '>' | '(' | ')'))
+            .next()
+            .unwrap_or("");
+        PIPE_TARGET_SHELLS.contains(&token)
+    })
+}
 
 /// Interpreters invoked with an INLINE code string the token scan can't see into
 /// (`bash -c '<payload>'`, `python -c '<payload>'`, …). All entries are lowercase —
@@ -296,8 +310,8 @@ const INLINE_CODE_MARKERS: &[&str] = &[
 /// fail-CLOSED-on-uncertainty trigger. Returns `true` for: `eval` at a command
 /// position; `base64` with a decode flag (an encoded payload being unpacked); a pipe
 /// into a shell interpreter; an interpreter running an inline code string; `\x`/`\u`
-/// byte escapes used to hide characters; or a backtick command substitution (a hidden
-/// sub-command). Conservative + dependency-free; any odd input simply yields `false`
+/// byte escapes used to hide characters; or a `` `…` `` / `$(…)` command
+/// substitution (a hidden sub-command). Conservative + dependency-free; any odd input simply yields `false`
 /// in the underlying [`verb_at_command_position`] (never a parser-quirk escalation
 /// the caller can't explain).
 fn command_is_obfuscated(cmd: &str) -> bool {
@@ -312,14 +326,12 @@ fn command_is_obfuscated(cmd: &str) -> bool {
         return true;
     }
     // A pipe into a shell, or an interpreter running an inline code string.
-    if PIPE_TO_SHELL_MARKERS.iter().any(|m| cmd.contains(m))
-        || INLINE_CODE_MARKERS.iter().any(|m| cmd.contains(m))
-    {
+    if pipes_into_shell(cmd) || INLINE_CODE_MARKERS.iter().any(|m| cmd.contains(m)) {
         return true;
     }
-    // Hex/unicode byte escapes hide characters from the scan; a backtick substitution
-    // runs a hidden sub-command.
-    cmd.contains("\\x") || cmd.contains("\\u") || cmd.contains('`')
+    // Hex/unicode byte escapes hide characters from the scan; a backtick OR `$(…)`
+    // command substitution runs a hidden sub-command (the two are symmetric).
+    cmd.contains("\\x") || cmd.contains("\\u") || cmd.contains('`') || cmd.contains("$(")
 }
 
 /// Classify a candidate action — a shell command string and/or a target path —
@@ -1953,6 +1965,72 @@ mod tests {
                 ""
             ));
         }
+    }
+
+    #[test]
+    fn pipe_to_shell_lookalikes_are_not_obfuscated_but_real_shells_are() {
+        // #2: a benign read-only command piped into an `sh…`-PREFIXED tool
+        // (checksum / lint / shuffle) is NOT a pipe-into-shell — it must stay
+        // Reversible so a guarded/auto run isn't wedge-DENY-ed on legit work. The
+        // pre-fix substring check ("| sh" ⊂ "| sha256sum") mis-classed these.
+        for cmd in [
+            "cat dist/app.js | sha256sum",
+            "cat dist/app.js | shasum",
+            "cat dist/app.js | sha1sum",
+            "cat names.txt | shuf",
+            "cat build.sh | shellcheck",
+            "cat main.tf | shfmt",
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Reversible,
+                "{cmd:?} pipes into a checksum/lint tool, not a shell — must stay Reversible"
+            );
+            assert!(
+                !requires_confirmation(TrustMode::Auto, cmd, ""),
+                "{cmd:?} must run automatically under Auto (not wedge-DENY-ed)"
+            );
+        }
+        // A genuine pipe into a shell (whole-token target) stays Uncertain → confirms.
+        for cmd in [
+            "cat payload | sh",
+            "cat payload |sh -c 'echo hi'",
+            "cat payload | bash",
+            "echo y | zsh",
+            "cat x | dash -s",
+            "cat x | ksh",
+            "cat x | fish",
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Uncertain,
+                "{cmd:?} pipes into a real shell — must classify as Uncertain"
+            );
+            assert!(requires_confirmation(TrustMode::Auto, cmd, ""));
+        }
+    }
+
+    #[test]
+    fn dollar_paren_command_substitution_is_obfuscated_like_backtick() {
+        // #2-Low: `$(…)` command substitution hides a sub-command exactly like a
+        // backtick — it must trip the same fail-closed boundary (symmetric).
+        for cmd in ["echo $(whoami)", "x=$(id -u) && echo $x"] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Uncertain,
+                "{cmd:?} carries a $() substitution — must classify as Uncertain"
+            );
+        }
+        // The backtick form classifies identically (the symmetry being matched).
+        assert_eq!(
+            reversibility_class("echo `whoami`", ""),
+            Reversibility::Uncertain
+        );
+        // A plain command with neither construct stays Reversible (no over-block).
+        assert_eq!(
+            reversibility_class("echo hello world", ""),
+            Reversibility::Reversible
+        );
     }
 
     #[test]

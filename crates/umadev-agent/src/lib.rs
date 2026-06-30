@@ -90,7 +90,8 @@ pub use adopt::{
 pub use app_runtime::{app_calls_llm_at_runtime, runtime_model_directive, stated_runtime_model};
 pub use ask_question::{
     note_for as ask_question_note, relay_directive as ask_question_relay_directive,
-    surface as ask_question_surface, AskQuestionSurface,
+    relay_or_passthrough as ask_question_relay_or_passthrough, surface as ask_question_surface,
+    AskQuestionSurface,
 };
 pub use checkpoint::{
     create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
