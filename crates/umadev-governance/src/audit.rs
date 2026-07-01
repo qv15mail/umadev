@@ -387,6 +387,34 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn extract_fetch_axios_ky_swr() {
         let urls = extract_api_urls(
@@ -452,7 +480,7 @@ mod tests {
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
+        let _env = EnvRestore::remove("UMADEV_AUDIT_MAX_BYTES");
         let tmp = TempDir::new().unwrap();
         let _ = record_api_calls(
             tmp.path(),
@@ -543,7 +571,7 @@ mod tests {
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "0"); // never rotate mid-test
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "0"); // never rotate mid-test
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
@@ -601,7 +629,6 @@ mod tests {
             writers * per_writer,
             "no record dropped or duplicated under concurrency"
         );
-        std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
     }
 
     #[test]
@@ -614,7 +641,7 @@ mod tests {
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "16");
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "16");
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
@@ -659,7 +686,6 @@ mod tests {
             !rotate_lock_path(&live).exists(),
             "rotation lock must be released after rotation"
         );
-        std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
     }
 
     // NOTE: these mutate the process-global UMADEV_AUDIT_MAX_BYTES env
@@ -678,7 +704,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // --- (1) rotate when over cap ---
-        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "8");
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "8");
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();

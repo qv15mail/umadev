@@ -347,6 +347,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreXdg(Option<String>);
+
+    impl Drop for RestoreXdg {
+        fn drop(&mut self) {
+            match self.0.as_ref() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn default_config_has_no_backend() {
         let cfg = UserConfig::default();
@@ -515,19 +528,13 @@ mod tests {
 
     #[test]
     fn default_path_honours_xdg_config_home() {
-        // SAFETY: we mutate environment then restore — single-threaded test
-        // runner (default). The env var is process-wide so we must reset
-        // it before returning.
+        let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
+        let _restore = RestoreXdg(prev);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
         let p = default_path();
-        // Restore before any potential panic from assertions.
-        if let Some(v) = prev {
-            std::env::set_var("XDG_CONFIG_HOME", v);
-        } else {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-        assert!(p.starts_with("/tmp/xdg-test/umadev"));
+        assert!(p.starts_with(tmp.path().join("umadev")));
         assert!(p.ends_with(FILE_NAME));
     }
 }

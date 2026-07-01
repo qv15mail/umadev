@@ -1733,6 +1733,31 @@ mod tests {
         }
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            restore_env(self.key, self.prior.take());
+        }
+    }
+
     #[test]
     fn strip_ansi_removes_color_codes() {
         let painted = "\x1b[1;32mhello\x1b[0m world";
@@ -2118,7 +2143,7 @@ mod tests {
         // ceiling and fail-open to None (→ Unknown), never block the picker or
         // wrongly report logged-in.
         let _env = IDLE_ENV_LOCK.lock().await;
-        std::env::set_var("UMADEV_AUTH_PROBE_SECS", "1");
+        let _restore = EnvRestore::set("UMADEV_AUTH_PROBE_SECS", "1");
         let started = Instant::now();
         let got = run_auth_status(
             "sh",
@@ -2127,7 +2152,6 @@ mod tests {
             false,
         )
         .await;
-        std::env::remove_var("UMADEV_AUTH_PROBE_SECS");
         assert!(
             got.is_none(),
             "a hung auth-status command must fail-open to None"
@@ -2295,11 +2319,8 @@ mod tests {
         // under our temp HOME is exercised. Not clobbering PATH keeps concurrent
         // spawn-based tests (echo/cat/sh) safe.
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = EnvRestore::set("HOME", tmp.path());
         let got = resolve_program("mybase");
-        // Restore before asserting so a failure can't poison sibling tests.
-        restore_env("HOME", saved_home);
 
         assert_eq!(
             got,
@@ -2324,13 +2345,9 @@ mod tests {
         std::fs::write(known.join("dualbase"), "#!/bin/sh\n").unwrap();
 
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
-        let saved_path = std::env::var_os("PATH");
-        std::env::set_var("HOME", home.path());
-        std::env::set_var("PATH", on_path.path());
+        let _home = EnvRestore::set("HOME", home.path());
+        let _path = EnvRestore::set("PATH", on_path.path());
         let got = resolve_program("dualbase");
-        restore_env("HOME", saved_home);
-        restore_env("PATH", saved_path);
 
         assert_eq!(
             got,
@@ -2349,13 +2366,9 @@ mod tests {
         std::fs::write(tmp.path().join("winbase.cmd"), b"@echo off\n").unwrap();
 
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_path = std::env::var_os("PATH");
-        let saved_ext = std::env::var_os("PATHEXT");
-        std::env::set_var("PATH", tmp.path());
-        std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        let _path = EnvRestore::set("PATH", tmp.path());
+        let _pathext = EnvRestore::set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         let got = resolve_program("winbase");
-        restore_env("PATH", saved_path);
-        restore_env("PATHEXT", saved_ext);
 
         assert!(
             got.to_ascii_lowercase().ends_with("winbase.cmd"),
@@ -2374,13 +2387,9 @@ mod tests {
         std::fs::write(progdir.join("winstandalone.exe"), b"MZ").unwrap();
 
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_local = std::env::var_os("LOCALAPPDATA");
-        let saved_path = std::env::var_os("PATH");
-        std::env::set_var("LOCALAPPDATA", tmp.path());
-        std::env::set_var("PATH", ""); // force the known-dir branch
+        let _local = EnvRestore::set("LOCALAPPDATA", tmp.path());
+        let _path = EnvRestore::set("PATH", ""); // force the known-dir branch
         let got = resolve_program("winstandalone");
-        restore_env("LOCALAPPDATA", saved_local);
-        restore_env("PATH", saved_path);
 
         assert!(
             got.to_ascii_lowercase().ends_with("winstandalone.exe"),
@@ -2424,7 +2433,7 @@ mod tests {
     async fn run_subprocess_idle_kills_after_first_byte_then_silence() {
         let _env = IDLE_ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
         let started = Instant::now();
         let err = run_subprocess(SubprocessCall {
             program: "sh",
@@ -2439,7 +2448,6 @@ mod tests {
         })
         .await
         .unwrap_err();
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
         assert!(
             err.contains("stdout silence"),
             "expected the idle-silence error, got: {err}"
@@ -2462,7 +2470,7 @@ mod tests {
     async fn run_subprocess_first_byte_grace_survives_slow_first_output() {
         let _env = IDLE_ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
         let started = Instant::now();
         let out = run_subprocess(SubprocessCall {
             program: "sh",
@@ -2474,7 +2482,6 @@ mod tests {
             env: &[],
         })
         .await;
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
         let out = out.expect("a slow first byte under the ceiling must not be idle-killed");
         assert!(out.stdout.contains("the answer"));
         assert!(
@@ -2645,7 +2652,7 @@ mod tests {
             "slow-first",
             "#!/bin/sh\ncat >/dev/null 2>&1\nsleep 2\nprintf 'the slow answer\\n'\n",
         );
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
         let started = Instant::now();
         let out = run_subprocess_streaming(
             SubprocessCall {
@@ -2661,7 +2668,6 @@ mod tests {
             &|_line: &str| {},
         )
         .await;
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
         let out = out.expect("a slow first token under call.timeout must not be idle-killed");
         assert!(out.stdout.contains("the slow answer"));
         assert!(
@@ -2685,7 +2691,7 @@ mod tests {
             "first-then-hang",
             "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'first line\\n'\nsleep 30\n",
         );
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
         let started = Instant::now();
         let err = run_subprocess_streaming(
             SubprocessCall {
@@ -2703,7 +2709,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
         assert!(
             err.contains("idle timeout"),
             "mid-stream silence after the first line must trip the idle watchdog, got: {err}"
@@ -2731,7 +2736,7 @@ mod tests {
         );
         // Idle timeout huge so it can't be what fires — only the 1s hard ceiling
         // can stop a never-emitting child before the first line.
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "600");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "600");
         let started = Instant::now();
         let err = run_subprocess_streaming(
             SubprocessCall {
@@ -2747,7 +2752,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
         assert!(
             err.contains("timed out"),
             "a silent child past call.timeout must hit the hard ceiling, got: {err}"
@@ -2790,7 +2794,7 @@ mod tests {
     async fn streaming_idle_default_300s_tolerates_short_midstream_silence() {
         let _env = IDLE_ENV_LOCK.lock().await;
         // Make sure no leftover override is in scope — we want the DEFAULT.
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        let _restore = EnvRestore::remove("UMADEV_IDLE_TIMEOUT_SECS");
         let tmp = tempfile::TempDir::new().unwrap();
         // First line immediately, ~2s mid-stream silence, then a second line and
         // exit. Under the OLD 120s default this also passed, but under a 1s

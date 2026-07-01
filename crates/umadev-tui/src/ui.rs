@@ -5871,6 +5871,8 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
     let inner_h = area.height.saturating_sub(2) as usize;
     let total = items.len();
     let max_scroll = total.saturating_sub(inner_h);
+    let max_scroll_u16 = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    app.help_max_scroll.set(max_scroll_u16);
     let scroll = (app.help_scroll as usize).min(max_scroll);
     let shown = inner_h.min(total.saturating_sub(scroll));
     let title = if max_scroll > 0 {
@@ -6524,6 +6526,12 @@ mod tests {
     }
 
     fn app_with(backend: Option<&str>) -> App {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let workspace = std::env::temp_dir().join(format!("sd-ui-test-workspace-{id}"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&workspace);
         let mut app = App::new(
             "demo",
             UserConfig {
@@ -6531,8 +6539,8 @@ mod tests {
                 model: None,
                 ..Default::default()
             },
-            std::path::PathBuf::from("/tmp/sd-test-config.toml"),
-            std::path::PathBuf::from("/tmp/sd-test-workspace"),
+            std::env::temp_dir().join(format!("sd-ui-test-config-{id}.toml")),
+            workspace,
         );
         // P5d: deterministic spinner cadence in render tests (see fresh_app).
         app.animations = true;

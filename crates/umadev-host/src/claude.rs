@@ -926,8 +926,35 @@ fn parse_claude_auth_status(out: &str) -> AuthState {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use umadev_runtime::StreamEvent;
+
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: std::env::var_os(key),
+            }
+        }
+
+        fn set(&self, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(self.key, value);
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn fork_yields_a_concurrent_instance() {
@@ -939,8 +966,6 @@ mod tests {
             .fork();
         assert!(forked.is_some(), "a real base must fork for parallel work");
     }
-    use umadev_runtime::StreamEvent;
-
     #[test]
     fn salvage_partial_stream_recovers_text_or_none() {
         // A partial stream with an assistant text block → recoverable (so a
@@ -1313,16 +1338,12 @@ mod tests {
     async fn probe_auth_logged_in_via_env_var() {
         // Crate-wide lock so no sibling module's env-mutating test races us.
         let _guard = crate::AUTH_ENV_TEST_LOCK.lock().await;
-        let saved = std::env::var_os("ANTHROPIC_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+        let env = EnvRestore::capture("ANTHROPIC_API_KEY");
+        env.set("sk-ant-test");
         // Point at a missing binary so the ONLY way this returns LoggedIn is the
         // env-var fast path (a real `claude auth status` couldn't run).
         let d = ClaudeCodeDriver::with_program("umadev-fake-claude-xyz");
         let state = d.probe_auth().await;
-        match saved {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
         assert_eq!(
             state,
             AuthState::LoggedIn,

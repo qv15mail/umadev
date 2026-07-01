@@ -826,6 +826,28 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn user_message_line_is_valid_ndjson_user_shape() {
         let line = user_message_line("do the thing");
@@ -855,8 +877,7 @@ mod tests {
     #[test]
     fn session_args_permission_mode_tracks_autonomy() {
         // Guard against the env override leaking in from a sibling process.
-        let prior = std::env::var_os("UMADEV_CLAUDE_PERMISSION_MODE");
-        std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE");
+        let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
         let auto = session_args("sid-a", None, true);
         let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
@@ -881,11 +902,6 @@ mod tests {
             .position(|a| a == "--permission-mode")
             .unwrap();
         assert_eq!(overridden[o_idx + 1], "plan", "env override wins");
-
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", v),
-            None => std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE"),
-        }
     }
 
     #[test]
@@ -894,8 +910,7 @@ mod tests {
         // `--resume <id>` and must NOT branch it (`--fork-session`) nor mint a fresh
         // `--session-id`. The write toolset + stream-json flags match a fresh start,
         // so the resumed session writes files identically — it just inherits context.
-        let prior = std::env::var_os("UMADEV_CLAUDE_PERMISSION_MODE");
-        std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE");
+        let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
         let args = resume_session_args("sid-resume", Some("be terse"), true);
         // Resumes the SAME conversation id.
@@ -924,11 +939,6 @@ mod tests {
         // Firmware still injects natively on resume.
         assert!(args.contains(&"--append-system-prompt".to_string()));
         assert!(args.contains(&"be terse".to_string()));
-
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", v),
-            None => std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE"),
-        }
     }
 
     #[test]

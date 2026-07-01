@@ -67,7 +67,7 @@ pub fn write_coach_prompt_with_retrieval(
     fs::create_dir_all(&dir)?;
     let body = render_coach_prompt_with_retrieval(opts, phase, query_vec, expansion);
     let path = dir.join(coach_filename(phase));
-    fs::write(&path, body)?;
+    fs::write(&path, &body)?;
     // Mirror to CURRENT.md so the host's CLAUDE.md can point at one
     // stable path without needing to know the phase number.
     let current = dir.join("CURRENT.md");
@@ -77,9 +77,7 @@ pub fn write_coach_prompt_with_retrieval(
         coach_filename(phase),
     );
     let mut current_body = header;
-    current_body.push_str(&render_coach_prompt_with_retrieval(
-        opts, phase, query_vec, expansion,
-    ));
+    current_body.push_str(&body);
     fs::write(&current, current_body)?;
     Ok(path)
 }
@@ -1557,8 +1555,24 @@ mod tests {
     }
 
     #[test]
+    fn current_prompt_reuses_exact_phase_body() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_coach_prompt(&opts(tmp.path()), Phase::Backend).unwrap();
+        let phase_body = fs::read_to_string(&path).unwrap();
+        let current = fs::read_to_string(tmp.path().join(".umadev/coach/CURRENT.md")).unwrap();
+        let (_, current_body) = current
+            .split_once('\n')
+            .expect("CURRENT.md starts with a one-line pointer header");
+        assert_eq!(
+            phase_body, current_body,
+            "CURRENT.md must reuse the exact rendered body"
+        );
+    }
+
+    #[test]
     fn research_prompt_carries_requirement_and_discovery() {
-        let body = render_coach_prompt(&opts(Path::new("/tmp")), Phase::Research);
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Research);
         assert!(body.contains("build a login system"));
         assert!(body.contains("Similar products"));
         assert!(body.contains("Discovery"));
@@ -1570,7 +1584,8 @@ mod tests {
 
     #[test]
     fn docs_prompt_demands_three_artifacts() {
-        let body = render_coach_prompt(&opts(Path::new("/tmp")), Phase::Docs);
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Docs);
         assert!(body.contains("output/demo-prd.md"));
         assert!(body.contains("output/demo-architecture.md"));
         assert!(body.contains("output/demo-uiux.md"));
@@ -1578,14 +1593,16 @@ mod tests {
 
     #[test]
     fn gate_prompts_tell_host_to_wait() {
-        let body = render_coach_prompt(&opts(Path::new("/tmp")), Phase::DocsConfirm);
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::DocsConfirm);
         assert!(body.to_lowercase().contains("wait"));
         assert!(body.contains("Do NOT advance"));
     }
 
     #[test]
     fn frontend_prompt_locks_hard_rules() {
-        let body = render_coach_prompt(&opts(Path::new("/tmp")), Phase::Frontend);
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Frontend);
         assert!(body.contains("Lucide"));
         assert!(body.contains("design tokens"));
         assert!(body.contains("frontend-api-calls.jsonl") || body.contains("architecture"));
@@ -1654,8 +1671,13 @@ mod tests {
     #[test]
     fn render_with_retrieval_none_matches_plain_renderer() {
         // expansion=None must render exactly the same prompt as the non-HyDE
-        // renderer (additive-only contract).
-        let o = opts(Path::new("/tmp"));
+        // renderer (additive-only contract). Use an isolated root whose local
+        // knowledge directory is intentionally empty so process-global test env
+        // (`UMADEV_KNOWLEDGE_DIR`, staged corpora) cannot make this flaky.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("knowledge")).unwrap();
+        std::fs::write(tmp.path().join("knowledge/.keep"), "").unwrap();
+        let o = opts(tmp.path());
         for phase in [Phase::Research, Phase::Frontend, Phase::Backend] {
             let plain = render_coach_prompt(&o, phase);
             let with_none = render_coach_prompt_with_retrieval(&o, phase, None, None);

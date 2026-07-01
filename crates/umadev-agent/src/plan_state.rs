@@ -1272,22 +1272,19 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("umadev-plan-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
         let p = plan(vec![step("a", &[]), step("b", &["a"])]);
-        let path = save(&p, &dir).expect("save ok");
+        let path = save(&p, dir).expect("save ok");
         assert!(path.exists());
-        let loaded = load(&dir).expect("load ok");
+        let loaded = load(dir).expect("load ok");
         assert_eq!(loaded, p);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_missing_is_none() {
-        let dir = std::env::temp_dir().join(format!("umadev-plan-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(load(&dir).is_none());
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load(tmp.path()).is_none());
     }
 
     // ── drain_plan_turn cleanly handles a mid-turn approval (MEDIUM #3) ──
@@ -1989,9 +1986,8 @@ mod tests {
 
     #[test]
     fn plan_step_with_evidence_round_trips_through_save_load() {
-        let dir = std::env::temp_dir().join(format!("umadev-ev-rt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
         let mut s = step("a", &[]);
         s.evidence = vec![
             EvidenceContract::FileExists {
@@ -2004,12 +2000,11 @@ mod tests {
             },
         ];
         let p = plan(vec![s]);
-        save(&p, &dir).expect("save ok");
-        let loaded = load(&dir).expect("load ok");
+        save(&p, dir).expect("save ok");
+        let loaded = load(dir).expect("load ok");
         assert_eq!(
             loaded, p,
             "the typed evidence contract survives persistence"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

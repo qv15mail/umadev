@@ -1,7 +1,7 @@
 # UmaDev — workspace manifest.
 #
 # UmaDev is a coach for AI coding hosts. One specification, one
-# binary, 23 host CLI backends. No API key — drives your already
+# binary, three first-class host CLI backends. No API key — drives your already
 # logged-in coding CLI as a subprocess.
 
 [workspace]

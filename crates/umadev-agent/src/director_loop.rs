@@ -3889,6 +3889,34 @@ mod tests {
     use crate::trust::TrustMode;
     use umadev_runtime::{SessionError, SessionEvent, TurnStatus};
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn opts(root: &std::path::Path) -> RunOptions {
         RunOptions {
             project_root: root.to_path_buf(),
@@ -4460,9 +4488,8 @@ mod tests {
         let _env = IDLE_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "42");
         // A valid positive value is honoured.
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "42");
         assert_eq!(idle_timeout(), Duration::from_secs(42));
         // A non-positive / garbage value falls back to the default (fail-open: a
         // bad env never DISABLES the watchdog, which would re-open the hang).
@@ -4481,10 +4508,6 @@ mod tests {
             idle_timeout(),
             Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
         );
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     #[test]
@@ -4496,8 +4519,7 @@ mod tests {
         // a non-positive / unparseable value falls back to the default (a bad env
         // never DISABLES the grace, and because the default is finite it can never
         // make the watchdog unbounded).
-        let prior = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
-        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "2400");
+        let _restore = EnvRestore::set("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "2400");
         assert_eq!(tool_idle_timeout(), Duration::from_secs(2400));
         std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "0");
         assert_eq!(
@@ -4514,10 +4536,6 @@ mod tests {
             tool_idle_timeout(),
             Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
         );
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     #[test]
@@ -4585,10 +4603,8 @@ mod tests {
         assert_eq!(budget.window(false), Duration::from_secs(600));
         assert_eq!(budget.window(true), Duration::from_secs(300));
         // `from_env` wires the two env knobs (defaults here, no override set).
-        let prior_base = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
-        let prior_tool = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
-        std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        let _base_env = EnvRestore::remove("UMADEV_IDLE_TIMEOUT_SECS");
+        let _tool_env = EnvRestore::remove("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
         let env_budget = IdleBudget::from_env();
         assert_eq!(
             env_budget.window(false),
@@ -4598,14 +4614,6 @@ mod tests {
             env_budget.window(true),
             Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
         );
-        match prior_base {
-            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
-        }
-        match prior_tool {
-            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     #[test]
@@ -5727,8 +5735,7 @@ mod tests {
 
     #[test]
     fn run_budget_reads_env_and_falls_back_safely() {
-        let prior = std::env::var_os("UMADEV_RUN_BUDGET_SECS");
-        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "120");
+        let _env = EnvRestore::set("UMADEV_RUN_BUDGET_SECS", "120");
         assert_eq!(run_budget(), Duration::from_secs(120));
         std::env::set_var("UMADEV_RUN_BUDGET_SECS", "0"); // non-positive → default
         assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
@@ -5736,9 +5743,6 @@ mod tests {
         assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
         std::env::remove_var("UMADEV_RUN_BUDGET_SECS");
         assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
-        if let Some(v) = prior {
-            std::env::set_var("UMADEV_RUN_BUDGET_SECS", v);
-        }
     }
 
     #[test]

@@ -185,7 +185,7 @@ fn char_to_key(c: char) -> KeyEvent {
     match c {
         '\r' => key(KeyCode::Enter, KeyModifiers::NONE),
         '\t' => key(KeyCode::Tab, KeyModifiers::NONE),
-        '\u{7f}' => key(KeyCode::Backspace, KeyModifiers::NONE),
+        '\u{8}' | '\u{7f}' => key(KeyCode::Backspace, KeyModifiers::NONE),
         '\0' => key(KeyCode::Char(' '), KeyModifiers::CONTROL),
         c if ('\u{1}'..='\u{1a}').contains(&c) => {
             // Ctrl-A..Ctrl-Z (incl. \n=Ctrl-J, \b=Ctrl-H in raw mode).
@@ -375,7 +375,7 @@ fn decode_csi_u(params: &[u8]) -> Vec<InputEvent> {
                     KeyCode::Tab
                 }
             }
-            Some('\u{7f}') => KeyCode::Backspace,
+            Some('\u{8}' | '\u{7f}') => KeyCode::Backspace,
             Some(c) => KeyCode::Char(c),
             None => return Vec::new(),
         },
@@ -606,6 +606,14 @@ mod tests {
     }
 
     #[test]
+    fn backspace_via_csi_u_decodes() {
+        // CSI 8 u = BS (common Windows/ConPTY Backspace representation).
+        assert_eq!(one_key(&seq(b"\x1b[8u")).code, KeyCode::Backspace);
+        // CSI 127 u = DEL (common POSIX Backspace representation).
+        assert_eq!(one_key(&seq(b"\x1b[127u")).code, KeyCode::Backspace);
+    }
+
+    #[test]
     fn alt_letter_decodes() {
         let k = one_key(&seq(b"\x1bc"));
         assert_eq!(k.code, KeyCode::Char('c'));
@@ -787,6 +795,9 @@ mod tests {
     fn control_bytes_in_text_map_to_keys() {
         assert_eq!(one_key(&text("\r")).code, KeyCode::Enter);
         assert_eq!(one_key(&text("\t")).code, KeyCode::Tab);
+        // Windows Terminal / ConPTY commonly sends BS (0x08) for Backspace.
+        assert_eq!(one_key(&text("\u{8}")).code, KeyCode::Backspace);
+        // POSIX terminals commonly send DEL (0x7f) for Backspace.
         assert_eq!(one_key(&text("\u{7f}")).code, KeyCode::Backspace);
         // Ctrl-C = 0x03.
         let k = one_key(&text("\u{3}"));

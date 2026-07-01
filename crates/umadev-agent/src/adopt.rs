@@ -606,6 +606,28 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn write(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);
         if let Some(parent) = p.parent() {
@@ -784,9 +806,9 @@ mod tests {
 
     #[test]
     fn env_max_files_zero_is_unlimited() {
-        // Guard the override semantics without mutating the global env in a way
-        // that races other tests: just check the parse logic via the public cap.
-        std::env::set_var("UMADEV_ADOPT_MAX_FILES", "0");
+        // Guard the override semantics while restoring the process-global env
+        // even if an assertion below fails.
+        let _env = EnvRestore::set("UMADEV_ADOPT_MAX_FILES", "0");
         assert_eq!(env_max_files(), usize::MAX);
         std::env::set_var("UMADEV_ADOPT_MAX_FILES", "7");
         assert_eq!(env_max_files(), 7);

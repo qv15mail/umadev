@@ -3626,6 +3626,28 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn agentic_knowledge_digest_fails_open_without_knowledge_dir() {
         // No `knowledge/` dir in the workspace AND no bundled corpus reachable
@@ -3683,13 +3705,12 @@ mod tests {
         // dir) wins over the home fallback.
         let bare = TempDir::new().unwrap();
         let envdir = TempDir::new().unwrap();
-        std::env::set_var("UMADEV_KNOWLEDGE_DIR", envdir.path());
+        let _env = EnvRestore::set("UMADEV_KNOWLEDGE_DIR", envdir.path());
         assert_eq!(
             knowledge_root(bare.path()),
             envdir.path(),
             "UMADEV_KNOWLEDGE_DIR wins when local corpus is absent"
         );
-        std::env::remove_var("UMADEV_KNOWLEDGE_DIR");
     }
 
     #[test]

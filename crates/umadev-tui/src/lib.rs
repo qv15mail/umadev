@@ -5913,6 +5913,34 @@ mod tests {
         }
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn enrich_base_failure_prepends_actionable_line_and_keeps_tail() {
         // D1 (chat path): a known auth stderr now classifies and PREPENDS the
@@ -6051,8 +6079,7 @@ mod tests {
     #[test]
     fn synchronized_output_supported_detects_known_terminals() {
         // Env is process-global: snapshot every var the detector reads, force a
-        // clean slate for each case, then restore. (`set_var`/`remove_var` are
-        // safe on edition 2021 — the same pattern other tests here use.)
+        // clean slate for each case, then restore even if an assertion fails.
         let keys = [
             "TMUX",
             "TERM_PROGRAM",
@@ -6062,8 +6089,7 @@ mod tests {
             "WT_SESSION",
             "VTE_VERSION",
         ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let _env: Vec<_> = keys.iter().map(|k| EnvRestore::remove(k)).collect();
         let clear = || {
             for k in keys {
                 std::env::remove_var(k);
@@ -6097,15 +6123,6 @@ mod tests {
         clear();
         std::env::set_var("VTE_VERSION", "5400");
         assert!(!synchronized_output_supported(), "old VTE < 6800 → false");
-        clear();
-
-        // Restore the original environment so parallel/later tests are unaffected.
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     /// A minimal [`RoutePlan`] of a given class for driving [`drive_agentic_stream`]
@@ -6217,13 +6234,8 @@ mod tests {
         // `UMADEV_NO_GOAL_MODE=1` suppresses goal framing on EVERY path (shared
         // verbatim with the legacy pipeline's `with_goal_mode`). The env guard is
         // global, so scope the mutation tightly and restore it.
-        let prev = std::env::var("UMADEV_NO_GOAL_MODE").ok();
-        std::env::set_var("UMADEV_NO_GOAL_MODE", "1");
+        let _env = EnvRestore::set("UMADEV_NO_GOAL_MODE", "1");
         assert_eq!(resolve_goal_mode("claude-code", true), None);
-        match prev {
-            Some(v) => std::env::set_var("UMADEV_NO_GOAL_MODE", v),
-            None => std::env::remove_var("UMADEV_NO_GOAL_MODE"),
-        }
     }
 
     #[test]
@@ -7660,12 +7672,9 @@ mod tests {
     /// shared) so it never leaves global state mutated.
     #[test]
     fn tui_continuous_default_on_with_opt_out() {
-        let saved_c = std::env::var("UMADEV_CONTINUOUS").ok();
-        let saved_l = std::env::var("UMADEV_LEGACY_RUN").ok();
-
         // Unset → DEFAULT ON.
-        std::env::remove_var("UMADEV_CONTINUOUS");
-        std::env::remove_var("UMADEV_LEGACY_RUN");
+        let _continuous = EnvRestore::remove("UMADEV_CONTINUOUS");
+        let _legacy = EnvRestore::remove("UMADEV_LEGACY_RUN");
         assert!(tui_continuous_enabled(), "continuous is the default");
 
         // Explicit opt-out → single-shot.
@@ -7674,17 +7683,6 @@ mod tests {
         std::env::set_var("UMADEV_CONTINUOUS", "1");
         std::env::set_var("UMADEV_LEGACY_RUN", "1");
         assert!(!tui_continuous_enabled(), "UMADEV_LEGACY_RUN=1 opts out");
-
-        // Restore.
-        std::env::remove_var("UMADEV_LEGACY_RUN");
-        match saved_c {
-            Some(v) => std::env::set_var("UMADEV_CONTINUOUS", v),
-            None => std::env::remove_var("UMADEV_CONTINUOUS"),
-        }
-        match saved_l {
-            Some(v) => std::env::set_var("UMADEV_LEGACY_RUN", v),
-            None => std::env::remove_var("UMADEV_LEGACY_RUN"),
-        }
     }
 
     /// Fail-open: when the persistent session can't open (an unknown backend id
@@ -8437,8 +8435,7 @@ mod tests {
         // settle now reports the long-task framing (build/compile/install/test) and
         // points at UMADEV_IDLE_TIMEOUT_SECS. Tiny base window (1s) so it settles fast.
         let _env = CHAT_IDLE_ENV_LOCK.lock().await;
-        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _idle = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
 
         let tmp = tempfile::TempDir::new().unwrap();
         let (sink, mut _engine_rx) = ChannelSink::new();
@@ -8472,11 +8469,6 @@ mod tests {
             }
             other => panic!("expected a Failed idle settle, got {other:?}"),
         }
-
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     #[tokio::test]
@@ -8487,10 +8479,8 @@ mod tests {
         // 1s base window AND a 1s poll, we cancel at 2s: the live in-tool base is still
         // draining (timeout Err); without the liveness model it would have settled at ~1s.
         let _env = CHAT_IDLE_ENV_LOCK.lock().await;
-        let prior_base = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
-        let prior_tool = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
-        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "1"); // 1s liveness poll
+        let _base = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _tool = EnvRestore::set("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "1"); // 1s liveness poll
 
         let tmp = tempfile::TempDir::new().unwrap();
         let (sink, mut _engine_rx) = ChannelSink::new();
@@ -8516,15 +8506,6 @@ mod tests {
             "a chat turn mid-tool must NOT settle at the 1s base window — the liveness \
              poll keeps the live base alive (so the 2s cancel fires instead)"
         );
-
-        match prior_base {
-            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
-        }
-        match prior_tool {
-            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     fn chat_turn(
@@ -8870,8 +8851,7 @@ mod tests {
     #[tokio::test]
     async fn chat_idle_hang_on_live_base_parks_session() {
         let _env = CHAT_IDLE_ENV_LOCK.lock().await;
-        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let _idle = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
 
         let tmp = tempfile::TempDir::new().unwrap();
         let (sink, mut _engine_rx) = ChannelSink::new();
@@ -8901,11 +8881,6 @@ mod tests {
             holder.lock().await.is_some(),
             "an idle hang on a still-alive base must PARK the session for the next turn"
         );
-
-        match prior {
-            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
-        }
     }
 
     /// The core latency-fix invariant: two chat turns REUSE the one held session
@@ -9645,8 +9620,8 @@ mod tests {
     #[test]
     fn scrub_and_resume_intervals_honor_env_overrides_and_floor() {
         // Defaults when unset.
-        std::env::remove_var("UMADEV_SCRUB_SECS");
-        std::env::remove_var("UMADEV_RESUME_GAP_SECS");
+        let _scrub = EnvRestore::remove("UMADEV_SCRUB_SECS");
+        let _resume = EnvRestore::remove("UMADEV_RESUME_GAP_SECS");
         assert_eq!(scrub_interval(), Duration::from_secs(2), "default scrub 2s");
         assert_eq!(
             resume_gap(),
@@ -9676,7 +9651,5 @@ mod tests {
             Duration::from_secs(5),
             "garbage resume gap floors back to the default"
         );
-        std::env::remove_var("UMADEV_SCRUB_SECS");
-        std::env::remove_var("UMADEV_RESUME_GAP_SECS");
     }
 }

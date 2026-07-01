@@ -933,20 +933,48 @@ mod tests {
         assert_eq!(d.login_hint().unwrap(), "codex login");
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prev: std::env::var_os(key),
+            }
+        }
+
+        fn set<P: AsRef<std::ffi::OsStr>>(&self, value: P) {
+            std::env::set_var(self.key, value);
+        }
+
+        fn remove(&self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prev.as_ref() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     // `codex_auth_file` honors `$CODEX_HOME`, defaulting to `~/.codex/auth.json`.
     #[test]
     fn codex_auth_file_honors_codex_home() {
         // Crate-wide auth-env lock; this sync test takes it via `blocking_lock`.
         let _g = crate::AUTH_ENV_TEST_LOCK.blocking_lock();
-        let saved = std::env::var_os("CODEX_HOME");
-        std::env::set_var("CODEX_HOME", "/tmp/umadev-codex-home-test");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_home = EnvRestore::capture("CODEX_HOME");
+        codex_home.set(tmp.path());
         let p = codex_auth_file().unwrap();
-        match saved {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         assert!(p.ends_with("auth.json"));
-        assert!(p.to_string_lossy().contains("umadev-codex-home-test"));
+        assert!(p.starts_with(tmp.path()));
     }
 
     // The `auth.json` existence path: an empty CODEX_HOME (no file) + no
@@ -956,19 +984,12 @@ mod tests {
     async fn probe_auth_unknown_when_no_creds_and_status_cmd_missing() {
         let _g = crate::AUTH_ENV_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let saved_home = std::env::var_os("CODEX_HOME");
-        let saved_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::set_var("CODEX_HOME", tmp.path()); // empty → no auth.json
-        std::env::remove_var("OPENAI_API_KEY");
+        let codex_home = EnvRestore::capture("CODEX_HOME");
+        let openai_key = EnvRestore::capture("OPENAI_API_KEY");
+        codex_home.set(tmp.path()); // empty → no auth.json
+        openai_key.remove();
         let d = CodexDriver::with_program("umadev-fake-codex-xyz");
         let state = d.probe_auth().await;
-        match saved_home {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        if let Some(v) = saved_key {
-            std::env::set_var("OPENAI_API_KEY", v);
-        }
         assert_eq!(
             state,
             AuthState::Unknown,
@@ -982,20 +1003,12 @@ mod tests {
     async fn probe_auth_logged_in_via_openai_api_key() {
         let _g = crate::AUTH_ENV_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let saved_home = std::env::var_os("CODEX_HOME");
-        let saved_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::set_var("CODEX_HOME", tmp.path());
-        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let codex_home = EnvRestore::capture("CODEX_HOME");
+        let openai_key = EnvRestore::capture("OPENAI_API_KEY");
+        codex_home.set(tmp.path());
+        openai_key.set("sk-test");
         let d = CodexDriver::with_program("umadev-fake-codex-xyz");
         let state = d.probe_auth().await;
-        match saved_home {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        match saved_key {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
-        }
         assert_eq!(state, AuthState::LoggedIn);
     }
 

@@ -20,7 +20,9 @@
 //!
 //! The legacy `crossterm::EventStream` path is retained behind
 //! [`legacy_input_from_env`] (`UMADEV_LEGACY_INPUT=1`) so a tokenizer bug in the
-//! field is one env var away from reverting.
+//! field is one env var away from reverting. It is also the default on Windows:
+//! console keys such as Esc and arrows can arrive as Windows input records rather
+//! than stdin bytes, and crossterm's native backend is the correct reader there.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -310,7 +312,7 @@ impl InputSource {
     /// Construct the source per the escape-hatch env gate.
     #[must_use]
     pub fn from_env() -> Self {
-        if legacy_input_from_env() {
+        if cfg!(windows) || legacy_input_from_env() {
             InputSource::Legacy(Box::new(EventStream::new()))
         } else {
             InputSource::Owned(Box::<OwnedInput>::default())
@@ -339,50 +341,97 @@ impl InputSource {
 mod tests {
     use super::*;
 
-    #[test]
-    fn legacy_input_env_gate() {
-        // Process-global env: snapshot, force, restore.
-        let prev = std::env::var("UMADEV_LEGACY_INPUT").ok();
-        std::env::remove_var("UMADEV_LEGACY_INPUT");
-        assert!(!legacy_input_from_env(), "default is the owned tokenizer");
-        std::env::set_var("UMADEV_LEGACY_INPUT", "1");
-        assert!(legacy_input_from_env(), "=1 selects the legacy path");
-        std::env::set_var("UMADEV_LEGACY_INPUT", "true");
-        assert!(legacy_input_from_env(), "=true also selects legacy");
-        std::env::set_var("UMADEV_LEGACY_INPUT", "0");
-        assert!(!legacy_input_from_env(), "=0 stays on the owned path");
-        match prev {
-            Some(v) => std::env::set_var("UMADEV_LEGACY_INPUT", v),
-            None => std::env::remove_var("UMADEV_LEGACY_INPUT"),
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvRestore {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prev: std::env::var(key).ok(),
+            }
+        }
+
+        fn set(&self, value: &str) {
+            std::env::set_var(self.key, value);
+        }
+
+        fn remove(&self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prev.as_ref() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
         }
     }
 
     #[test]
+    fn legacy_input_env_gate() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvRestore::capture("UMADEV_LEGACY_INPUT");
+        env.remove();
+        assert!(!legacy_input_from_env(), "default is the owned tokenizer");
+        env.set("1");
+        assert!(legacy_input_from_env(), "=1 selects the legacy path");
+        env.set("true");
+        assert!(legacy_input_from_env(), "=true also selects legacy");
+        env.set("0");
+        assert!(!legacy_input_from_env(), "=0 stays on the owned path");
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn input_source_defaults_to_owned_off_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvRestore::capture("UMADEV_LEGACY_INPUT");
+        env.remove();
+        assert!(InputSource::from_env().is_owned());
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn input_source_defaults_to_legacy_on_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvRestore::capture("UMADEV_LEGACY_INPUT");
+        env.remove();
+        assert!(
+            !InputSource::from_env().is_owned(),
+            "Windows console Esc/arrows are native input records, not stdin bytes"
+        );
+    }
+
+    #[test]
     fn esc_flush_interval_clamps() {
-        let prev = std::env::var("UMADEV_ESC_FLUSH_MS").ok();
-        std::env::remove_var("UMADEV_ESC_FLUSH_MS");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvRestore::capture("UMADEV_ESC_FLUSH_MS");
+        env.remove();
         assert_eq!(
             esc_flush_interval(),
             Duration::from_millis(DEFAULT_ESC_FLUSH_MS)
         );
-        std::env::set_var("UMADEV_ESC_FLUSH_MS", "0");
+        env.set("0");
         assert_eq!(
             esc_flush_interval(),
             Duration::from_millis(DEFAULT_ESC_FLUSH_MS),
             "0 is rejected (clamped to default)"
         );
-        std::env::set_var("UMADEV_ESC_FLUSH_MS", "120");
+        env.set("120");
         assert_eq!(esc_flush_interval(), Duration::from_millis(120));
-        std::env::set_var("UMADEV_ESC_FLUSH_MS", "999999");
+        env.set("999999");
         assert_eq!(
             esc_flush_interval(),
             Duration::from_millis(DEFAULT_ESC_FLUSH_MS),
             "out-of-range is rejected"
         );
-        match prev {
-            Some(v) => std::env::set_var("UMADEV_ESC_FLUSH_MS", v),
-            None => std::env::remove_var("UMADEV_ESC_FLUSH_MS"),
-        }
     }
 
     #[test]

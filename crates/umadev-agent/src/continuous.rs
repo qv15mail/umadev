@@ -2014,7 +2014,25 @@ impl Blackboard {
         };
         let (prd, architecture, uiux) = (doc("prd"), doc("architecture"), doc("uiux"));
         let code = if matches!(kind, ReviewKind::Preview | ReviewKind::Quality) {
-            source_digest(options)
+            let digest = source_digest(options);
+            if matches!(kind, ReviewKind::Quality) {
+                // The Quality critics judge a FORKED session whose context is the
+                // blackboard (the `output/*.md` docs + this source DIGEST), not the
+                // full file tree — so a critic can hallucinate "no tests / no backend
+                // / no source exist" and raise a spurious blocking finding. GROUND
+                // them with a bounded listing of the REAL workspace files so they SEE
+                // what exists and judge it, instead of filtering the hallucination out
+                // after the fact. Fail-open: an empty listing (unreadable/empty tree)
+                // contributes nothing and the digest stands alone.
+                let listing = WorkspaceEvidence::read(root).to_review_context();
+                if listing.is_empty() {
+                    digest
+                } else {
+                    format!("{listing}\n{digest}")
+                }
+            } else {
+                digest
+            }
         } else {
             String::new()
         };
@@ -2078,6 +2096,143 @@ fn source_digest(options: &RunOptions) -> String {
         }
     }
     out
+}
+
+/// Max file paths listed in a single workspace-evidence grounding block — keeps
+/// the forked judge prompt bounded even on a large tree.
+const MAX_LISTED_PATHS: usize = 40;
+/// Max bytes of joined relative paths in a workspace-evidence grounding block.
+const MAX_LISTING_BYTES: usize = 4096;
+
+/// A bounded, deterministic listing of the REAL workspace files, handed to the
+/// Quality-review critics as GROUNDING.
+///
+/// The Quality critics review a `fork()`ed read-only session whose context is
+/// the blackboard (the `output/*.md` docs + a source *digest*), NOT the full
+/// file tree — so a critic can hallucinate "no tests / no backend / no source
+/// exist" and raise a spurious blocking finding. Injecting the ACTUAL relative
+/// paths lets a critic SEE what exists and judge it, killing the hallucination
+/// at the source. Because the grounding prevents the false claim up front, there
+/// is no post-hoc verdict surgery: critic verdicts stay advisory (invariant 2)
+/// and the deterministic floor (coverage / contract / verify) governs loop
+/// termination.
+///
+/// The listing is bounded ([`MAX_LISTED_PATHS`] paths / [`MAX_LISTING_BYTES`]
+/// bytes), deterministic (paths sorted), and fail-open: an unreadable / empty
+/// tree yields an empty listing that injects NOTHING — never a panic, and never
+/// a fabricated claim that files exist when they don't.
+#[derive(Debug, Default)]
+struct WorkspaceEvidence {
+    /// Relative paths of the real test files (accurate [`is_test_file`] split).
+    tests: Vec<String>,
+    /// Relative paths of the real non-test source files (backend + everything else).
+    source: Vec<String>,
+    /// How many additional files existed beyond the listing cap (the "(+N more)").
+    overflow: usize,
+}
+
+impl WorkspaceEvidence {
+    /// Scan the workspace once and collect a bounded, sorted listing of the real
+    /// source + test files. Fail-open: an unreadable tree yields empty vecs.
+    fn read(project_root: &std::path::Path) -> Self {
+        let files = crate::acceptance::source_files(project_root);
+        let total = files.len();
+        // `source_files` walks the tree in OS-defined `read_dir` order; sort by
+        // relative path so the injected listing is DETERMINISTIC.
+        let mut rels: Vec<(bool, String)> = files
+            .iter()
+            .map(|f| (is_test_file(f), rel_path(project_root, f)))
+            .collect();
+        rels.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut evidence = Self::default();
+        let mut bytes = 0usize;
+        for (is_test, rel) in rels {
+            let listed = evidence.tests.len() + evidence.source.len();
+            if listed >= MAX_LISTED_PATHS || bytes + rel.len() + 1 > MAX_LISTING_BYTES {
+                break;
+            }
+            bytes += rel.len() + 1;
+            if is_test {
+                evidence.tests.push(rel);
+            } else {
+                evidence.source.push(rel);
+            }
+        }
+        evidence.overflow = total.saturating_sub(evidence.tests.len() + evidence.source.len());
+        evidence
+    }
+
+    /// Render the grounding block for the critic review context. Empty when the
+    /// scan found nothing (fail-open: nothing real to ground → inject nothing).
+    fn to_review_context(&self) -> String {
+        if self.tests.is_empty() && self.source.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        out.push_str(
+            "## Current workspace files (fresh filesystem listing)\n\
+             The files below REALLY EXIST in the workspace right now. Do NOT claim tests, \
+             backend, or source are absent when the matching files appear here — review the \
+             files that exist for specific, evidence-backed gaps instead.\n",
+        );
+        render_listing(&mut out, "Test files", &self.tests);
+        render_listing(
+            &mut out,
+            "Source files (backend + everything else)",
+            &self.source,
+        );
+        if self.overflow > 0 {
+            out.push_str(&format!("(+{} more file(s) not listed)\n", self.overflow));
+        }
+        out
+    }
+}
+
+/// Append a labelled, one-path-per-line block. Skips an EMPTY bucket so the
+/// listing never implies files exist that don't: if there are genuinely no test
+/// files, no "Test files" block appears, and a critic's legitimate "no tests"
+/// finding is neither contradicted nor suppressed.
+fn render_listing(out: &mut String, label: &str, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
+    out.push_str("### ");
+    out.push_str(label);
+    out.push('\n');
+    for f in files {
+        out.push_str("- ");
+        out.push_str(f);
+        out.push('\n');
+    }
+}
+
+fn rel_path(root: &std::path::Path, file: &std::path::Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn is_test_file(path: &std::path::Path) -> bool {
+    let rel = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    rel.contains("/tests/")
+        || rel.contains("/test/")
+        || rel.contains("/__tests__/")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with("_test.rs")
+        || name.ends_with("_test.go")
+        || name.starts_with("test_")
+        || name.ends_with("_test.py")
 }
 
 /// A [`CriticConsult`] that routes a seat's strict-JSON judge turn to a READ-ONLY
@@ -2363,6 +2518,37 @@ mod tests {
     use std::sync::Mutex;
     use umadev_runtime::SessionError;
 
+    struct EnvRestore {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prev: std::env::var(key).ok(),
+            }
+        }
+
+        fn set(&self, value: &str) {
+            std::env::set_var(self.key, value);
+        }
+
+        fn remove(&self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prev.as_ref() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     // ── A scripted, fully-deterministic fake BaseSession ───────────────────
     //
     // Each `send_turn` pops the next scripted batch of events; `next_event`
@@ -2609,17 +2795,14 @@ mod tests {
 
     #[test]
     fn legacy_pipeline_flag_defaults_off_and_honours_explicit_on() {
-        // This is the ONLY test that touches `UMADEV_LEGACY_PIPELINE`, so it owns
-        // the var: set/clear in-test, no cross-test env race. Default (unset) is
-        // OFF (director path); only an explicit truthy value selects the legacy
-        // fixed pipeline.
-        std::env::remove_var("UMADEV_LEGACY_PIPELINE");
+        let env = EnvRestore::capture("UMADEV_LEGACY_PIPELINE");
+        env.remove();
         assert!(
             !legacy_pipeline_from_env(),
             "default (unset) is the director path, not legacy"
         );
         for on in ["1", "true", "on"] {
-            std::env::set_var("UMADEV_LEGACY_PIPELINE", on);
+            env.set(on);
             assert!(
                 legacy_pipeline_from_env(),
                 "`{on}` selects the legacy fixed pipeline"
@@ -2627,13 +2810,12 @@ mod tests {
         }
         // A non-truthy value stays on the director path (fail-open default).
         for off in ["0", "false", "off", "nonsense", ""] {
-            std::env::set_var("UMADEV_LEGACY_PIPELINE", off);
+            env.set(off);
             assert!(
                 !legacy_pipeline_from_env(),
                 "`{off}` is NOT an opt-in → director path"
             );
         }
-        std::env::remove_var("UMADEV_LEGACY_PIPELINE");
     }
 
     // ── Phase advance + gate pause ─────────────────────────────────────────
@@ -3361,8 +3543,8 @@ mod tests {
             TrustMode::Guarded,
         );
         let (events, _rec) = sink();
-        let saved = std::env::var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS").ok();
-        std::env::set_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS", "1");
+        let fork_timeout_env = EnvRestore::capture("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS");
+        fork_timeout_env.set("1");
 
         let mut session = FakeBaseSession::fork_wedged();
         let sent = session.sent_handle();
@@ -3376,11 +3558,6 @@ mod tests {
         )
         .await
         .expect("run must not hang on a wedged fork — the timeout must fire");
-
-        match saved {
-            Some(v) => std::env::set_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS", v),
-            None => std::env::remove_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS"),
-        }
 
         // The gate still PAUSED (the wedged forks all fail-open ACCEPT → no rework).
         assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
@@ -3827,12 +4004,12 @@ mod tests {
     /// reads these vars, so this can't race a sibling.
     #[test]
     fn continuous_is_default_with_explicit_opt_out() {
-        let saved_c = std::env::var("UMADEV_CONTINUOUS").ok();
-        let saved_l = std::env::var("UMADEV_LEGACY_RUN").ok();
+        let continuous_env = EnvRestore::capture("UMADEV_CONTINUOUS");
+        let legacy_env = EnvRestore::capture("UMADEV_LEGACY_RUN");
 
         // Unset → DEFAULT ON (the architecture has closed on continuous).
-        std::env::remove_var("UMADEV_CONTINUOUS");
-        std::env::remove_var("UMADEV_LEGACY_RUN");
+        continuous_env.remove();
+        legacy_env.remove();
         assert!(
             continuous_enabled_from_env(),
             "continuous must be the DEFAULT when nothing is set"
@@ -3840,7 +4017,7 @@ mod tests {
 
         // Explicit opt-out via the off-switch on the continuous var → single-shot.
         for off in ["0", "false", "off"] {
-            std::env::set_var("UMADEV_CONTINUOUS", off);
+            continuous_env.set(off);
             assert!(
                 !continuous_enabled_from_env(),
                 "UMADEV_CONTINUOUS={off} must opt OUT to single-shot"
@@ -3849,33 +4026,23 @@ mod tests {
 
         // Explicit opt-out via the legacy-run alias → single-shot, even when the
         // continuous var is left unset / on (opt-out wins).
-        std::env::remove_var("UMADEV_CONTINUOUS");
+        continuous_env.remove();
         for on in ["1", "true", "on"] {
-            std::env::set_var("UMADEV_LEGACY_RUN", on);
+            legacy_env.set(on);
             assert!(
                 !continuous_enabled_from_env(),
                 "UMADEV_LEGACY_RUN={on} must opt OUT to single-shot"
             );
         }
-        std::env::remove_var("UMADEV_LEGACY_RUN");
+        legacy_env.remove();
 
         // Explicit force-on still honoured (symmetry, no longer required).
         for on in ["1", "true", "on"] {
-            std::env::set_var("UMADEV_CONTINUOUS", on);
+            continuous_env.set(on);
             assert!(
                 continuous_enabled_from_env(),
                 "UMADEV_CONTINUOUS={on} must keep continuous ON"
             );
-        }
-
-        // Restore the global env exactly as we found it.
-        match saved_c {
-            Some(v) => std::env::set_var("UMADEV_CONTINUOUS", v),
-            None => std::env::remove_var("UMADEV_CONTINUOUS"),
-        }
-        match saved_l {
-            Some(v) => std::env::set_var("UMADEV_LEGACY_RUN", v),
-            None => std::env::remove_var("UMADEV_LEGACY_RUN"),
         }
     }
 
@@ -4094,6 +4261,126 @@ mod tests {
         let docs_bb = Blackboard::read(&options, ReviewKind::Docs);
         let docs_arts = docs_bb.artifacts(&options.requirement);
         assert!(docs_arts.qa_floor.is_empty() && docs_arts.security_floor.is_empty());
+    }
+
+    #[test]
+    fn quality_blackboard_grounds_critics_with_real_file_listing() {
+        // GROUNDING: the Quality critics review a forked session with only the
+        // blackboard + a source digest, so they can hallucinate absent files. The
+        // review context must carry the ACTUAL relative paths of the real test +
+        // source (incl. backend) files so a critic SEES them and cannot claim
+        // absence.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/api")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("src/api/server.py"),
+            "def route():\n    return 200\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/test_server.py"),
+            "def test_route():\n    assert True\n",
+        )
+        .unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+
+        let bb = Blackboard::read(&options, ReviewKind::Quality);
+        let arts = bb.artifacts(&options.requirement);
+
+        assert!(
+            arts.code.contains("Current workspace files"),
+            "quality critics must see the real file listing: {}",
+            arts.code
+        );
+        // The listing separates tests from source, and shows the ACTUAL paths (not
+        // a bare count the critic can ignore) — the backend file is visible by its
+        // real path under the source bucket.
+        assert!(arts.code.contains("### Test files"), "{}", arts.code);
+        assert!(arts.code.contains("### Source files"), "{}", arts.code);
+        assert!(arts.code.contains("src/api/server.py"), "{}", arts.code);
+        assert!(arts.code.contains("tests/test_server.py"), "{}", arts.code);
+    }
+
+    #[test]
+    fn workspace_evidence_only_grounds_files_that_exist() {
+        // TRUTHFUL grounding: with source present but NO test files, the listing
+        // must NOT emit a "Test files" block — it never fabricates that tests exist,
+        // so a critic's legitimate "no tests" finding stays valid (nothing is
+        // suppressed).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+
+        let ctx = WorkspaceEvidence::read(root).to_review_context();
+        assert!(
+            ctx.contains("src/app.py"),
+            "lists the real source file: {ctx}"
+        );
+        assert!(
+            !ctx.contains("### Test files"),
+            "must NOT claim tests exist when none do: {ctx}"
+        );
+    }
+
+    #[test]
+    fn workspace_evidence_is_fail_open_on_unreadable_tree() {
+        // FAIL-OPEN: an unreadable / missing tree yields an EMPTY listing that
+        // injects nothing — never a panic, never a fabricated claim.
+        let missing = std::path::Path::new("/umadev-nonexistent-abcdef/definitely/not/here");
+        let ev = WorkspaceEvidence::read(missing);
+        assert!(
+            ev.to_review_context().is_empty(),
+            "an unreadable tree grounds nothing (fail-open)"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_review_does_not_suppress_or_force_accept_absence_findings() {
+        // NO post-hoc suppression / force-accept: the crude filter is gone. Even a
+        // GLOBAL "no tests exist" blocking finding passes through `run_review_team`
+        // verbatim — critic verdicts are advisory (invariant 2) and the
+        // deterministic floor governs loop control; the injected file listing (the
+        // grounding) is what prevents the hallucination, not verdict surgery.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/test_app.py"),
+            "def test_app():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+
+        // A single QA seat scripted to BLOCK with a global-absence finding — the
+        // exact shape the old filter would have suppressed + force-accepted.
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(vec![Some(
+            r#"{"accepts":false,"blocking":["No tests exist anywhere in the delivered artifact"]}"#
+                .into(),
+        )]);
+
+        let blocking = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.contains("No tests exist anywhere")),
+            "a critic's blocking finding must pass through un-suppressed: {blocking:?}"
+        );
     }
 
     // ── Idle watchdog on EVERY main-session pump (P0-3 / P1-11) ─────────────

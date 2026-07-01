@@ -2218,6 +2218,10 @@ pub struct App {
     /// Scroll offset (in rows) for the help overlay, so it never crops on
     /// small terminals. Reset to 0 each time help opens.
     pub help_scroll: u16,
+    /// Renderer-published maximum reachable help scroll row. Key handling clamps
+    /// against this so holding ↓/PgDn at the bottom cannot overshoot and make the
+    /// next ↑ appear stuck.
+    pub help_max_scroll: std::cell::Cell<u16>,
     /// A scrollable overlay (from `/spec` / `/verify` / `/doctor` /
     /// `/diff`). When `Some`, key input is routed to the overlay
     /// (scroll, close); when `None`, normal chat input.
@@ -2629,6 +2633,7 @@ impl App {
             backends: Vec::new(),
             show_help: false,
             help_scroll: 0,
+            help_max_scroll: std::cell::Cell::new(0),
             overlay: None,
             search: None,
             history_search: None,
@@ -3640,6 +3645,26 @@ impl App {
         self.transcript_scroll.set(0);
     }
 
+    /// Scroll the help overlay DOWN by `rows`, clamped to the renderer-published
+    /// bottom row. Without this clamp, holding ↓ at the bottom could overshoot
+    /// `help_scroll` far past the visible range; the render stayed pinned to the
+    /// bottom, but the next ↑ appeared to do nothing until the hidden overshoot
+    /// counted back down.
+    fn help_scroll_down(&mut self, rows: u16) {
+        let max = self.help_max_scroll.get();
+        self.help_scroll = self.help_scroll.saturating_add(rows).min(max);
+    }
+
+    /// Scroll the help overlay UP by `rows`.
+    fn help_scroll_up(&mut self, rows: u16) {
+        self.help_scroll = self.help_scroll.saturating_sub(rows);
+    }
+
+    /// Jump to the renderer-published bottom of the help overlay.
+    fn help_scroll_to_bottom(&mut self) {
+        self.help_scroll = self.help_max_scroll.get();
+    }
+
     /// Route one mouse-wheel notch (`up` = `ScrollUp`) to the right surface.
     ///
     /// Precedence: a modal **overlay**, when open, owns the viewport and scrolls
@@ -3992,11 +4017,14 @@ impl App {
         if split_chip {
             self.reconcile_attachments();
         }
-        // The slash palette re-filters as you type — reset the highlight to the
-        // best (first) match so Enter runs a predictable command.
+        self.reset_typeahead_after_edit();
+    }
+
+    /// Any edit that changes `input` invalidates the live slash / `@` candidate
+    /// lists. Re-open a dismissed mention popover because the token just changed;
+    /// pure cursor movement intentionally does not call this.
+    fn reset_typeahead_after_edit(&mut self) {
         self.palette_selected = 0;
-        // Editing re-opens a dismissed `@`-mention popover and resets its
-        // highlight (the candidate set just changed).
         self.mention_selected = 0;
         self.mention_dismissed = false;
     }
@@ -4044,9 +4072,7 @@ impl App {
             }
         }
         self.input_history_idx = None;
-        self.palette_selected = 0;
-        self.mention_selected = 0;
-        self.mention_dismissed = false;
+        self.reset_typeahead_after_edit();
     }
 
     /// Delete the GRAPHEME CLUSTER before the cursor (Backspace). Steps over a
@@ -4071,9 +4097,7 @@ impl App {
             self.remove_char_range(start_char, self.input_cursor);
             self.input_cursor = start_char;
         }
-        self.palette_selected = 0;
-        self.mention_selected = 0;
-        self.mention_dismissed = false;
+        self.reset_typeahead_after_edit();
     }
 
     /// Remove the half-open char range `[start_char, end_char)` from `input`.
@@ -4104,7 +4128,7 @@ impl App {
             let end_char = self.next_grapheme(self.input_cursor);
             self.remove_char_range(self.input_cursor, end_char);
         }
-        self.palette_selected = 0;
+        self.reset_typeahead_after_edit();
     }
 
     /// Delete from the cursor back to the start of the line (Ctrl+U). The removed
@@ -4125,7 +4149,7 @@ impl App {
         // A line-kill can take whole chips with it — drop any now-orphaned ref so
         // a removed chip never silently mis-expands on submit.
         self.reconcile_attachments();
-        self.palette_selected = 0;
+        self.reset_typeahead_after_edit();
         self.push_kill(&killed, KillDir::Backward);
     }
 
@@ -4145,7 +4169,7 @@ impl App {
         // Mirror of `delete_to_line_start`: a kill-to-EOL may swallow whole chips,
         // so drop any orphaned backing ref.
         self.reconcile_attachments();
-        self.palette_selected = 0;
+        self.reset_typeahead_after_edit();
         self.push_kill(&killed, KillDir::Forward);
     }
 
@@ -4216,7 +4240,7 @@ impl App {
         self.input.replace_range(start..end, "");
         self.input_cursor = c;
         self.reconcile_attachments();
-        self.palette_selected = 0;
+        self.reset_typeahead_after_edit();
         self.push_kill(&killed, KillDir::Backward);
     }
 
@@ -4368,8 +4392,7 @@ impl App {
         self.input_cursor = snap.cursor.min(self.input_len());
         self.last_snapshot_at = None;
         self.input_history_idx = None;
-        self.palette_selected = 0;
-        self.mention_selected = 0;
+        self.reset_typeahead_after_edit();
     }
 
     /// Move the caret by `delta` GRAPHEME CLUSTERS, clamped to `[0, len]`. `delta`
@@ -6745,20 +6768,28 @@ impl App {
                     self.show_help = false;
                     return Action::None;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = self.help_scroll.saturating_add(1);
+                KeyCode::Down | KeyCode::Char('j' | 'J') => {
+                    self.help_scroll_down(1);
                     return Action::None;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                KeyCode::Up | KeyCode::Char('k' | 'K') => {
+                    self.help_scroll_up(1);
                     return Action::None;
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.help_scroll = self.help_scroll.saturating_add(10);
+                    self.help_scroll_down(10);
                     return Action::None;
                 }
                 KeyCode::PageUp => {
-                    self.help_scroll = self.help_scroll.saturating_sub(10);
+                    self.help_scroll_up(10);
+                    return Action::None;
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.help_scroll = 0;
+                    return Action::None;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.help_scroll_to_bottom();
                     return Action::None;
                 }
                 // F1 toggles help off (handled earlier); any OTHER key is
@@ -6898,7 +6929,22 @@ impl App {
             }
 
             // ---- input editing ----
+            KeyCode::Backspace if alt => {
+                self.pending_quit_confirm = false;
+                self.pending_rewind = false;
+                self.delete_word_back();
+                Action::None
+            }
             KeyCode::Backspace => {
+                self.pending_quit_confirm = false;
+                self.pending_rewind = false;
+                self.backspace();
+                Action::None
+            }
+            // Some Windows/ConPTY paths surface Backspace as a literal BS/DEL
+            // control char instead of `KeyCode::Backspace`; treat both as the
+            // same editor command so the input box remains terminal-agnostic.
+            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
                 self.pending_quit_confirm = false;
                 self.pending_rewind = false;
                 self.backspace();
@@ -12106,6 +12152,10 @@ impl App {
                 self.search_backspace();
                 Action::None
             }
+            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
+                self.search_backspace();
+                Action::None
+            }
             // Printable char (no ctrl/alt) filters the query live. `n`/`N` type
             // into the box rather than navigating, so a query can contain them —
             // navigation lives on Enter/↑/↓/Ctrl+N/Ctrl+P (standard incremental
@@ -12289,6 +12339,10 @@ impl App {
                 Action::None
             }
             KeyCode::Backspace => {
+                self.history_search_backspace();
+                Action::None
+            }
+            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
                 self.history_search_backspace();
                 Action::None
             }
@@ -13532,7 +13586,7 @@ mod tests {
         // gate-card tests see the manual-approval path. Remove any leftover dir
         // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
         // bleed into a test that expects a clean conversation buffer.
-        let workspace = std::path::PathBuf::from(format!("/tmp/sd-test-ws-{id}"));
+        let workspace = std::env::temp_dir().join(format!("sd-test-ws-{id}"));
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&workspace);
         let _ = std::fs::write(
@@ -13542,7 +13596,7 @@ mod tests {
         let mut app = App::new(
             "demo",
             cfg,
-            std::path::PathBuf::from(format!("/tmp/sd-test-cfg-{id}.toml")),
+            std::env::temp_dir().join(format!("sd-test-cfg-{id}.toml")),
             workspace,
         );
         // P5d: force animations ON in tests so spinner-cadence assertions are
@@ -14122,7 +14176,7 @@ mod tests {
     }
 
     /// Build an app rooted at a UNIQUE temp dir so the `.umadev/chat/` persistence
-    /// tests don't collide with each other or the shared `/tmp/sd-test-ws-*` dirs.
+    /// tests don't collide with each other or the shared `fresh_app` temp dirs.
     fn temp_app() -> (App, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = UserConfig {
@@ -16228,17 +16282,14 @@ mod tests {
     fn slash_claude_switches_backend_and_saves() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         let cfg = UserConfig {
             backend: Some("offline".to_string()),
             model: None,
             ..Default::default()
         };
-        let mut app = App::new(
-            "demo",
-            cfg,
-            cfg_path.clone(),
-            std::path::PathBuf::from("/tmp/sd-test-workspace"),
-        );
+        let mut app = App::new("demo", cfg, cfg_path.clone(), workspace);
         for c in "/claude".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
         }
@@ -16674,6 +16725,36 @@ mod tests {
     }
 
     #[test]
+    fn help_scroll_clamps_and_accepts_arrow_vim_keys() {
+        let mut a = fresh_app(Some("offline"));
+        let _ = a.apply_key(KeyCode::F(1));
+        a.help_max_scroll.set(3);
+
+        for _ in 0..10 {
+            let _ = a.apply_key(KeyCode::Down);
+        }
+        assert_eq!(a.help_scroll, 3, "Down must clamp at the rendered bottom");
+
+        let _ = a.apply_key(KeyCode::Up);
+        assert_eq!(
+            a.help_scroll, 2,
+            "Up must move immediately after bottom clamp"
+        );
+
+        let _ = a.apply_key(KeyCode::Char('J'));
+        assert_eq!(a.help_scroll, 3, "uppercase J mirrors j/Down");
+
+        let _ = a.apply_key(KeyCode::Char('K'));
+        assert_eq!(a.help_scroll, 2, "uppercase K mirrors k/Up");
+
+        let _ = a.apply_key(KeyCode::Char('G'));
+        assert_eq!(a.help_scroll, 3, "G jumps to the bottom");
+
+        let _ = a.apply_key(KeyCode::Home);
+        assert_eq!(a.help_scroll, 0, "Home jumps to the top");
+    }
+
+    #[test]
     fn slash_spec_opens_overlay() {
         let mut a = fresh_app(Some("offline"));
         for c in "/spec".chars() {
@@ -16749,7 +16830,7 @@ mod tests {
         let mut app = App::new(
             "demo",
             cfg,
-            std::path::PathBuf::from("/tmp/sd-test-config.toml"),
+            tmp.path().join("config.toml"),
             tmp.path().to_path_buf(),
         );
         for c in "/init".chars() {
@@ -17228,7 +17309,7 @@ mod tests {
         let app = App::new(
             "demo",
             cfg,
-            std::path::PathBuf::from("/tmp/sd-test-config.toml"),
+            tmp.path().join("config.toml"),
             tmp.path().to_path_buf(),
         );
 
@@ -17268,7 +17349,7 @@ mod tests {
         let app = App::new(
             "demo",
             cfg,
-            std::path::PathBuf::from("/tmp/sd-test-config.toml"),
+            tmp.path().join("config.toml"),
             tmp.path().to_path_buf(),
         );
         let msg = app
@@ -17290,7 +17371,7 @@ mod tests {
         let app = App::new(
             "demo",
             cfg,
-            std::path::PathBuf::from("/tmp/sd-test-config.toml"),
+            tmp.path().join("config.toml"),
             tmp.path().to_path_buf(),
         );
         // Greeting still present (always), but no resume hint.
@@ -17487,17 +17568,14 @@ mod tests {
     fn slash_model_with_arg_does_not_set_a_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         let cfg = UserConfig {
             backend: Some("offline".into()),
             model: None,
             ..Default::default()
         };
-        let mut app = App::new(
-            "demo",
-            cfg,
-            cfg_path.clone(),
-            std::path::PathBuf::from("/tmp/sd-test-workspace"),
-        );
+        let mut app = App::new("demo", cfg, cfg_path.clone(), workspace);
         for c in "/model claude-opus-4-7".chars() {
             let _ = app.apply_key(KeyCode::Char(c));
         }
@@ -17832,7 +17910,7 @@ mod tests {
                 model: None,
                 ..Default::default()
             },
-            std::path::PathBuf::from("/tmp/cfg.toml"),
+            tmp.path().join("config.toml"),
             root.to_path_buf(),
         );
         for c in "/verify".chars() {
@@ -18098,6 +18176,30 @@ mod tests {
         // Backspace once → just one CJK char gone, no panic.
         let _ = a.apply_key(KeyCode::Backspace);
         assert_eq!(a.input, "做");
+    }
+
+    #[test]
+    fn windows_bs_control_char_backspaces() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "abc".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Char('\u{8}'));
+        assert_eq!(a.input, "ab");
+        assert_eq!(a.input_cursor, 2);
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_not_one_char() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "hello world".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+
+        let _ = a.apply_key_with_mods(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
+
+        assert_eq!(a.input, "hello ");
+        assert_eq!(a.input_cursor, 6);
     }
 
     // ---- I5: grapheme-cluster-aware cursor ----
@@ -18416,6 +18518,56 @@ mod tests {
         assert!(
             !a.mention_matches().is_empty(),
             "editing re-opened the popover"
+        );
+    }
+
+    #[test]
+    fn delete_reopens_dismissed_mention_after_query_changes() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "@mainx".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        a.dismiss_mention();
+        assert!(
+            a.mention_matches().is_empty(),
+            "dismissed mention starts closed"
+        );
+
+        let _ = a.apply_key(KeyCode::Left);
+        assert!(
+            a.mention_matches().is_empty(),
+            "pure cursor movement must not re-open a dismissed mention"
+        );
+        let _ = a.apply_key(KeyCode::Delete);
+
+        assert_eq!(a.input, "@main");
+        assert!(
+            !a.mention_matches().is_empty(),
+            "forward delete changed the query and must re-open matches"
+        );
+    }
+
+    #[test]
+    fn kill_edit_keys_reset_dismissed_mention_state() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        a.input = "@mainx".to_string();
+        a.input_cursor = a.input_len() - 1;
+        a.dismiss_mention();
+
+        let _ = a.apply_key_with_mods(KeyCode::Char('k'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(a.input, "@main");
+        assert!(
+            !a.mention_matches().is_empty(),
+            "Ctrl+K changed the active mention token and must re-open it"
+        );
+
+        a.dismiss_mention();
+        let _ = a.apply_key_with_mods(KeyCode::Char('w'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(
+            !a.mention_dismissed,
+            "Ctrl+W is an edit and must not leave a stale dismissed flag"
         );
     }
 
@@ -19765,7 +19917,8 @@ mod tests {
         // claim success and revert on next launch. Point config_path under a
         // regular FILE so `create_dir_all(parent)` inside save_to fails.
         let mut app = fresh_app(Some("offline"));
-        let blocker = std::env::temp_dir().join(format!("sd-cfg-blocker-{}", std::process::id()));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("cfg-blocker");
         std::fs::write(&blocker, b"x").unwrap();
         app.config_path = blocker.join("nested").join("config.toml");
         let before = app.history.len();
@@ -19782,7 +19935,6 @@ mod tests {
         );
         // The language still changed for this session (fail-open).
         assert_eq!(app.lang, umadev_i18n::Lang::En);
-        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
@@ -19811,8 +19963,8 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         // Point the project root at a regular FILE so the output/ dir can't be
         // created and the answer write fails.
-        let blocker =
-            std::env::temp_dir().join(format!("sd-clarify-blocker-{}", std::process::id()));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("clarify-blocker");
         std::fs::write(&blocker, b"x").unwrap();
         app.project_root = blocker.clone();
         app.active_gate = Some(Gate::ClarifyGate);
@@ -19831,7 +19983,6 @@ mod tests {
             "a failed clarify write must surface a warning: {}",
             last.body()
         );
-        let _ = std::fs::remove_file(&blocker);
     }
 
     // ---- WorkerStream rendering tests ----
@@ -20794,6 +20945,18 @@ mod tests {
             "Enter loaded the match into the input box"
         );
         assert_eq!(a.input_cursor, a.input_len(), "caret lands at the end");
+    }
+
+    #[test]
+    fn history_search_windows_bs_deletes_query_char() {
+        let mut a = fresh_app(Some("offline"));
+        seed_history(&mut a, &["fix the bug", "add a feature"]);
+        a.open_history_search();
+        for c in "bug".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Char('\u{8}'));
+        assert_eq!(a.history_search.as_ref().unwrap().query, "bu");
     }
 
     #[test]
@@ -21834,7 +21997,7 @@ mod tests {
         let mut app = App::new(
             "shop",
             cfg,
-            std::path::PathBuf::from("/tmp/sd-status-overlay-cfg.toml"),
+            tmp.path().join("config.toml"),
             tmp.path().to_path_buf(),
         );
         // Precondition: the in-memory phase vector is frozen all-Pending.
@@ -22077,6 +22240,14 @@ mod tests {
         assert_eq!(s.query, "beta");
         assert_eq!(s.matches.len(), 1);
         assert_eq!(s.matches[0].row, 0);
+
+        let _ = app.apply_key(crossterm::event::KeyCode::Char('\u{8}'));
+        assert_eq!(
+            app.search.as_ref().unwrap().query,
+            "bet",
+            "Windows BS deletes from the search query"
+        );
+        let _ = app.apply_key(crossterm::event::KeyCode::Char('a'));
 
         // Enter advances to the next match (single match → stays put, no panic).
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
