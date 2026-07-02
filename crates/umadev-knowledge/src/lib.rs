@@ -67,6 +67,9 @@ pub mod local_embed;
 pub mod repomap;
 pub mod retrieve;
 pub mod tokenizer;
+/// Per-chunk usefulness prior — retrieval-quality feedback that self-tunes the
+/// curated-knowledge ranking from build outcomes (fail-open, bounded).
+pub mod usefulness;
 pub mod vector;
 
 pub use chunker::{chunk_file, chunk_text, Chunk, ChunkMeta};
@@ -84,6 +87,7 @@ pub use retrieve::{
     RetrievalConfig, RetrievalEngine, ScoredChunk,
 };
 pub use tokenizer::{cjk_trigrams_only, tokenize, tokenize_trigram};
+pub use usefulness::{record_chunk_outcomes, record_chunk_outcomes_in, UsefulnessStore};
 pub use vector::VectorStore;
 
 /// Knowledge base index storage location, relative to the project root.

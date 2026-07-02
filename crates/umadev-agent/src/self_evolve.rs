@@ -67,6 +67,12 @@ pub(crate) fn penalise_on_fail(root: &Path, failure_evidence: &[String]) {
     let _ = lessons::apply_dev_error_trust(root, failure_evidence, false);
     let ids = lessons::read_surfaced_identities(root);
     let _ = lessons::apply_trust_for_identities(root, &ids, false);
+    // Retrieval-quality feedback (same seam as the lesson-trust reflux): the
+    // curated-knowledge chunks surfaced into this step were in front of the doer
+    // and it did NOT pass — demote their cross-project usefulness prior so future
+    // ranking trusts them less. Fail-open + deterministic; a no-op when nothing was
+    // surfaced. Only changes future RANKING, never this step's outcome.
+    crate::knowledge_feedback::penalise_surfaced_chunks(root);
 }
 
 /// Trust REWARD (+ pitfall-resolved) side-effect of a step whose acceptance verdict
@@ -91,6 +97,12 @@ pub(crate) fn reward_on_pass(root: &Path, recovered_from: &[String]) {
         let _ = lessons::apply_dev_error_trust(root, recovered_from, true);
         let _ = lessons::mark_pitfalls_resolved(root, recovered_from);
     }
+    // Retrieval-quality feedback (same seam as the lesson-trust reward): the
+    // curated-knowledge chunks surfaced into this step were in front of the doer
+    // and it PASSED — lift their cross-project usefulness prior so future ranking
+    // surfaces them sooner. Fail-open + deterministic; a no-op when nothing was
+    // surfaced. Only changes future RANKING, never this step's outcome.
+    crate::knowledge_feedback::reward_surfaced_chunks(root);
 }
 
 /// Reflection: on a TRUE recurrence of a pitfall (its recorded fix already failed

@@ -200,6 +200,14 @@ pub fn agentic_knowledge_digest(
     if hits.is_empty() {
         return String::new();
     }
+    // Retrieval-quality feedback: snapshot the chunks actually injected so the
+    // step's later PASS/FAIL can tune their usefulness prior (fail-open, bounded).
+    let surfaced: Vec<(String, String)> = hits
+        .iter()
+        .take(max_chunks)
+        .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
+        .collect();
+    crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
     let mut out = String::from(
         "\n\nYOUR TEAM'S EXPERIENCE ON THIS (patterns and practices your team has \
          built up that match this request — draw on what's useful, your judgment \
@@ -315,6 +323,14 @@ pub fn seat_scoped_knowledge_digest(
         // relevant-but-off-domain than empty).
         chosen = hits.iter().take(max_chunks).collect();
     }
+    // Retrieval-quality feedback: snapshot the chunks actually injected for THIS
+    // seat step so its later PASS/FAIL can tune their usefulness prior. Fail-open,
+    // bounded, overwrite-most-recent (mirrors the surfaced-lesson-identity snapshot).
+    let surfaced: Vec<(String, String)> = chosen
+        .iter()
+        .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
+        .collect();
+    crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
     let mut out = format!(
         "\n\nYOUR TEAM'S EXPERIENCE ON THIS ({role} seat — patterns and practices \
          from your discipline that match this step; draw on what's useful, your \

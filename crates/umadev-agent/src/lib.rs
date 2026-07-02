@@ -58,6 +58,7 @@ pub mod experts;
 pub mod fact_extract;
 pub mod first_pass;
 pub mod gates;
+pub mod knowledge_feedback;
 pub mod lessons;
 pub mod manifest;
 pub mod open_decisions;

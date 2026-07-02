@@ -377,7 +377,12 @@ pub fn retrieve_with_vector_and_expansion(
     } else {
         bm25_hits
     };
-    dedup_learned_chunks(normalise(&index, ranked))
+    // Retrieval-quality feedback: blend the cross-project per-chunk usefulness
+    // prior into the final score (a multiplicative weight, neutral 1.0 until a
+    // chunk is well-sampled). Loaded fail-open ONCE per query — a missing/corrupt
+    // store yields an empty prior, so a fresh corpus ranks exactly as before.
+    let usefulness = crate::usefulness::UsefulnessStore::load();
+    dedup_learned_chunks(normalise(&index, ranked, &usefulness))
 }
 
 /// Collapse duplicate sedimented-lesson chunks so the SAME learned lesson is
@@ -635,7 +640,18 @@ fn idf_floor() -> f64 {
 /// gets ~1.24× its normalised score (clamped to 1.0), so curated docs rank
 /// slightly above equally-matching un-scored ones. Missing quality_score is
 /// treated as 50 (neutral).
-fn normalise(index: &Bm25Index, hits: Vec<(usize, f64)>) -> Vec<ScoredChunk> {
+///
+/// Then applies the **usefulness prior** ([`crate::usefulness`]) as a second
+/// multiplicative weight: a chunk with a proven track record (well-sampled
+/// helpful outcomes) lifts, a proven-unhelpful one sinks, both bounded to
+/// `0.3..=1.2` and clamped to a top score of `1.0`. `usefulness` is neutral
+/// (`1.0` for every chunk) on a fresh corpus, so this is a strict no-op until
+/// outcomes accumulate — BM25/vector relevance is BLENDED, never replaced.
+fn normalise(
+    index: &Bm25Index,
+    hits: Vec<(usize, f64)>,
+    usefulness: &crate::usefulness::UsefulnessStore,
+) -> Vec<ScoredChunk> {
     if hits.is_empty() {
         return Vec::new();
     }
@@ -652,9 +668,15 @@ fn normalise(index: &Bm25Index, hits: Vec<(usize, f64)>) -> Vec<ScoredChunk> {
         .map(|(idx, score)| {
             let base = (score / max) as f32;
             let qs = index.chunks[idx].quality_score.unwrap_or(50).clamp(0, 100);
-            // Weak boost: score × (1 + quality/200). quality=50 → ×1.25,
-            // quality=100 → ×1.5, quality=0 → ×1.0. Clamped to 1.0.
-            let boosted = (base * (1.0 + qs as f32 / 200.0)).min(1.0);
+            // Usefulness prior: 1.0 until this chunk is well-sampled, then
+            // 0.3..=1.2 by its helpful ratio. Keyed on the same (path, section)
+            // identity the outcome recorder writes, so ranking and feedback agree.
+            let meta = &index.chunks[idx].meta;
+            let usefulness_w = usefulness.weight_for(&meta.path, &meta.section);
+            // Weak boost: score × (1 + quality/200) × usefulness. quality=50 →
+            // ×1.25, quality=100 → ×1.5, quality=0 → ×1.0; usefulness neutral 1.0.
+            // Clamped to 1.0 (top score stays normalised).
+            let boosted = (base * (1.0 + qs as f32 / 200.0) * usefulness_w).min(1.0);
             (
                 idx,
                 ScoredChunk {
@@ -1277,7 +1299,10 @@ mod tests {
         let index = Bm25Index::from_chunks(vec![a, b, c]); // idx 0=a, 1=b, 2=c
                                                            // Raw order a(1.0) > b(0.65) > c(0.6). After boost: a=1.0,
                                                            // b=0.65×1.25=0.8125, c=0.6×1.5=0.9 → c must overtake b.
-        let out = normalise(&index, vec![(0, 1.0), (1, 0.65), (2, 0.6)]);
+                                                           // Empty usefulness store → every weight neutral 1.0, so this is purely the
+                                                           // quality-boost reorder (proving the prior is a no-op on a fresh corpus).
+        let store = crate::usefulness::UsefulnessStore::default();
+        let out = normalise(&index, vec![(0, 1.0), (1, 0.65), (2, 0.6)], &store);
         let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1293,12 +1318,80 @@ mod tests {
         let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa")[0].clone();
         let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb")[0].clone();
         let index = Bm25Index::from_chunks(vec![a, b]);
+        let store = crate::usefulness::UsefulnessStore::default();
         for _ in 0..32 {
             // Equal raw score + equal (default) quality → equal boosted score.
-            let out = normalise(&index, vec![(1, 0.5), (0, 0.5)]);
+            let out = normalise(&index, vec![(1, 0.5), (0, 0.5)], &store);
             let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
             assert_eq!(paths, vec!["a.md", "b.md"], "lower chunk_idx wins the tie");
         }
+    }
+
+    #[test]
+    fn usefulness_prior_lifts_proven_helpful_over_equal_unobserved() {
+        // Three chunks: c is the clear top hit (so the normalised top stays 1.0),
+        // a and b tie on raw relevance AND quality. a has a proven-helpful track
+        // record; b is unobserved. The prior must break the tie in a's favour —
+        // WITHOUT dropping b or disturbing the genuine top hit c.
+        let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa body")[0].clone();
+        let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb body")[0].clone();
+        let c = crate::chunker::chunk_text("c.md", "# C\n\n## S\n\nccc body")[0].clone();
+        let index = Bm25Index::from_chunks(vec![a, b, c]); // idx 0=a, 1=b, 2=c
+        let mut store = crate::usefulness::UsefulnessStore::default();
+        for _ in 0..crate::usefulness::MIN_SAMPLES {
+            store.record(&[("a.md".to_string(), "S".to_string())], true);
+        }
+        // c raw 10 (top), a and b raw 5 (equal, sub-max so no clamp collision).
+        let out = normalise(&index, vec![(2, 10.0), (0, 5.0), (1, 5.0)], &store);
+        let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["c.md", "a.md", "b.md"],
+            "proven-helpful `a` must outrank equal-relevance unobserved `b`: {paths:?}"
+        );
+        assert!(
+            (out[0].score - 1.0).abs() < 1e-5,
+            "the genuine top hit stays normalised to 1.0"
+        );
+    }
+
+    #[test]
+    fn usefulness_prior_is_identity_on_a_fresh_corpus() {
+        // With an EMPTY store, normalise must produce byte-for-byte the same
+        // ordering + scores it produced before the prior existed (neutral 1.0).
+        let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa body")[0].clone();
+        let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb body")[0].clone();
+        let index = Bm25Index::from_chunks(vec![a, b]);
+        let empty = crate::usefulness::UsefulnessStore::default();
+        let out = normalise(&index, vec![(0, 1.0), (1, 0.6)], &empty);
+        let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md"], "fresh corpus ranks as before");
+        assert!((out[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn usefulness_prior_sinks_a_proven_harmful_chunk() {
+        // a has the HIGHER raw relevance but a proven-unhelpful track record
+        // (weight ≈ 0.6); b is unobserved (weight 1.0). The prior must pull a below
+        // b in ORDER while both stay above the min_score gate — the prior demotes,
+        // it never discards a relevant chunk.
+        let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa body")[0].clone();
+        let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb body")[0].clone();
+        let index = Bm25Index::from_chunks(vec![a, b]);
+        let mut store = crate::usefulness::UsefulnessStore::default();
+        // 1 helpful + 2 harmful → ratio 1/3 → weight ≈ 0.6 (well-sampled, sinks but
+        // not to the floor, so a stays above the 0.5 min_score gate).
+        store.record(&[("a.md".to_string(), "S".to_string())], true);
+        store.record(&[("a.md".to_string(), "S".to_string())], false);
+        store.record(&[("a.md".to_string(), "S".to_string())], false);
+        // a raw 5.0 (top), b raw 4.9: base_a=1.0×1.25×0.6=0.75, base_b≈0.98×1.25=1.0.
+        let out = normalise(&index, vec![(0, 5.0), (1, 4.9)], &store);
+        let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["b.md", "a.md"],
+            "proven-unhelpful `a` sinks below unobserved `b` yet is kept: {paths:?}"
+        );
     }
 
     #[cfg(feature = "vector")]
