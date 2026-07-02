@@ -718,10 +718,17 @@ pub struct FinalizeResult {
     /// scan) was produced — `true` only on the deliberate path. A lean build gets
     /// just the core docs, so this stays `false`.
     pub proof_pack: bool,
-    /// Workspace-relative names of the deliverables finalize wrote or refreshed
-    /// (the backfilled core docs, plus the delivery artifacts on the deliberate
-    /// path). Empty when nothing was produced.
+    /// Workspace-relative names of the delivery artifacts finalize produced (the
+    /// proof-pack, scorecard, review report, security scan, compliance mapping on
+    /// the deliberate path). Empty when nothing was produced. Finalize NO LONGER
+    /// fabricates core docs, so this never contains a retrospective template stub.
     pub artifacts: Vec<String>,
+    /// Workspace-relative names of the core narrative docs (PRD / architecture /
+    /// UI-UX) a DELIBERATE build did NOT produce — reported HONESTLY instead of
+    /// backfilling a TODO-template stub that masquerades as a deliverable (and that
+    /// fed the FR-coverage check fabricated `FR-` ids). Empty when every core doc
+    /// was produced (or on a non-deliberate / no-op finalize).
+    pub missing_docs: Vec<String>,
 }
 
 impl FinalizeResult {
@@ -734,18 +741,25 @@ impl FinalizeResult {
 
 /// **Finalize a clean build into a shareable delivery** — the Wave 4 (§L4 / G8)
 /// recovery of the delivery artifacts on the DEFAULT `/run` path, run ONCE after
-/// QC settles clean. Lifts the artifact writers out of the (stranded) legacy
-/// pipeline so a default build again leaves a PRD, an architecture doc, a UI/UX
-/// doc, a scorecard, and a shareable proof-pack — not just source files.
+/// QC settles clean. Assembles the shareable proof-pack + scorecard so a default
+/// build leaves verifiable delivery evidence, not just source files.
 ///
 /// **Depth-gated, so we never over-deliver:**
-/// - **Lean / Fast** (a todo page, a quick edit) → ensure only the core docs
-///   exist ([`crate::phases::scaffold_core_docs`]). A single page does NOT earn a
-///   zipped proof-pack + scorecard (that would be ceremony nobody asked for).
+/// - **Lean / Fast** (a todo page, a quick edit) → the code IS the deliverable; no
+///   doc ceremony, no zipped proof-pack + scorecard (that would be ceremony nobody
+///   asked for). The owned `.umadev/plan.json` records what was built.
 /// - **Deliberate (`Standard` / `Deep`)** → the FULL delivery
-///   ([`crate::phases::run_delivery`]): core docs + compliance mapping + the
-///   owned + tool security scan + the PR-ready review report + the zipped
-///   proof-pack + the shareable HTML scorecard.
+///   ([`crate::phases::run_delivery`]): compliance mapping + the owned + tool
+///   security scan + the PR-ready review report + the zipped proof-pack + the
+///   shareable HTML scorecard, over the docs the base actually produced.
+///
+/// **HONESTY — no fabricated docs.** Finalize does NOT backfill a TODO-template
+/// stub for a missing PRD/architecture/UIUX (which would masquerade as a real
+/// deliverable inside the proof pack AND feed the FR-coverage check fake `FR-`
+/// ids). A genuinely-missing core doc is reported truthfully via
+/// [`crate::phases::missing_core_docs`] (`FinalizeResult::missing_docs` + a Note +
+/// a "not produced" scorecard row); the docs are made real up front by the
+/// PM/architect plan step's `FileContains` evidence contract.
 ///
 /// **Only on a Build route with real source on disk.** A chat / explain / a build
 /// that produced no code gets nothing (there is nothing to deliver). The caller
@@ -812,17 +826,31 @@ pub fn finalize(
         return result;
     }
 
-    // DELIBERATE: guarantee the core docs exist (idempotent + never clobbers a doc
-    // the base already wrote, fail-open inside) …
-    let scaffolded = crate::phases::scaffold_core_docs(options);
-    if !scaffolded.is_empty() {
+    // DELIBERATE: HONESTY (proof-pack) — do NOT backfill a TODO-template stub for a
+    // missing PRD/architecture/UIUX. A retrospective template masquerading as a
+    // deliverable is exactly the fabrication the spec forbids (and it fed the
+    // FR-coverage check fake `FR-` ids, making it vacuous). Report any missing core
+    // doc TRUTHFULLY instead; the docs the base actually produced ship as-is, and the
+    // shareable scorecard marks the missing ones "未产出 · not produced". The doc is
+    // made REAL up front by the PM/architect plan step's `FileContains` evidence
+    // contract (see `plan_state::Plan::enforce_doc_evidence_floor`), not retrofitted
+    // here. Fail-open: `missing_core_docs` only reads existence and never panics.
+    let missing = crate::phases::missing_core_docs(options);
+    if missing.is_empty() {
+        events.emit(EngineEvent::Note(
+            "team · delivery — core docs present (PRD / architecture / UI-UX produced \
+             during the build)"
+                .to_string(),
+        ));
+    } else {
         events.emit(EngineEvent::Note(format!(
-            "team · delivery — wrote {} core doc(s) ({})",
-            scaffolded.len(),
-            scaffolded.join(", ")
+            "team · delivery — {} core doc(s) NOT produced ({}); reported missing, not \
+             fabricated",
+            missing.len(),
+            missing.join(", ")
         )));
     }
-    result.artifacts.extend(scaffolded);
+    result.missing_docs = missing;
 
     // … plus the full, shareable proof-pack + scorecard.
     {
@@ -1509,5 +1537,108 @@ mod tests {
                 "{name} must NOT be scaffolded for an incomplete build"
             );
         }
+    }
+
+    #[test]
+    fn finalize_deliberate_missing_docs_are_reported_missing_not_fabricated() {
+        // HONESTY: a clean DELIBERATE build whose base did NOT produce the core docs must
+        // NOT get a TODO-template stub backfilled (a fake deliverable that also fed the
+        // FR-coverage check fabricated FR- ids). Finalize reports them MISSING truthfully,
+        // still assembles the proof pack (the build IS clean), and the scorecard marks the
+        // docs "not produced".
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // real code on disk, but no output/*.md docs
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &ev, Some(&route), true);
+
+        // 1. No fabricated stub on disk: none of the core docs exist (nothing was written).
+        for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
+            assert!(
+                !tmp.path().join("output").join(name).is_file(),
+                "{name} must NOT be fabricated — a missing doc is reported, not stubbed"
+            );
+        }
+        // 2. FR-coverage is not fed a fabricated stub: with no PRD on disk there are no
+        //    fake FR- ids to (mis)report — coverage sees nothing declared.
+        assert!(
+            crate::coverage::uncovered_requirements(tmp.path(), "demo").is_empty(),
+            "no fabricated PRD ⇒ no phantom FR- requirements for coverage to chew on"
+        );
+        // 3. The result reports the three core docs as missing, honestly.
+        for name in [
+            "output/demo-prd.md",
+            "output/demo-architecture.md",
+            "output/demo-uiux.md",
+        ] {
+            assert!(
+                r.missing_docs.iter().any(|m| m == name),
+                "missing_docs must name {name}: {:?}",
+                r.missing_docs
+            );
+        }
+        // 4. The build is clean, so the proof pack + scorecard still ship (not fabricated,
+        //    not withheld) — and the scorecard tells the truth about the missing docs.
+        assert!(
+            r.proof_pack,
+            "a clean deliberate build still assembles the proof-pack"
+        );
+        let release = tmp.path().join("release");
+        let scorecard = std::fs::read_dir(&release)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let is_scorecard = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("scorecard-"));
+                let is_html = p.extension().and_then(|e| e.to_str()) == Some("html");
+                is_scorecard && is_html
+            })
+            .expect("a scorecard was written");
+        let html = std::fs::read_to_string(&scorecard).unwrap();
+        assert!(
+            html.contains("not produced"),
+            "the scorecard reports the missing docs as 'not produced'"
+        );
+    }
+
+    #[test]
+    fn finalize_reports_only_the_absent_docs_and_never_fabricates_a_real_one() {
+        // A DELIBERATE build where the base produced a REAL PRD but not the architecture /
+        // UI-UX docs: finalize leaves the real PRD untouched (no clobber), reports ONLY the
+        // two absent docs as missing, and fabricates nothing. Fail-open: a partial doc set
+        // never panics and never turns a clean build into a failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        let prd = tmp.path().join("output").join("demo-prd.md");
+        std::fs::write(&prd, "# REAL PRD\n\n| FR-001 | login | P0 |\n").unwrap();
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &ev, Some(&route), true);
+        // The base's real PRD is never clobbered.
+        assert!(
+            std::fs::read_to_string(&prd).unwrap().contains("REAL PRD"),
+            "finalize must not clobber the base's real PRD"
+        );
+        // Only the two genuinely-absent docs are reported missing (the PRD is NOT).
+        assert!(
+            !r.missing_docs.iter().any(|m| m == "output/demo-prd.md"),
+            "a produced PRD is not reported missing: {:?}",
+            r.missing_docs
+        );
+        assert!(
+            r.missing_docs
+                .iter()
+                .any(|m| m == "output/demo-architecture.md")
+                && r.missing_docs.iter().any(|m| m == "output/demo-uiux.md"),
+            "the two absent docs are reported missing: {:?}",
+            r.missing_docs
+        );
+        assert!(r.proof_pack, "a clean build still delivers (not failed)");
     }
 }

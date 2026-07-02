@@ -750,7 +750,12 @@ impl Plan {
             risks: self.risks.clone(),
             open_questions: self.open_questions.clone(),
         };
-        let Some(mut normalized) = candidate.normalized() else {
+        // A re-plan merge re-normalises structurally but does NOT re-apply the
+        // core-doc floor (`None`): a surviving PM/architect step already carries its
+        // FileContains evidence from the initial synthesis (cloned intact), and the
+        // merge has no route/slug context — so we never strip it, and a rare new PM
+        // step in the sub-DAG simply reverts to today's behaviour (fail-open).
+        let Some(mut normalized) = candidate.normalized(None) else {
             return false; // nothing usable survived normalisation → fail-open
         };
         // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending.
@@ -777,7 +782,15 @@ impl Plan {
     /// always make progress — a cyclic `a → b → a` would otherwise leave both steps
     /// permanently un-ready, a silent deadlock). Returns `None` if nothing usable
     /// survives (the caller then fail-opens to no plan).
-    fn normalized(mut self) -> Option<Self> {
+    ///
+    /// `doc_slug` carries the build's slug ONLY on a DELIBERATE route (`Some(slug)`)
+    /// — then the core-doc evidence floor binds any PM/architect BUILD step to
+    /// actually produce its PRD/architecture doc (see
+    /// [`Self::enforce_doc_evidence_floor`]). `None` (a lean/quick route, a re-plan
+    /// merge, or a test) skips that floor — the smaller path never demands the full
+    /// doc set, and finalize honestly reports any missing doc rather than fabricating
+    /// it.
+    fn normalized(mut self, doc_slug: Option<&str>) -> Option<Self> {
         let mut seen: HashSet<String> = HashSet::new();
         self.steps.retain(|s| {
             let id = s.id.trim();
@@ -830,6 +843,16 @@ impl Plan {
         // [`Self::enforce_falsifiability_floor`].
         self.enforce_seat_evidence_floor();
         self.enforce_falsifiability_floor();
+        // CORE-DOC EVIDENCE FLOOR (deliberate builds only) — when the plan convened a
+        // PM/architect, bind that seat to actually PRODUCE its core doc via a
+        // FileContains evidence contract, so the PRD/architecture is a VERIFIED build
+        // deliverable (checked on the deterministic floor before the step ticks Done)
+        // instead of a template stub retro-fitted at finalize. `None` (lean / quick /
+        // re-plan / test) skips it. Augment-only + fail-open. See
+        // [`Self::enforce_doc_evidence_floor`].
+        if let Some(slug) = doc_slug {
+            self.enforce_doc_evidence_floor(slug);
+        }
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
@@ -1041,6 +1064,42 @@ impl Plan {
             if s.kind == StepKind::Build && !s.has_strong_contract() {
                 push_unique(&mut s.evidence, EvidenceContract::BuildClean);
             }
+        }
+    }
+
+    /// **Core-doc evidence floor (deliberate builds only)** — when the plan carries a
+    /// PM or architect BUILD step, bind that seat to actually PRODUCE its core doc by
+    /// attaching a [`EvidenceContract::FileContains`] on the doc file with the marker
+    /// it must hold (`FR-` for the PRD's functional requirements; `API` for the
+    /// architecture doc's API surface). This makes the PRD / architecture a VERIFIED
+    /// deliverable of the build — the deterministic floor checks the file exists AND
+    /// holds the marker before the step ticks [`StepStatus::Done`] — instead of a
+    /// TODO-template stub retro-fitted at finalize (which masqueraded as real work and
+    /// fed the `FR-`coverage check fabricated ids, making it vacuous). Augment-only +
+    /// idempotent ([`push_unique`]): a stronger brain-volunteered contract is never
+    /// removed or downgraded. If the plan has NO PM/architect BUILD step (a smaller
+    /// deliberate build), it is a no-op — UmaDev does NOT invent a doc step, and
+    /// finalize honestly reports the doc missing rather than fabricating it. Only fired
+    /// on a deliberate route (the caller gates on `doc_slug`). Pure over `self`.
+    fn enforce_doc_evidence_floor(&mut self, slug: &str) {
+        use crate::critics::Seat;
+        for s in &mut self.steps {
+            // A REVIEW step reads the doc; only a BUILD step AUTHORS it.
+            if s.kind != StepKind::Build {
+                continue;
+            }
+            let contract = match s.seat {
+                Seat::ProductManager => EvidenceContract::FileContains {
+                    path: format!("output/{slug}-prd.md"),
+                    needle: "FR-".to_string(),
+                },
+                Seat::Architect => EvidenceContract::FileContains {
+                    path: format!("output/{slug}-architecture.md"),
+                    needle: "API".to_string(),
+                },
+                _ => continue, // every other seat authors no core narrative doc
+            };
+            push_unique(&mut s.evidence, contract);
         }
     }
 }
@@ -1309,7 +1368,15 @@ pub async fn synthesize_plan(
         risks: raw.risks,
         open_questions: raw.open_questions,
     };
-    plan.normalized()
+    // Enforce the core-doc evidence floor ONLY on a deliberate route (pass the slug);
+    // a lean/quick build never demands the full doc set. This binds the PM/architect
+    // seat to actually produce its PRD/architecture (a verified deliverable), so the
+    // doc is real up front — never a template stub retro-fitted at finalize.
+    let doc_slug = route
+        .depth
+        .is_deliberate()
+        .then(|| options.effective_slug());
+    plan.normalized(doc_slug.as_deref())
 }
 
 /// Map ONE tolerant [`BrainStep`] into an owned [`PlanStep`] — the shared node parse
@@ -1455,7 +1522,7 @@ mod tests {
             risks: vec![String::new(), "real risk".to_string()],
             open_questions: vec![],
         }
-        .normalized()
+        .normalized(None)
         .expect("a usable plan survives");
         // `` and the duplicate `a` are gone → a, b.
         assert_eq!(p.steps.len(), 2);
@@ -1471,7 +1538,7 @@ mod tests {
 
     #[test]
     fn normalize_returns_none_when_nothing_usable() {
-        let p = plan(vec![step("", &[])]).normalized();
+        let p = plan(vec![step("", &[])]).normalized(None);
         assert!(p.is_none());
     }
 
@@ -1482,7 +1549,7 @@ mod tests {
         // TRIMMED ids, so the edge is NOT dropped as dangling — otherwise the dependent
         // would run BEFORE its prerequisite.
         let p = plan(vec![step(" auth ", &[]), step("ui", &["auth"])])
-            .normalized()
+            .normalized(None)
             .expect("a usable plan survives");
         // Both ids are trimmed; the dependency edge survives.
         assert_eq!(deps_of(&p, "ui"), &["auth".to_string()]);
@@ -1501,7 +1568,7 @@ mod tests {
         // either step (silent deadlock). Normalisation must break the back-edge so the
         // DAG is acyclic and at least one step becomes ready.
         let p = plan(vec![step("a", &["b"]), step("b", &["a"])])
-            .normalized()
+            .normalized(None)
             .expect("a usable plan survives");
         assert_eq!(p.steps.len(), 2, "no step is dropped, only an edge");
         // Exactly one back-edge is dropped, so one of the two becomes ready.
@@ -1529,7 +1596,7 @@ mod tests {
             step("c", &["b"]),
             step("d", &["a"]),
         ])
-        .normalized()
+        .normalized(None)
         .expect("a usable plan survives");
         assert_eq!(p.steps.len(), 4);
         // The whole graph must be schedulable: repeatedly mark ready steps Done until
@@ -1944,7 +2011,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(deps_of(&p, "fe").contains(&"contract".to_string()));
         assert!(deps_of(&p, "be").contains(&"contract".to_string()));
@@ -1975,7 +2042,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         // Exactly one edge, not a duplicate.
         assert_eq!(deps_of(&p, "fe"), &["api-spec".to_string()]);
@@ -1992,7 +2059,7 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::SourcePresent,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(deps_of(&p, "fe").is_empty());
     }
@@ -2019,7 +2086,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             !p.ready_steps().is_empty(),
@@ -2066,7 +2133,7 @@ mod tests {
                 AcceptanceSpec::BuildTest,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         let qa_deps = deps_of(&p, "qa-tests");
         assert!(
@@ -2111,7 +2178,7 @@ mod tests {
                 AcceptanceSpec::ReviewClean,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             deps_of(&p, "qa-review").contains(&"fe".to_string()),
@@ -2311,7 +2378,7 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::SourcePresent,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "api").contains(&EvidenceContract::ContractMatches),
@@ -2340,7 +2407,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "qa")
@@ -2362,7 +2429,7 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::SourcePresent,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "ui").contains(&EvidenceContract::BuildClean),
@@ -2382,12 +2449,105 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::SourcePresent,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "harden").contains(&EvidenceContract::BuildClean),
             "a bare security doing step references a real build bar: {:?}",
             ev_of(&p, "harden")
+        );
+    }
+
+    #[test]
+    fn deliberate_pm_and_architect_steps_gain_core_doc_evidence() {
+        // HONESTY: on a DELIBERATE route (`normalized(Some(slug))`), a PM build step is
+        // bound to actually PRODUCE the PRD (FileContains prd, "FR-") and an architect
+        // build step to produce the architecture doc — a VERIFIED deliverable, not a
+        // template stub retro-fitted at finalize. A frontend peer keeps the plan below
+        // the wholesale falsifiability backstop so the assertion is about the doc floor.
+        let p = plan(vec![
+            step_seat(
+                "prd",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "arch",
+                &[],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "ui",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some("demo"))
+        .expect("usable");
+        assert!(
+            ev_of(&p, "prd").contains(&EvidenceContract::FileContains {
+                path: "output/demo-prd.md".to_string(),
+                needle: "FR-".to_string(),
+            }),
+            "a deliberate PM build step must produce the PRD with FR- content: {:?}",
+            ev_of(&p, "prd")
+        );
+        assert!(
+            ev_of(&p, "arch").contains(&EvidenceContract::FileContains {
+                path: "output/demo-architecture.md".to_string(),
+                needle: "API".to_string(),
+            }),
+            "a deliberate architect build step must produce the architecture doc: {:?}",
+            ev_of(&p, "arch")
+        );
+    }
+
+    #[test]
+    fn core_doc_floor_is_off_for_a_lean_route_and_never_invents_a_doc_step() {
+        // The doc floor fires ONLY on a deliberate route. `normalized(None)` (a lean /
+        // quick route) leaves a PM step with NO FileContains doc evidence — the smaller
+        // path never demands the full doc set. And a deliberate build whose plan has NO
+        // PM/architect step gains NO invented doc evidence (a smaller deliberate change
+        // is not forced to author a PRD; finalize reports it missing, not fabricated).
+        let lean = plan(vec![step_seat(
+            "prd",
+            &[],
+            Seat::ProductManager,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized(None)
+        .expect("usable");
+        assert!(
+            !ev_of(&lean, "prd").iter().any(
+                |c| matches!(c, EvidenceContract::FileContains { path, .. } if path.contains("prd"))
+            ),
+            "a lean route attaches no PRD FileContains floor: {:?}",
+            ev_of(&lean, "prd")
+        );
+        // Deliberate, but no PM/architect step: a single frontend build step gains its
+        // own seat floor (BuildClean) but NO core-doc FileContains — no doc is invented.
+        let no_pm = plan(vec![step_seat(
+            "ui",
+            &[],
+            Seat::FrontendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized(Some("demo"))
+        .expect("usable");
+        assert!(
+            !ev_of(&no_pm, "ui")
+                .iter()
+                .any(|c| matches!(c, EvidenceContract::FileContains { .. })),
+            "no PM/architect step ⇒ no invented core-doc evidence: {:?}",
+            ev_of(&no_pm, "ui")
         );
     }
 
@@ -2408,7 +2568,7 @@ mod tests {
             path: "/api/login".into(),
             status: Some(200),
         }];
-        let p = plan(vec![s]).normalized().expect("usable");
+        let p = plan(vec![s]).normalized(None).expect("usable");
         assert_eq!(
             ev_of(&p, "login"),
             &[EvidenceContract::RouteResponds {
@@ -2431,7 +2591,7 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::DesignTokensPresent,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "tokens").is_empty(),
@@ -2461,7 +2621,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "deploy").is_empty(),
@@ -2483,7 +2643,7 @@ mod tests {
             StepKind::Review,
             AcceptanceSpec::ReviewClean,
         )])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         assert!(
             ev_of(&p, "qa-review").is_empty(),
@@ -2513,7 +2673,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         for id in ["prd", "scope"] {
             assert!(
@@ -2545,7 +2705,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized()
+        .normalized(None)
         .expect("usable");
         // Backend got its per-seat contract; the lone bare PM step is exactly half →
         // no wholesale backstop, so it keeps today's behaviour (empty evidence).
