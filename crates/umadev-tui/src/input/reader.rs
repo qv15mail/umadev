@@ -146,6 +146,27 @@ async fn next_winch(sig: &mut Option<WinchSignal>) {
     }
 }
 
+/// P2 — parse a **DECRPM reply** to the startup DEC-2026 (synchronized output)
+/// DECRQM probe: `\x1b[?2026;<n>$y`. `n = 1` (set) or `2` (reset) mean the
+/// terminal implements the mode → `Some(true)`; any other recognized reply
+/// value (`0` = not recognized, `3`/`4` = permanently locked) → `Some(false)`;
+/// bytes that are not a 2026 DECRPM at all → `None` (not our reply). The event
+/// loop sends the query once at startup and reads the verdict via
+/// [`InputSource::take_sync_output_reply`]; routing the reply through the ONE
+/// owned tokenizer (instead of a second stdin reader) is what keeps it from
+/// racing the input stream or leaking as keystrokes.
+fn decrpm_2026_verdict(bytes: &[u8]) -> Option<bool> {
+    let n = bytes
+        .strip_prefix(b"\x1b[?2026;")?
+        .strip_suffix(b"$y")?
+        .iter()
+        .try_fold(0u32, |acc, &b| {
+            b.is_ascii_digit()
+                .then(|| acc.saturating_mul(10) + u32::from(b - b'0'))
+        })?;
+    Some(n == 1 || n == 2)
+}
+
 /// Sleep until `deadline`, or never (when `None`) — so the ESC-flush arm is a
 /// plain always-enabled select! branch (no precondition) that simply parks when
 /// no flush is pending.
@@ -180,6 +201,11 @@ pub struct OwnedInput {
     /// Whether the reader channel has closed (thread ended). Disables the recv
     /// arm so the source parks instead of busy-looping on `None`.
     closed: bool,
+    /// P2 — the captured verdict of the startup DEC-2026 DECRQM probe, parked
+    /// here when the DECRPM reply flows through the decoder (see
+    /// [`decrpm_2026_verdict`]). `None` until (unless) the terminal answers;
+    /// drained one-shot by [`OwnedInput::take_sync_output_reply`].
+    sync_output_reply: Option<bool>,
 }
 
 impl OwnedInput {
@@ -195,7 +221,33 @@ impl OwnedInput {
             esc_interval: esc_flush_interval(),
             winch: register_winch_signal(),
             closed: false,
+            sync_output_reply: None,
         }
+    }
+
+    /// Decode-side event sink shared by [`Self::ingest`] and
+    /// [`Self::flush_escape`]: captures the DEC-2026 DECRPM probe reply (P2 —
+    /// consumed here, never surfaced as input) and enqueues everything that maps
+    /// to a real terminal event. Every other [`InputEvent::Response`] stays
+    /// dropped exactly as before.
+    fn enqueue(&mut self, ev: InputEvent) {
+        if let InputEvent::Response(bytes) = &ev {
+            if let Some(verdict) = decrpm_2026_verdict(bytes) {
+                self.sync_output_reply = Some(verdict);
+            }
+        }
+        if let Some(event) = ev.into_event() {
+            self.queue.push_back(event);
+        }
+    }
+
+    /// P2 — take the captured DECRPM verdict for the startup synchronized-output
+    /// probe, if the terminal has answered. One-shot (`None` after the first
+    /// take); the event loop polls this until its probe deadline, then falls
+    /// back to the env allowlist.
+    #[must_use]
+    pub fn take_sync_output_reply(&mut self) -> Option<bool> {
+        self.sync_output_reply.take()
     }
 
     /// Feed a byte chunk through the tokenizer + decoder, enqueueing events, then
@@ -203,9 +255,7 @@ impl OwnedInput {
     fn ingest(&mut self, bytes: &[u8]) {
         for token in self.tokenizer.feed(bytes) {
             for ev in self.decoder.feed_token(token) {
-                if let Some(event) = ev.into_event() {
-                    self.queue.push_back(event);
-                }
+                self.enqueue(ev);
             }
         }
         self.update_esc_deadline();
@@ -215,9 +265,7 @@ impl OwnedInput {
     fn flush_escape(&mut self) {
         for token in self.tokenizer.flush() {
             for ev in self.decoder.feed_token(token) {
-                if let Some(event) = ev.into_event() {
-                    self.queue.push_back(event);
-                }
+                self.enqueue(ev);
             }
         }
         self.esc_deadline = None;
@@ -335,6 +383,19 @@ impl InputSource {
             InputSource::Legacy(s) => s.next().await,
         }
     }
+
+    /// P2 — take the terminal's DECRPM answer to the startup synchronized-output
+    /// probe, if it has arrived (one-shot). Always `None` on the legacy path:
+    /// crossterm's parser owns stdin there and has no lane for the reply, which
+    /// is exactly why the event loop only SENDS the probe on the owned path and
+    /// falls back to the env allowlist at the deadline otherwise.
+    #[must_use]
+    pub fn take_sync_output_reply(&mut self) -> Option<bool> {
+        match self {
+            InputSource::Owned(o) => o.take_sync_output_reply(),
+            InputSource::Legacy(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +492,73 @@ mod tests {
             esc_flush_interval(),
             Duration::from_millis(DEFAULT_ESC_FLUSH_MS),
             "out-of-range is rejected"
+        );
+    }
+
+    /// A bare `OwnedInput` around a hand-made byte channel — no stdin reader
+    /// thread, no SIGWINCH — so the decode/capture path is testable hermetically.
+    fn owned_for_test() -> (OwnedInput, UnboundedSender<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            OwnedInput {
+                rx,
+                tokenizer: Tokenizer::for_stdin(),
+                decoder: Decoder::new(),
+                queue: VecDeque::new(),
+                esc_deadline: None,
+                esc_interval: Duration::from_millis(DEFAULT_ESC_FLUSH_MS),
+                winch: None,
+                closed: false,
+                sync_output_reply: None,
+            },
+            tx,
+        )
+    }
+
+    #[test]
+    fn decrpm_2026_verdict_parses_supported_and_unsupported() {
+        // n=1 (set) and n=2 (reset) both mean the mode is implemented.
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;1$y"), Some(true));
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;2$y"), Some(true));
+        // n=0 = not recognized → unsupported.
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;0$y"), Some(false));
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;4$y"), Some(false));
+        // A DECRPM for a DIFFERENT mode, a DA1 reply, or ordinary keys are not
+        // ours — `None`, never a false verdict.
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2004;1$y"), None);
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?62;1c"), None);
+        assert_eq!(decrpm_2026_verdict(b"hello"), None);
+        // Garbage where the digit should be → not a verdict.
+        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;x$y"), None);
+    }
+
+    #[test]
+    fn sync_probe_reply_is_captured_and_never_leaks_as_input() {
+        let (mut oi, _tx) = owned_for_test();
+        oi.ingest(b"\x1b[?2026;1$y");
+        assert!(
+            oi.queue.is_empty(),
+            "the DECRPM reply must be consumed, never surfaced as keystrokes"
+        );
+        assert_eq!(oi.take_sync_output_reply(), Some(true), "verdict captured");
+        assert_eq!(oi.take_sync_output_reply(), None, "the take is one-shot");
+    }
+
+    #[test]
+    fn sync_probe_reply_split_across_reads_and_mixed_with_typing_still_resolves() {
+        // The reply can straddle a read boundary and be followed by real input
+        // in the same chunk — the tokenizer reassembles the sequence, the
+        // verdict is captured, and ONLY the real keys surface.
+        let (mut oi, _tx) = owned_for_test();
+        oi.ingest(b"\x1b[?2026;");
+        assert!(oi.queue.is_empty(), "an incomplete reply emits nothing");
+        oi.ingest(b"0$yhi");
+        assert_eq!(oi.take_sync_output_reply(), Some(false));
+        let keys: Vec<Event> = std::mem::take(&mut oi.queue).into();
+        assert_eq!(
+            keys.len(),
+            2,
+            "exactly the two real keystrokes surface, none of the reply: {keys:?}"
         );
     }
 

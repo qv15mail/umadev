@@ -1905,22 +1905,26 @@ pub struct App {
     /// activity indicator removed at settle) — rows below the new end were
     /// vacated, exactly where a diff-only console can leave orphaned stale rows,
     /// so the renderer requests a full repaint via
-    /// [`Self::transcript_repaint_pending`]. `0` until the first render (a first
+    /// [`Self::request_transcript_repaint`]. `0` until the first render (a first
     /// frame never counts as a shrink). See
     /// [`crate::transcript_reflow_needs_repaint`].
     pub transcript_prev_total: std::cell::Cell<usize>,
-    /// One-shot request, raised by the renderer (`&App`, so interior-mutable) or a
-    /// scroll handler, for a FULL clear + redraw on the next frame — the
-    /// transcript counterpart of [`Self::force_repaint`] (which covers the INPUT
-    /// box). Set when the transcript **reflows / re-bases / scrolls** in a way the
-    /// incremental diff can leave stale rows behind over a long streaming run: the
-    /// `MAX_RENDER_ROWS` front-trim first crossing in, a transcript shrink, or a
-    /// user scroll jump. Drained by the event loop via
-    /// [`Self::take_transcript_repaint`], which folds it into the same
-    /// `force_full_repaint` gate as the input-box / resize / resume self-heal.
-    /// Fires only on the discrete EVENT (never every streaming frame), so a
-    /// marathon run heals without thrashing the repaint. Defaults `false`.
-    pub transcript_repaint_pending: std::cell::Cell<bool>,
+    /// P3 — the **terminal-contamination flag**: a one-shot request, raised from
+    /// anywhere (interior-mutable `Cell`, so the pure `&App` renderer, the scroll
+    /// helpers, and the `&mut` handlers can all set it), for ONE full clear +
+    /// redraw on the next frame. Set after any OUT-OF-BAND terminal write (the
+    /// completion BEL, a terminal-mode reassert, an OSC 52 clipboard copy) and at
+    /// the discrete transitions where ratatui's prev-vs-next diff can leave
+    /// stale rows (a transcript reflow / re-base / scroll jump, a height-changing
+    /// history recall or `/clear`, focus gain, a resize, a live turn settling).
+    /// Drained by the event loop via [`Self::take_terminal_contaminated`] into
+    /// its `force_full_repaint` gate: exactly one `terminal.clear()` + full
+    /// repaint, then the flag resets. This is the PRIMARY heal on a terminal
+    /// WITHOUT confirmed synchronized output (an every-frame clear would flicker
+    /// there); under confirmed sync output every frame is already a full atomic
+    /// repaint (P0) and the flag only guarantees the healing frame is drawn.
+    /// Defaults `false`.
+    pub terminal_contaminated: std::cell::Cell<bool>,
     /// The maximum the transcript can scroll up (= rows hidden above the
     /// viewport), recomputed by the renderer every frame from the CURRENT
     /// width/height. Interior-mutable so the pure `render` fn can publish it for
@@ -2369,21 +2373,6 @@ pub struct App {
     /// `true` when the user asked to quit.
     pub should_quit: bool,
 
-    /// One-shot request for a FULL clear + redraw on the next frame, drained by
-    /// the event loop via [`Self::take_force_repaint`]. Set by an operation that
-    /// can leave STALE rows on a console whose incremental-diff repaint differs
-    /// from a VT-strict terminal — notably the Windows console (conhost /
-    /// PowerShell) after a **history recall** that swaps a one-row input for a
-    /// multi-line entry (the transcript above shifts) or a **`/clear`** that
-    /// empties the transcript. The loop folds this into its `force_full_repaint`
-    /// gate, which `terminal.clear()`s (a real `Clear(All)` + a ratatui
-    /// back-buffer reset) so the next draw repaints EVERY cell and no row the
-    /// shift vacated survives. Fail-open: a missed flag only forgoes one full
-    /// repaint — the periodic self-heal scrub / Ctrl+L still recover. Defaults
-    /// `false`; the unix render path is unaffected (its diff already wipes the
-    /// vacated cells, so the extra clear is invisible under synchronized output).
-    pub force_repaint: bool,
-
     /// Wall-clock start of the current running block. Drives the live
     /// `[m:ss]` elapsed counter in the status bar so long worker calls
     /// don't read as "frozen". `None` when nothing is running.
@@ -2614,7 +2603,7 @@ impl App {
             transcript_prev_hidden: std::cell::Cell::new(0),
             transcript_cut: std::cell::Cell::new(0),
             transcript_prev_total: std::cell::Cell::new(0),
-            transcript_repaint_pending: std::cell::Cell::new(false),
+            terminal_contaminated: std::cell::Cell::new(false),
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
@@ -2704,7 +2693,6 @@ impl App {
             // the renderer agrees with the base drivers from turn one.
             show_process_logs: umadev_host::process_logs::show_process_logs(),
             should_quit: false,
-            force_repaint: false,
             run_started_at: None,
             phase_started_at: None,
             pending_auto_continue: None,
@@ -4545,43 +4533,50 @@ impl App {
         true
     }
 
-    /// Request a FULL clear + redraw on the next frame (see [`Self::force_repaint`]).
-    /// Idempotent; called by the height-changing operations that can otherwise
-    /// leave stale overlapping rows on the Windows console (a multi-line history
-    /// recall, `/clear`).
-    pub fn request_full_repaint(&mut self) {
-        self.force_repaint = true;
+    /// P3 — mark the terminal **contaminated** (see
+    /// [`Self::terminal_contaminated`]): an out-of-band write or a discrete
+    /// layout transition invalidated what is on the real screen, so the event
+    /// loop must force ONE full clear + repaint on the next frame. Idempotent;
+    /// `&self` (interior-mutable `Cell`) so the pure `&App` renderer, the scroll
+    /// helpers, and the event loop's select arms can all raise it.
+    pub fn contaminate_terminal(&self) {
+        self.terminal_contaminated.set(true);
     }
 
-    /// Take + clear the pending full-repaint request. The event loop ORs this
-    /// into its `force_full_repaint` gate each iteration, so a height change
-    /// (multi-line history recall) or a `/clear` clears the screen + resets
-    /// ratatui's back-buffer before the next draw. Drains in one shot (a second
-    /// call returns `false`) so exactly one full repaint is forced, then the
-    /// cheap incremental diff resumes. Returns `false` in the steady state.
+    /// P3 — drain the contamination flag. The event loop calls this once per
+    /// iteration and folds `true` into its `force_full_repaint` gate, which
+    /// `terminal.clear()`s (a real `Clear(All)` + a ratatui back-buffer reset)
+    /// so the next draw repaints EVERY cell and no stale row survives. Drains in
+    /// one shot (a second call returns `false`): exactly one healing repaint per
+    /// contamination, then the cheap incremental diff resumes (on a non-sync
+    /// terminal — under confirmed sync output every frame is a full atomic
+    /// repaint regardless, P0). Returns `false` in the steady state.
     #[must_use]
-    pub fn take_force_repaint(&mut self) -> bool {
-        std::mem::take(&mut self.force_repaint)
+    pub fn take_terminal_contaminated(&self) -> bool {
+        self.terminal_contaminated.replace(false)
+    }
+
+    /// Request a FULL clear + redraw on the next frame — an alias of
+    /// [`Self::contaminate_terminal`] kept for the height-changing operations
+    /// that can otherwise leave stale overlapping rows on the Windows console (a
+    /// multi-line history recall, `/clear`).
+    pub fn request_full_repaint(&self) {
+        self.contaminate_terminal();
     }
 
     /// Request a FULL clear + redraw on the next frame because the TRANSCRIPT
-    /// (not the input box) reflowed / re-based / scrolled — see
-    /// [`Self::transcript_repaint_pending`]. Takes `&self` so the pure `&App`
-    /// renderer and the interior-mutable scroll helpers can both raise it.
+    /// reflowed / re-based / scrolled (see
+    /// [`crate::transcript_reflow_needs_repaint`]) — an alias of
+    /// [`Self::contaminate_terminal`] kept for the renderer / scroll callers.
     pub fn request_transcript_repaint(&self) {
-        self.transcript_repaint_pending.set(true);
+        self.contaminate_terminal();
     }
 
-    /// Take + clear the pending transcript-repaint request (the transcript
-    /// counterpart of [`Self::take_force_repaint`]). The event loop ORs this into
-    /// its `force_full_repaint` gate every iteration, so a transcript reflow /
-    /// `MAX_RENDER_ROWS` re-base / scroll jump clears the screen + resets
-    /// ratatui's back-buffer before the next draw and no stale row survives.
-    /// Drains in one shot; `&self` (interior-mutable `Cell`) so it composes with
-    /// the renderer's `&App`. Returns `false` in the steady state.
+    /// Drain a pending transcript-repaint request — an alias of
+    /// [`Self::take_terminal_contaminated`] (one shared contamination flag).
     #[must_use]
     pub fn take_transcript_repaint(&self) -> bool {
-        self.transcript_repaint_pending.replace(false)
+        self.take_terminal_contaminated()
     }
 
     /// The rendered input-box height (clamped visible rows + underline + meta) at
@@ -12116,9 +12111,17 @@ impl App {
 
     /// Drain the pending-bell flag. The event loop calls this each iteration and,
     /// when `true`, writes the BEL byte through the render's own backend writer
-    /// between frames. Returns `false` once drained (idempotent).
+    /// between frames. Returns `false` once drained (idempotent). A drained
+    /// `true` also marks the terminal contaminated (P3): the BEL the loop is
+    /// about to write is an OUT-OF-BAND byte outside ratatui's diff, so the next
+    /// frame does one full clear + repaint — the universal catch-all that keeps
+    /// any terminal-side reaction to the bell from surviving as drift.
     pub fn take_bell(&mut self) -> bool {
-        std::mem::take(&mut self.bell_pending)
+        let pending = std::mem::take(&mut self.bell_pending);
+        if pending {
+            self.contaminate_terminal();
+        }
+        pending
     }
 
     // ---- Feature B: in-transcript search --------------------------------
@@ -17200,16 +17203,22 @@ mod tests {
         // GROWS the prompt, shifting the transcript above it — exactly the case
         // that leaves overlapping garble on the Windows console.
         a.remember_submission("line one\nline two\nline three");
-        assert!(!a.force_repaint, "no repaint pending before the recall");
+        assert!(
+            !a.terminal_contaminated.get(),
+            "no repaint pending before the recall"
+        );
         a.input_history_back();
         assert_eq!(a.input, "line one\nline two\nline three");
         assert!(
-            a.take_force_repaint(),
+            a.take_terminal_contaminated(),
             "a multi-line recall that grows the input box must force a full repaint"
         );
         // The request drains in ONE shot — exactly one full repaint, then the
         // cheap incremental diff resumes.
-        assert!(!a.take_force_repaint(), "the repaint request drains once");
+        assert!(
+            !a.take_terminal_contaminated(),
+            "the repaint request drains once"
+        );
     }
 
     #[test]
@@ -17222,7 +17231,7 @@ mod tests {
         a.input_history_back();
         assert_eq!(a.input, "hi");
         assert!(
-            !a.take_force_repaint(),
+            !a.take_terminal_contaminated(),
             "a same-height recall must NOT force a needless full repaint"
         );
     }
@@ -17234,10 +17243,10 @@ mod tests {
         a.remember_submission("a\nb\nc\nd"); // four rows tall
         a.remember_submission("short"); // one row
         a.input_history_back(); // -> "short" (same height as empty draft)
-        let _ = a.take_force_repaint(); // clear whatever that step set
+        let _ = a.take_terminal_contaminated(); // clear whatever that step set
         a.input_history_back(); // -> the tall entry (grows)
         assert!(
-            a.take_force_repaint(),
+            a.take_terminal_contaminated(),
             "growing the box on the way back forces a repaint"
         );
         // Stepping FORWARD shrinks the tall entry back to "short": the box loses
@@ -17246,7 +17255,7 @@ mod tests {
         a.input_history_forward();
         assert_eq!(a.input, "short");
         assert!(
-            a.take_force_repaint(),
+            a.take_terminal_contaminated(),
             "shrinking the input box on forward-recall must force a full repaint"
         );
     }
@@ -17326,9 +17335,40 @@ mod tests {
             "/clear drops the prior transcript"
         );
         assert!(
-            a.take_force_repaint(),
+            a.take_terminal_contaminated(),
             "/clear drops transcript rows without changing the input height, so it \
              must force a full repaint itself (the generic height guard can't catch it)"
+        );
+    }
+
+    // ---- P3: out-of-band terminal writes contaminate the render, forcing one
+    // healing clear+repaint on the next frame (the primary heal on terminals
+    // without confirmed synchronized output). --------------------------------
+
+    #[test]
+    fn taking_an_armed_bell_contaminates_the_terminal() {
+        let mut a = fresh_app(Some("offline"));
+        a.bell_pending = true;
+        assert!(a.take_bell(), "the armed bell drains");
+        assert!(
+            a.take_terminal_contaminated(),
+            "the out-of-band BEL write must contaminate the terminal (one heal frame)"
+        );
+        // Both flags are one-shot: no bell, no second heal.
+        assert!(!a.take_bell(), "the bell drains once");
+        assert!(
+            !a.take_terminal_contaminated(),
+            "the contamination flag drains once — exactly one healing repaint"
+        );
+    }
+
+    #[test]
+    fn an_unarmed_bell_does_not_contaminate() {
+        let mut a = fresh_app(Some("offline"));
+        assert!(!a.take_bell(), "nothing armed → no bell");
+        assert!(
+            !a.take_terminal_contaminated(),
+            "no out-of-band write happened → the steady state stays clean"
         );
     }
 
