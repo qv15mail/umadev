@@ -112,8 +112,15 @@ fn fetch_regex() -> &'static Regex {
         // look-behind): a `fetch(` whose preceding char is an identifier char
         // is really the tail of `prefetch(` / `refetch(` / `router.prefetch(`,
         // not a fetch call, and is rejected in `extract_from_file`.
+        // The verb group is case-insensitive (`(?i:…)`): `HttpVerb::parse`
+        // accepts lower/mixed case, but a literal `method: 'post'` failed to
+        // capture here and fell through to the GET default with
+        // `method_known = true` — a systematic false MethodMismatch against a
+        // POST-only endpoint. The captured verb is normalised via
+        // `HttpVerb::parse` at the call site. A genuinely absent `method:` key
+        // still leaves the group unmatched → GET default (fetch's spec default).
         Regex::new(
-            r#"(?P<lead>[A-Za-z0-9_$.]?)fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['"`])?"#,
+            r#"(?P<lead>[A-Za-z0-9_$.]?)fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>(?i:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))['"`])?"#,
         )
         .expect("fetch regex well-formed")
     })
@@ -176,8 +183,11 @@ fn use_mutation_regex() -> &'static Regex {
 fn axios_direct_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // Verb group is case-insensitive (`(?i:…)`) for the same reason as
+        // `fetch_regex`: a lowercase `method: 'post'` must not fall through to
+        // the GET default. Normalised via `HttpVerb::parse` at the call site.
         Regex::new(
-            r#"axios\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['"`])?"#,
+            r#"axios\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>(?i:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))['"`])?"#,
         )
         .expect("axios-direct regex well-formed")
     })
@@ -731,6 +741,100 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.path == "/api/upload"),
             "direct axios() must be captured"
+        );
+    }
+
+    // ---- P2: lowercase/mixed-case fetch/axios `method:` option ----
+
+    #[test]
+    fn fetch_lowercase_method_resolves_to_post() {
+        // Regression: `method: 'post'` (lowercase) failed to capture, so the
+        // call defaulted to GET with method_known = true — a false GET that
+        // raised a spurious MethodMismatch against a POST-only endpoint.
+        let calls = extract_from_file("src/a.ts", "fetch('/api/orders', { method: 'post' })");
+        let c = calls.iter().find(|c| c.path == "/api/orders");
+        let c = c.expect("fetch with method:'post' must be captured");
+        assert_eq!(
+            c.method,
+            HttpVerb::Post,
+            "lowercase 'post' must resolve to POST"
+        );
+        assert!(c.method_known);
+    }
+
+    #[test]
+    fn fetch_mixed_case_method_resolves_to_post() {
+        // `method: 'Post'` (mixed case) must also resolve to POST.
+        let calls = extract_from_file("src/a.ts", "fetch('/api/orders', { method: 'Post' })");
+        let c = calls
+            .iter()
+            .find(|c| c.path == "/api/orders")
+            .expect("fetch with method:'Post' must be captured");
+        assert_eq!(
+            c.method,
+            HttpVerb::Post,
+            "mixed-case 'Post' must resolve to POST"
+        );
+    }
+
+    #[test]
+    fn fetch_uppercase_method_still_resolves() {
+        // Negative-control: an UPPERCASE `method: 'PUT'` keeps resolving.
+        let calls = extract_from_file("src/a.ts", "fetch('/api/items', { method: 'PUT' })");
+        let c = calls
+            .iter()
+            .find(|c| c.path == "/api/items")
+            .expect("fetch with method:'PUT' must be captured");
+        assert_eq!(c.method, HttpVerb::Put);
+    }
+
+    #[test]
+    fn fetch_no_method_key_still_defaults_get() {
+        // The "no method: key present → default GET" behavior is preserved.
+        let calls = extract_from_file("src/a.ts", "fetch('/api/list', { headers: {} })");
+        let c = calls
+            .iter()
+            .find(|c| c.path == "/api/list")
+            .expect("bare fetch must be captured");
+        assert_eq!(c.method, HttpVerb::Get, "no method: key → GET default");
+    }
+
+    #[test]
+    fn direct_axios_lowercase_method_resolves() {
+        // Same fix at the axios_direct regex site: axios('/x', { method: 'delete' }).
+        let calls = extract_from_file(
+            "src/a.ts",
+            "axios('/api/thing', { method: 'delete', data })",
+        );
+        let c = calls
+            .iter()
+            .find(|c| c.path == "/api/thing")
+            .expect("direct axios with method:'delete' must be captured");
+        assert_eq!(
+            c.method,
+            HttpVerb::Delete,
+            "lowercase 'delete' must resolve to DELETE"
+        );
+    }
+
+    #[test]
+    fn fetch_lowercase_post_no_false_method_mismatch() {
+        // P2 end-to-end: a POST-only contract endpoint must NOT raise a
+        // MethodMismatch for a fetch(method:'post') targeting it (the old
+        // lowercase-miss defaulted to GET and produced exactly that false alarm).
+        use crate::parse::parse_architecture;
+        use crate::validate::validate_frontend_vs_contract;
+        let spec = parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n\
+             |---|---|---|---|---|---|\n\
+             | POST | /api/orders | - | - | none | Create |\n",
+            "demo",
+        );
+        let calls = extract_from_file("src/a.ts", "fetch('/api/orders', { method: 'post' })");
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(
+            v.is_empty(),
+            "lowercase method:'post' must match a POST-only endpoint, got {v:?}"
         );
     }
 

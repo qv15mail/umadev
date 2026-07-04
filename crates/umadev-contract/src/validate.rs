@@ -178,7 +178,15 @@ pub fn validate_prd_vs_contract(prd_routes: &[String], spec: &ApiSpec) -> Vec<Co
             .trim_matches('/')
             .split('/')
             .filter(|s| {
-                !s.is_empty() && !s.starts_with(':') && *s != "api" && !is_version_prefix(s)
+                // Skip route parameters across the whole param vocabulary the
+                // backend/parse side recognises (`:id`, `{id}`, `<id>`,
+                // `<int:id>`) — not just `:id`. Otherwise a PRD route like
+                // `/api/users/{id}` extracted `{id}` as the resource segment,
+                // which no contract endpoint mentions → a false UnmatchedRoute.
+                !s.is_empty()
+                    && !crate::parse::is_template_param(s)
+                    && *s != "api"
+                    && !is_version_prefix(s)
             })
             .collect();
         let route_base = segments.last().copied().unwrap_or("");
@@ -219,8 +227,22 @@ fn is_version_prefix(s: &str) -> bool {
 }
 
 /// Does `path` contain a non-parameter segment equal to `segment`?
+/// Parameter segments are skipped across the full param vocabulary
+/// (`:id` / `{id}` / `<id>` / `<int:id>`) so a contract path template's
+/// parameter slot is never treated as a matchable resource name.
 fn path_contains_segment(path: &str, segment: &str) -> bool {
-    path.split('/').any(|s| !s.starts_with(':') && s == segment)
+    path.split('/')
+        .any(|s| !crate::parse::is_template_param(s) && s == segment)
+}
+
+/// Whether `path` is the conventional `/home` landing route — matched as a
+/// real path segment (`/home` exactly, or anything under `/home/…`), not a
+/// substring. A substring `contains("/home")` false-skipped real business
+/// routes such as `/api/homes`, `/homework`, and `/api/homepage`. Matched
+/// case-insensitively so `/Home` is skipped too.
+fn is_home_route(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "/home" || lower.starts_with("/home/")
 }
 
 /// Extract route paths from PRD markdown (the information-architecture
@@ -240,11 +262,12 @@ pub fn extract_prd_routes(prd_markdown: &str) -> Vec<String> {
         }
         // Take the path up to the first whitespace (ignore trailing labels).
         let path = stripped.split_whitespace().next().unwrap_or(&stripped);
-        // Skip the root + param-only routes (too generic to validate).
-        // `/Home` (and `/home`) is the conventional landing page that every
-        // app has but rarely maps to a single REST resource — skip case-
-        // insensitively so a lowercase `/home` route isn't flagged.
-        if path.len() < 3 || path.to_ascii_lowercase().contains("/home") {
+        // Skip the root + param-only routes (too generic to validate) and the
+        // conventional `/home` landing page (case-insensitive). The `/home`
+        // skip is path-segment anchored — exactly `/home` or under `/home/…` —
+        // NOT a substring `contains("/home")`, which wrongly swallowed real
+        // business routes like `/api/homes`, `/homework`, `/api/homepage`.
+        if path.len() < 3 || is_home_route(path) {
             continue;
         }
         routes.push(path.to_string());
@@ -456,6 +479,94 @@ mod tests {
             "lowercase /home must be skipped, got {routes:?}"
         );
         assert!(routes.contains(&"/dashboard".to_string()));
+    }
+
+    // ---- P2: `/home` skip is path-segment anchored, not a substring ----
+
+    #[test]
+    fn extract_prd_routes_home_skip_is_segment_anchored() {
+        // A substring `contains("/home")` wrongly swallowed real business
+        // routes. Only a genuine `/home` (or `/home/…`) route is skipped;
+        // `/api/homes`, `/homework`, `/api/homepage` must survive.
+        let prd = "/\n\
+             ├── /home\n\
+             ├── /home/settings\n\
+             ├── /Home\n\
+             ├── /api/homes\n\
+             ├── /homework\n\
+             └── /api/homepage\n";
+        let routes = extract_prd_routes(prd);
+        // Genuine /home routes (any case) are skipped.
+        assert!(
+            !routes.iter().any(|r| r.eq_ignore_ascii_case("/home")),
+            "exact /home must be skipped, got {routes:?}"
+        );
+        assert!(
+            !routes.contains(&"/home/settings".to_string()),
+            "/home/… must be skipped, got {routes:?}"
+        );
+        // Real business routes that merely START WITH the letters "home" must
+        // NOT be skipped.
+        assert!(
+            routes.contains(&"/api/homes".to_string()),
+            "/api/homes must NOT be skipped, got {routes:?}"
+        );
+        assert!(
+            routes.contains(&"/homework".to_string()),
+            "/homework must NOT be skipped, got {routes:?}"
+        );
+        assert!(
+            routes.contains(&"/api/homepage".to_string()),
+            "/api/homepage must NOT be skipped, got {routes:?}"
+        );
+    }
+
+    #[test]
+    fn is_home_route_helper() {
+        use super::is_home_route;
+        assert!(is_home_route("/home"));
+        assert!(is_home_route("/Home")); // case-insensitive
+        assert!(is_home_route("/home/settings"));
+        assert!(!is_home_route("/api/homes"));
+        assert!(!is_home_route("/homework"));
+        assert!(!is_home_route("/api/homepage"));
+        assert!(!is_home_route("/api/home")); // /home not at path root
+    }
+
+    // ---- P2: {id} / <id> / <int:id> PRD route params are normalised ----
+
+    #[test]
+    fn prd_route_brace_and_angle_params_match_contract() {
+        // A PRD route whose leaf is an OpenAPI `{id}` / Django `<id>` /
+        // `<int:id>` param must resolve its resource segment (`users`) and match
+        // the contract's `/api/users` endpoint — previously the unrecognised
+        // param became the route_base and raised a false UnmatchedRoute.
+        let spec = spec();
+        let routes = vec![
+            "/api/users/{id}".to_string(),
+            "/api/users/<id>".to_string(),
+            "/api/users/<int:id>".to_string(),
+        ];
+        let v = validate_prd_vs_contract(&routes, &spec);
+        assert!(
+            v.is_empty(),
+            "{{id}}/<id>/<int:id> PRD routes must match /api/users, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn prd_route_unmatched_still_flagged_after_param_broadening() {
+        // Regression guard: broadening param vocab must not hide a genuinely
+        // unmatched PRD route whose resource no endpoint serves.
+        let spec = spec();
+        let v = validate_prd_vs_contract(&["/api/widgets/{id}".to_string()], &spec);
+        assert_eq!(
+            v.len(),
+            1,
+            "unmatched resource must still be flagged: {v:?}"
+        );
+        assert_eq!(v[0].kind, ViolationKind::UnmatchedRoute);
+        assert!(v[0].detail.contains("/api/widgets/{id}"));
     }
 
     #[test]
