@@ -369,6 +369,13 @@ fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
 /// single-shot equivalent. 256 KiB matches the stdout cap in [`run_subprocess`].
 const STDERR_CAPTURE_CAP: usize = 262_144;
 
+/// Hard cap on stdout accumulated by [`run_subprocess_streaming`] — mirrors the
+/// 256 KiB post-hoc stdout truncation in [`run_subprocess`]. Without it a chatty
+/// newline-delimited stream (thousands of small JSONL events) grows the
+/// line buffer without bound. Past the cap we stop accumulating and append a
+/// single truncation marker; live streaming to `on_line` is unaffected.
+const STREAM_STDOUT_CAP: usize = 262_144;
+
 /// Bounded grace for draining a child's stderr AFTER it has exited (and for
 /// reaping the concurrent stdin writer). The child is already gone, so this only
 /// flushes an already-closing pipe — but a GRANDCHILD that inherited the stderr
@@ -426,6 +433,91 @@ async fn reap_bounded<T>(mut task: tokio::task::JoinHandle<T>) -> Option<T> {
     }
 }
 
+/// An owned background task that is **aborted on drop** unless it is explicitly
+/// reaped via [`AbortOnDrop::into_inner`]. This closes a leak in the drain
+/// loops below: `spawn_stderr_capture` runs forever if a base forks a
+/// grandchild that inherits the stderr write fd (the pipe never EOFs), and any
+/// early `return Err(..)` on the timeout/read-error paths would otherwise DROP
+/// the raw `JoinHandle` — which in tokio *detaches* the task, leaving it running
+/// in the background. Wrapping the handle guarantees every return path (happy or
+/// error) either reaps it (happy path: `into_inner()` → `reap_bounded`) or
+/// aborts it (guard `Drop`). Fail-open: abort never blocks.
+struct AbortOnDrop<T> {
+    task: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    /// Arm the guard over a spawned task.
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    /// Disarm the guard and hand back the handle so the caller can reap it
+    /// (used on the happy path, where the task is joined under a bounded grace).
+    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
+        self.task
+            .take()
+            .expect("AbortOnDrop::into_inner is the sole consumer of the handle")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // An early error return left the task un-reaped: abort it so a
+            // grandchild-held pipe can't keep the drain task alive forever.
+            task.abort();
+        }
+    }
+}
+
+/// Bounded grace for reaping a continuous-session base child at `end()`. After
+/// `start_kill()` we poll the child's exit under this budget so shutdown is
+/// deterministic and leaves no orphan; on overrun we fail open to
+/// `kill_on_drop(true)` (the child struct is dropped by the caller right after),
+/// so `end()` can never block the host.
+const END_REAP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Start-kill a continuous-session base child and then poll (bounded by
+/// [`END_REAP_BUDGET`]) until the OS reaper actually reaps it — so `end()` is
+/// deterministic and leaves no orphan `claude` / `codex app-server` /
+/// `opencode serve` process behind. Consistent across all three session
+/// drivers.
+///
+/// The child lives behind a [`std::sync::Mutex`] so the `&self`
+/// `try_exit_status` peek needs no `&mut`; this takes the blocking lock ONLY for
+/// the sync `start_kill()` / `try_wait()` micro-calls and NEVER holds it across
+/// an `.await` (each poll re-locks), leaving the async reaper free to run.
+///
+/// Fail-open: a poisoned/contended lock or a `try_wait` error just ends the
+/// poll early — `kill_on_drop(true)` remains the final backstop, so we never
+/// block the host on shutdown.
+pub(crate) async fn reap_after_kill(
+    child: &std::sync::Mutex<tokio::process::Child>,
+    budget: Duration,
+) {
+    // Signal the kill under the lock (sync; the guard drops before any await).
+    match child.lock() {
+        Ok(mut guard) => {
+            let _ = guard.start_kill();
+        }
+        // Poisoned lock: a prior panic while holding it. Fail-open — the
+        // caller's `kill_on_drop` is the backstop.
+        Err(_) => return,
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        // Re-lock for a non-blocking `try_wait`; never hold the lock across the
+        // sleep. A contended lock (a concurrent `try_exit_status` peek) simply
+        // retries on the next tick.
+        let reaped = matches!(child.try_lock().map(|mut g| g.try_wait()), Ok(Ok(Some(_))));
+        if reaped || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Drain a spawned child's stdout+stderr to EOF AND wait for its exit, bounded
 /// by BOTH a per-call hard ceiling AND a per-byte idle watchdog.
 ///
@@ -465,9 +557,12 @@ async fn drain_and_wait(
     // which would stall a single-task stdout+stderr join AND confuse the
     // stdout-only idle watchdog (stderr traffic is not stdout liveness). Reading
     // it independently keeps the stdout idle measurement honest. (Same shape as
-    // `run_subprocess_streaming`.) The task ends when stderr closes — which the
-    // kill below guarantees on every error path, so it is never orphaned.
-    let stderr_task = spawn_stderr_capture(child.stderr.take());
+    // `run_subprocess_streaming`.) The task ends when stderr closes — but a
+    // grandchild that inherited the stderr write fd can hold the pipe open past
+    // the child's own exit, so the drain task must be reaped OR aborted on EVERY
+    // return path, not just the happy one. The guard aborts it on drop (any early
+    // `return Err(..)` below), and the happy path disarms it via `into_inner`.
+    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.stderr.take()));
 
     // Same env + default + collapse semantics as the streaming path.
     let idle_timeout = std::cmp::min(
@@ -562,8 +657,10 @@ async fn drain_and_wait(
     // H1: the child has exited, but a grandchild that inherited the stderr write
     // fd can hold the pipe open so this read never EOFs. Reap under a bounded
     // flush grace so a leaked fd can't hang the call forever — the exit status +
-    // stdout are already in hand.
-    let stderr_buf = reap_bounded(stderr_task).await.unwrap_or_default();
+    // stdout are already in hand. Disarm the abort guard: we join it instead.
+    let stderr_buf = reap_bounded(stderr_task.into_inner())
+        .await
+        .unwrap_or_default();
     Ok((status, stdout_buf, stderr_buf))
 }
 
@@ -1259,7 +1356,10 @@ pub(crate) async fn run_subprocess_streaming(
 
     // Read stderr in a separate task so it doesn't block stdout streaming,
     // bounded by `STDERR_CAPTURE_CAP` (a flooding base can't grow it unboundedly).
-    let stderr_task = spawn_stderr_capture(child.stderr.take());
+    // Guarded so an early `return Err(..)` on the stdout-loop timeout/read-error
+    // paths below aborts (not detaches) the drain task — a grandchild holding the
+    // stderr fd open would otherwise leave it running forever.
+    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.stderr.take()));
 
     // Stream stdout line by line.
     // **Watchdog**: once the stream is live, a per-line idle timeout (not the
@@ -1284,6 +1384,13 @@ pub(crate) async fn run_subprocess_streaming(
         ),
     );
     let mut all_lines = Vec::new();
+    // Total-bytes cap on the accumulated stdout, mirroring the non-streaming
+    // 256 KiB cap in `run_subprocess` — a chatty JSONL stream (many small
+    // events) would otherwise grow `all_lines` without bound and exhaust memory.
+    // We keep *streaming* every line to `on_line` (the live UI is transient), but
+    // stop ACCUMULATING once past the cap and append a single truncation marker.
+    let mut acc_bytes: usize = 0;
+    let mut stdout_truncated = false;
     // **First-line grace.** The idle watchdog measures line-to-line *silence*,
     // which only makes sense once a line has been seen. Some bases (claude /
     // codex with `stream-json` / `--json`) emit lifecycle lines (system/init,
@@ -1337,7 +1444,16 @@ pub(crate) async fn run_subprocess_streaming(
                     let line = String::from_utf8_lossy(&line_buf);
                     let line = line.trim_end_matches(['\r', '\n']).to_string();
                     on_line(&line);
-                    all_lines.push(line);
+                    if !stdout_truncated {
+                        // +1 accounts for the '\n' the final `join` re-inserts.
+                        if acc_bytes.saturating_add(line.len() + 1) > STREAM_STDOUT_CAP {
+                            stdout_truncated = true;
+                            all_lines.push("...[umadev: stdout truncated at 256 KiB]".to_string());
+                        } else {
+                            acc_bytes += line.len() + 1;
+                            all_lines.push(line);
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     let _ = child.start_kill();
@@ -1403,7 +1519,10 @@ pub(crate) async fn run_subprocess_streaming(
     if let Some(writer) = stdin_writer {
         let _ = reap_bounded(writer).await;
     }
-    let stderr_buf = reap_bounded(stderr_task).await.unwrap_or_default();
+    // Disarm the abort guard on the happy path: join the drain task instead.
+    let stderr_buf = reap_bounded(stderr_task.into_inner())
+        .await
+        .unwrap_or_default();
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
@@ -2190,6 +2309,112 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.stdout, "hello-from-test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_stdout_is_capped() {
+        // A chatty stream (~400 KiB of small lines) must not grow `all_lines`
+        // without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
+        // (256 KiB) with a truncation marker, mirroring the non-streaming cap.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 2000 lines × 200 bytes ≈ 400 KiB — well past the 256 KiB cap.
+        let script = r#"s=$(head -c 200 /dev/zero | tr '\0' 'x'); i=0; while [ $i -lt 2000 ]; do echo "$s"; i=$((i+1)); done"#;
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: "sh",
+                args: &["-c".to_string(), script.to_string()],
+                prompt: "",
+                channel: PromptChannel::Arg,
+                workspace: tmp.path(),
+                timeout: Duration::from_secs(30),
+                env: &[],
+            },
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.stdout.len() <= STREAM_STDOUT_CAP + 128,
+            "streaming stdout stayed within the cap: {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout.contains("stdout truncated at 256 KiB"),
+            "the truncation marker must be present once the cap is hit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_after_kill_reaps_a_running_child() {
+        // A live child (a long sleep) is start-killed and then observed reaped
+        // within the bounded budget — deterministic, no orphan.
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let m = std::sync::Mutex::new(child);
+        let started = tokio::time::Instant::now();
+        reap_after_kill(&m, Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reap must return before the full budget once the child dies"
+        );
+        // The child is reaped: a subsequent non-blocking try_wait reports exit.
+        let exited = matches!(m.lock().unwrap().try_wait(), Ok(Some(_)));
+        assert!(exited, "the killed child must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_after_kill_is_bounded_by_budget() {
+        // Even with a zero budget the call kills then returns at once (fail-open),
+        // never hanging — kill_on_drop is the backstop for the reap.
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let m = std::sync::Mutex::new(child);
+        let started = tokio::time::Instant::now();
+        reap_after_kill(&m, Duration::ZERO).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a zero budget must return promptly, not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_aborts_the_wrapped_task() {
+        // Dropping the guard aborts the task: its captured oneshot sender is
+        // dropped without sending, so the receiver observes a cancel.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = tx.send(());
+        });
+        let guard = AbortOnDrop::new(task);
+        drop(guard);
+        assert!(
+            rx.await.is_err(),
+            "AbortOnDrop must abort the wrapped task on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_into_inner_disarms() {
+        // `into_inner` hands back the live handle so the happy path can reap it —
+        // the task runs to completion, not aborted.
+        let task = tokio::spawn(async { 7u8 });
+        let guard = AbortOnDrop::new(task);
+        let handle = guard.into_inner();
+        assert_eq!(
+            handle.await.unwrap(),
+            7,
+            "into_inner must not abort the task"
+        );
     }
 
     // ---- AuthState / ProbeResult honest-auth surface (gap G10) ----

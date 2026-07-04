@@ -32,6 +32,21 @@ const MAX_LINES: usize = 20;
 /// while staying a hard cap on memory.
 const MAX_BYTES: usize = 4 * 1024;
 
+/// The largest index `<= max` that lands on a UTF-8 char boundary of `s`, so a
+/// `String::truncate` at that index never splits a multibyte char (CJK / emoji)
+/// and panics. (`str::floor_char_boundary` is still unstable, so we walk back by
+/// hand.) Fail-open: keeps the "capture never panics" contract of this module.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// A shared, bounded ring of the most-recent stderr lines from a base child.
 ///
 /// Cheap to [`Clone`] (an `Arc`): the driver keeps one handle for
@@ -65,10 +80,13 @@ impl StderrTail {
             Err(poisoned) => poisoned.into_inner(),
         };
         // A single oversize line is still truncated to the byte budget so it
-        // can't blow the cap on its own.
+        // can't blow the cap on its own. Truncate on a UTF-8 char boundary:
+        // `String::truncate(MAX_BYTES)` PANICS when the byte index splits a
+        // multibyte char (a CJK / emoji stderr banner straddling the cut) —
+        // which would violate this module's "capture never panics" contract.
         let mut line = line;
         if line.len() > MAX_BYTES {
-            line.truncate(MAX_BYTES);
+            line.truncate(floor_char_boundary(&line, MAX_BYTES));
         }
         buf.bytes += line.len();
         buf.lines.push_back(line);
@@ -166,6 +184,49 @@ mod tests {
         t.push("y".repeat(MAX_BYTES * 2));
         let snap = t.snapshot().unwrap();
         assert!(snap.len() <= MAX_BYTES, "single oversize line truncated");
+    }
+
+    #[test]
+    fn oversize_multibyte_line_truncates_without_panic() {
+        // A CJK stderr banner far larger than MAX_BYTES. `中` is 3 bytes, so
+        // MAX_BYTES (4096) is NOT a char boundary (4096 % 3 == 1) — a naive
+        // `truncate(MAX_BYTES)` would panic mid-char. The boundary-floored
+        // truncation must not panic and must stay within the byte budget while
+        // keeping only whole chars.
+        let t = StderrTail::new();
+        t.push("中".repeat(MAX_BYTES)); // 3 * 4096 bytes
+        let snap = t.snapshot().unwrap();
+        assert!(
+            snap.len() <= MAX_BYTES,
+            "multibyte line stayed within budget"
+        );
+        assert_eq!(snap.len() % 3, 0, "truncation kept whole 3-byte chars");
+        assert!(snap.chars().all(|c| c == '中'), "no split/replacement char");
+    }
+
+    #[test]
+    fn oversize_emoji_line_truncates_on_boundary() {
+        // Emoji are 4 bytes; MAX_BYTES (4096) IS divisible by 4, so also test an
+        // offset run so the floor must walk back. No panic, valid UTF-8, bounded.
+        let t = StderrTail::new();
+        let mut line = String::from("x"); // 1-byte lead shifts every emoji boundary
+        line.push_str(&"😀".repeat(MAX_BYTES));
+        t.push(line);
+        let snap = t.snapshot().unwrap();
+        assert!(snap.len() <= MAX_BYTES, "emoji line stayed within budget");
+        // Valid UTF-8 by construction (it's a String); assert no replacement char
+        // crept in from a bad split.
+        assert!(!snap.contains('\u{FFFD}'), "no U+FFFD from a split char");
+    }
+
+    #[test]
+    fn floor_char_boundary_walks_back_to_a_boundary() {
+        let s = "中".repeat(3); // 9 bytes, boundaries at 0/3/6/9
+        assert_eq!(floor_char_boundary(s.as_str(), 9), 9);
+        assert_eq!(floor_char_boundary(s.as_str(), 100), 9);
+        assert_eq!(floor_char_boundary(s.as_str(), 4), 3);
+        assert_eq!(floor_char_boundary(s.as_str(), 5), 3);
+        assert_eq!(floor_char_boundary(s.as_str(), 0), 0);
     }
 
     #[tokio::test]

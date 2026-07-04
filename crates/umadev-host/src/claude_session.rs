@@ -47,6 +47,7 @@ use umadev_runtime::{
 
 use crate::spawn_parts;
 use crate::stderr_tail::{drain_stderr_into, StderrTail};
+use crate::{reap_after_kill, END_REAP_BUDGET};
 
 /// How many events the stdout-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -367,14 +368,12 @@ impl BaseSession for ClaudeSession {
         self.write_line(&line).await
     }
 
-    // `start_kill` is sync; the trait method is async for the other impls.
-    #[allow(clippy::unused_async)]
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort: killing the child drops stdin (EOF) and tears down the
-        // reader/stderr tasks. kill_on_drop is also set as a backstop.
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.start_kill();
-        }
+        // Best-effort: kill the child (drops stdin → EOF, tears down the
+        // reader/stderr tasks) AND wait (bounded) for it to be reaped so shutdown
+        // is deterministic and leaves no orphan. On overrun we fail open to
+        // kill_on_drop. Consistent with codex / opencode `end()`.
+        reap_after_kill(&self.child, END_REAP_BUDGET).await;
         Ok(())
     }
 
@@ -1895,6 +1894,46 @@ mod tests {
             }
         );
         let _ = s.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_reaps_the_child_within_the_bounded_wait() {
+        // A base that stays alive (a long sleep) after emitting init. `end()` must
+        // start-kill it AND wait (bounded) for the reap, so no orphan lingers and
+        // shutdown timing is deterministic — not left to a lazy drop.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nread _line\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"x\"}'\n\
+             sleep 30\n",
+        );
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
+        // The child is alive before end().
+        assert!(s.try_exit_status().is_none(), "child should be running");
+
+        let started = tokio::time::Instant::now();
+        s.end().await.expect("end");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "end() must return within its bounded reap budget, not hang: {:?}",
+            started.elapsed()
+        );
+        // end() awaited the reap, so the exit is observable immediately after.
+        assert!(
+            s.try_exit_status().is_some(),
+            "end() must reap the child (no orphan) within the bounded wait"
+        );
     }
 
     #[cfg(unix)]

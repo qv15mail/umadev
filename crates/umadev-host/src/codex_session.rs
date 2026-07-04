@@ -80,6 +80,7 @@ use umadev_runtime::{
 
 use crate::spawn_parts;
 use crate::stderr_tail::{drain_stderr_into, StderrTail};
+use crate::{reap_after_kill, END_REAP_BUDGET};
 
 /// Program name for the codex base (overridable for tests / forward compat),
 /// mirroring [`crate::codex::CodexDriver`]'s `UMADEV_CODEX_BIN`.
@@ -1725,9 +1726,12 @@ impl BaseSession for CodexSession {
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort graceful close: interrupt any in-flight turn, then let
-        // `kill_on_drop` reap the child. We never block the host on shutdown.
+        // Best-effort graceful close: interrupt any in-flight turn, then kill the
+        // child AND wait (bounded) for it to be reaped so shutdown is
+        // deterministic and leaves no orphan `codex app-server`. On overrun we
+        // fail open to kill_on_drop. Consistent with claude / opencode `end()`.
         let _ = self.interrupt().await;
+        reap_after_kill(&self.child, END_REAP_BUDGET).await;
         Ok(())
     }
 
