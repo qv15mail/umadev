@@ -41,6 +41,17 @@ const CAPTURE_CAP: usize = 8 * 1024;
 /// backstop so a hung interactive login can't block forever.
 const DEPLOY_TIMEOUT_SECS: u64 = 600;
 
+/// Cap on RAW captured deploy output held in memory while the command runs. A
+/// chatty deploy (e.g. a verbose `docker build`) can print far more than we keep;
+/// we retain only the last `OUTPUT_CAP` bytes (the result / URL / error lives at
+/// the end) while ALWAYS draining the pipe so the child never blocks. The final
+/// stored `log_tail` is capped smaller still, at [`CAPTURE_CAP`].
+const OUTPUT_CAP: usize = 256 * 1024;
+
+/// Bounded reap after a deploy TIMES OUT, so a killed CLI and its pipe readers
+/// can't turn a timeout into an unbounded hang.
+const KILL_REAP_SECS: u64 = 5;
+
 /// A recognised deployment platform. Detected purely from files already in the
 /// workspace; each variant maps to a single canonical CLI command.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -310,6 +321,26 @@ pub async fn run_deploy(workspace: &Path, command: Option<&str>) -> DeployProof 
         return DeployProof::not_deployed(platform, format!("{bin} not found on PATH"));
     }
 
+    run_deploy_command(workspace, platform, command, DEPLOY_TIMEOUT_SECS).await
+}
+
+/// Spawn + drive one deploy command against `workspace`, racing its exit against
+/// `timeout_secs`. Always returns a [`DeployProof`] — fail-open, never hangs.
+///
+/// **Kill + bound (the audit fix).** The command is spawned with
+/// `kill_on_drop(true)` AND detached into its own session/process-group, so on
+/// timeout we kill the WHOLE tree (the `sh -c` wrapper forks `npx` → `node`,
+/// etc.) — tokio dropping the `Child` alone would leave those descendants
+/// running. Output is captured through a bounded, tail-retaining reader
+/// ([`read_capped_tail`]) instead of `Command::output()`, so a chatty command
+/// can't buffer unbounded stdout/stderr into memory; the reader always drains so
+/// the child never blocks on a full pipe.
+async fn run_deploy_command(
+    workspace: &Path,
+    platform: DeployTarget,
+    command: String,
+    timeout_secs: u64,
+) -> DeployProof {
     let started = Instant::now();
     // Run through `sh -c` (Unix) / `cmd /c` (Windows) so multi-token commands
     // like `npx vercel --prod --yes` execute as written.
@@ -318,23 +349,66 @@ pub async fn run_deploy(workspace: &Path, command: Option<&str>) -> DeployProof 
     } else {
         ("sh", "-c")
     };
-    let fut = Command::new(shell)
-        .arg(shell_arg)
+    let mut dcmd = Command::new(shell);
+    dcmd.arg(shell_arg)
         .arg(&command)
         .current_dir(workspace)
         .stdin(Stdio::null())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Detach into its OWN session/process-group so a timeout can take down the
+    // whole deploy tree, not just the `sh -c` wrapper. Safe: stdin is null and
+    // stdout/stderr are piped. Fail-open (see spawn_util).
+    crate::spawn_util::detach_from_controlling_terminal(&mut dcmd);
+    let mut child = match dcmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let mut proof =
+                DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
+            proof.command = Some(command);
+            proof.exit_code = Some(-1);
+            return proof;
+        }
+    };
 
-    match tokio::time::timeout(Duration::from_secs(DEPLOY_TIMEOUT_SECS), fut).await {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let exit = out.status.code().unwrap_or(-1);
-            let ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    // Capped-tail readers: retain only the last OUTPUT_CAP bytes of each stream
+    // (bounding memory on a chatty deploy) while always draining so the child
+    // never blocks on a full pipe.
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
+
+    // Race the command's exit against the deploy budget.
+    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    if wait_result.is_err() {
+        // Timed out: KILL the whole process group (detached above) so `npx`/`node`
+        // descendants die too — dropping the `Child` alone would leave them
+        // running. `start_kill` + `kill_on_drop` back up the direct child; the
+        // reap is bounded so a wedged wait() can't hang.
+        let _ = crate::spawn_util::kill_process_group(&child);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
+    }
+
+    let raw_stdout = join_capped(stdout_task).await;
+    let raw_stderr = join_capped(stderr_task).await;
+    let stdout = String::from_utf8_lossy(&raw_stdout);
+    let stderr = String::from_utf8_lossy(&raw_stderr);
+    let ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            let exit = status.code().unwrap_or(-1);
             // Many deploy CLIs print the live URL on stdout; some on stderr.
             let url = extract_url(&stdout).or_else(|| extract_url(&stderr));
             let log_tail = log_tail(&stdout, &stderr);
-            if out.status.success() {
+            if status.success() {
                 DeployProof {
                     timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                     platform,
@@ -366,15 +440,58 @@ pub async fn run_deploy(workspace: &Path, command: Option<&str>) -> DeployProof 
             proof
         }
         Err(_) => {
-            let mut proof = DeployProof::not_deployed(
-                platform,
-                format!("timed out after {DEPLOY_TIMEOUT_SECS}s"),
-            );
+            let mut proof =
+                DeployProof::not_deployed(platform, format!("timed out after {timeout_secs}s"));
             proof.command = Some(command);
             proof.exit_code = Some(-1);
-            proof.duration_ms = Some(DEPLOY_TIMEOUT_SECS * 1000);
+            proof.duration_ms = Some(timeout_secs.saturating_mul(1000));
+            // Keep the killed command's last words for the auditor.
+            proof.log_tail = log_tail(&stdout, &stderr);
             proof
         }
+    }
+}
+
+/// Read `reader` to EOF, retaining only the LAST `cap` bytes (the deploy
+/// result / URL / error lives at the end) while always draining so the child
+/// never blocks on a full pipe. Memory is bounded to `2*cap` between trims, so a
+/// huge stream costs O(total), not O(total²).
+async fn read_capped_tail<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if cap > 0 && buf.len() > cap.saturating_mul(2) {
+                    let drop_to = buf.len() - cap;
+                    buf.drain(..drop_to);
+                }
+            }
+        }
+    }
+    if cap > 0 && buf.len() > cap {
+        let drop_to = buf.len() - cap;
+        buf.drain(..drop_to);
+    }
+    buf
+}
+
+/// Join a capped-tail reader task, BOUNDED so a wedged descendant that still
+/// holds a pipe open after a kill can't hang us. Fail-open: a missing task or a
+/// panic yields an empty buffer.
+async fn join_capped(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match task {
+        Some(t) => match tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), t).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
     }
 }
 
@@ -716,5 +833,74 @@ mod tests {
     #[test]
     fn deploy_proof_rel_path_is_stable() {
         assert_eq!(deploy_proof_rel_path(), ".umadev/audit/deploy-proof.json");
+    }
+
+    #[tokio::test]
+    async fn read_capped_tail_keeps_the_last_cap_bytes() {
+        // A reader producing MORE than `cap` bytes: only the last `cap` are kept
+        // (the tail, where a deploy prints its result / URL), bounding memory.
+        let data = vec![b'a'; 10_000];
+        let cap = 1_000;
+        let got = read_capped_tail(&data[..], cap).await;
+        assert_eq!(got.len(), cap, "keeps exactly the last cap bytes");
+        assert!(got.iter().all(|&b| b == b'a'));
+    }
+
+    #[tokio::test]
+    async fn read_capped_tail_returns_everything_when_under_cap() {
+        let got = read_capped_tail(&b"short output"[..], 1_000).await;
+        assert_eq!(got, b"short output");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_deploy_command_times_out_kills_and_does_not_hang() {
+        // A command that runs FAR past the (tiny) budget, with a backgrounded
+        // grandchild holding the stdout pipe open. On timeout the whole group is
+        // killed, so this returns a bounded NotDeployed(timeout) promptly instead
+        // of blocking on the pipe holder. (Fixes: tokio dropping the Child on
+        // timeout without killing it, and unbounded output().)
+        let tmp = TempDir::new().unwrap();
+        let started = Instant::now();
+        let proof = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_deploy_command(
+                tmp.path(),
+                DeployTarget::Netlify,
+                "sleep 60 & sleep 60".to_string(),
+                1,
+            ),
+        )
+        .await
+        .expect("run_deploy_command must return, not hang, on timeout");
+        assert!(!proof.status.is_deployed());
+        match &proof.status {
+            DeployStatus::NotDeployed(reason) => {
+                assert!(reason.contains("timed out"), "reason: {reason}");
+            }
+            DeployStatus::Deployed => panic!("expected NotDeployed(timeout)"),
+        }
+        assert_eq!(proof.exit_code, Some(-1));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "must return promptly after killing the group, not wait out the pipe holder"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_deploy_command_success_captures_url() {
+        // Sanity: the happy path still deploys + captures the URL after the
+        // switch off `Command::output()` to a bounded reader.
+        let tmp = TempDir::new().unwrap();
+        let proof = run_deploy_command(
+            tmp.path(),
+            DeployTarget::Netlify,
+            "echo Deployed to https://demo.example.app".to_string(),
+            30,
+        )
+        .await;
+        assert!(proof.status.is_deployed(), "echo exits 0 → Deployed");
+        assert_eq!(proof.url.as_deref(), Some("https://demo.example.app"));
     }
 }

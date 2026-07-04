@@ -80,6 +80,16 @@ const PORT_FREE_WAIT_SECS: u64 = 5;
 /// run — never a foreign process.
 const PREVIEW_PID_FILE: &str = "preview.pid";
 
+/// Bounded reap after we tear down (or time out) a spawned child, so a wedged
+/// `wait()` can't hang the runtime proof.
+const TEARDOWN_REAP_SECS: u64 = 5;
+
+/// Cap on RAW captured e2e output held in memory while the suite runs. We retain
+/// only the last `OUTPUT_CAP` bytes (the pass/fail summary is at the end) while
+/// always draining so the child never blocks. The stored value is capped smaller
+/// still, at [`CAPTURE_CAP`].
+const OUTPUT_CAP: usize = 256 * 1024;
+
 /// Whether the runtime check ran end-to-end or degraded (and why). This is the
 /// top-level verdict the proof-pack and the CLI surface.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -320,14 +330,30 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
         }
     };
 
-    // 6. Tear down — eagerly kill our spawned child and drop the pidfile so this
-    //    preview server can never become the next run's leftover. (`kill_on_drop`
-    //    is the backstop; we kill now so the port frees immediately.)
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    // 6. Tear down — kill our spawned dev server AND its whole descendant tree,
+    //    then drop the pidfile so this preview can never become the next run's
+    //    leftover. The dev command (npm/pnpm) forks node/vite grandchildren that
+    //    survive a kill of just the wrapper and keep holding the port; a
+    //    process-GROUP kill (the child was spawned detached above) reaps them.
+    teardown_child(&mut child).await;
     clear_preview_pid(workspace);
 
     proof
+}
+
+/// Tear down a spawned dev-server child AND its descendant tree, bounded. The
+/// child was spawned DETACHED (its own session/process-group via
+/// [`crate::spawn_util::detach_from_controlling_terminal`]), so a process-GROUP
+/// kill ([`crate::spawn_util::kill_process_group`]) reaps the `npm`/`pnpm`
+/// wrapper AND the `node`/`vite` grandchildren it forked — a plain
+/// [`tokio::process::Child::start_kill`] would drop only the wrapper and leave
+/// the real server holding the port. `start_kill` + `kill_on_drop(true)` are
+/// direct-child backstops; the reap is time-bounded so a wedged `wait()` can't
+/// hang the runtime proof.
+async fn teardown_child(child: &mut tokio::process::Child) {
+    let _ = crate::spawn_util::kill_process_group(child);
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), child.wait()).await;
 }
 
 /// Whether to reuse an already-running server or spawn our own. Split out so the
@@ -1066,41 +1092,134 @@ async fn run_e2e_if_present(workspace: &Path) -> Option<E2eResult> {
     let (program, args) = split_command(&cmd);
     let (vprog, vlead) = spawn_parts(&program);
     let started = Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(E2E_TIMEOUT_SECS),
-        Command::new(vprog)
-            .args(&vlead)
-            .args(&args)
-            .current_dir(workspace)
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await;
-    let ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-    match result {
-        Ok(Ok(out)) => {
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            truncate(&mut combined, CAPTURE_CAP);
-            Some(E2eResult {
+
+    let mut ecmd = Command::new(vprog);
+    ecmd.args(&vlead)
+        .args(&args)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Detach into its OWN session/process-group so a timeout can kill the WHOLE
+    // e2e tree — Playwright/Cypress fork browser processes that survive a kill of
+    // just the runner. Safe: stdin null, stdout/stderr piped. Fail-open.
+    crate::spawn_util::detach_from_controlling_terminal(&mut ecmd);
+    let mut child = match ecmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(E2eResult {
                 command: cmd,
-                passed: out.status.success(),
-                ms,
-                output: combined,
-            })
+                passed: false,
+                ms: elapsed_ms(started),
+                output: format!("failed to spawn e2e runner: {e}"),
+            });
         }
+    };
+
+    // Capped-tail readers: bound memory on a chatty suite while always draining
+    // so the child never blocks on a full pipe.
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
+
+    let wait_result =
+        tokio::time::timeout(Duration::from_secs(E2E_TIMEOUT_SECS), child.wait()).await;
+    if wait_result.is_err() {
+        // Timed out: kill the WHOLE group so browser descendants die too, not just
+        // the runner (dropping the `Child` alone would leave them running).
+        // Bounded reap so a wedged wait() can't hang.
+        let _ = crate::spawn_util::kill_process_group(&child);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), child.wait()).await;
+    }
+
+    let raw_stdout = join_capped(stdout_task).await;
+    let raw_stderr = join_capped(stderr_task).await;
+    let mut combined = String::from_utf8_lossy(&raw_stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&raw_stderr));
+    truncate(&mut combined, CAPTURE_CAP);
+    let ms = elapsed_ms(started);
+
+    match wait_result {
+        Ok(Ok(status)) => Some(E2eResult {
+            command: cmd,
+            passed: status.success(),
+            ms,
+            output: combined,
+        }),
         Ok(Err(e)) => Some(E2eResult {
             command: cmd,
             passed: false,
             ms,
             output: format!("failed to spawn e2e runner: {e}"),
         }),
-        Err(_) => Some(E2eResult {
-            command: cmd,
-            passed: false,
-            ms,
-            output: format!("e2e timed out after {E2E_TIMEOUT_SECS}s"),
-        }),
+        Err(_) => {
+            // Keep the killed suite's last words alongside the timeout marker.
+            let marker = format!("e2e timed out after {E2E_TIMEOUT_SECS}s");
+            let output = if combined.trim().is_empty() {
+                marker
+            } else {
+                let mut o = combined;
+                o.push_str(&format!("\n...[{marker}]"));
+                truncate(&mut o, CAPTURE_CAP);
+                o
+            };
+            Some(E2eResult {
+                command: cmd,
+                passed: false,
+                ms,
+                output,
+            })
+        }
+    }
+}
+
+/// Read `reader` to EOF, retaining only the LAST `cap` bytes (the e2e pass/fail
+/// summary lives at the end) while always draining so the child never blocks on
+/// a full pipe. Memory is bounded to `2*cap` between trims, so a huge stream
+/// costs O(total), not O(total²). Mirrors the deploy module's private helper.
+async fn read_capped_tail<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if cap > 0 && buf.len() > cap.saturating_mul(2) {
+                    let drop_to = buf.len() - cap;
+                    buf.drain(..drop_to);
+                }
+            }
+        }
+    }
+    if cap > 0 && buf.len() > cap {
+        let drop_to = buf.len() - cap;
+        buf.drain(..drop_to);
+    }
+    buf
+}
+
+/// Join a capped-tail reader task, BOUNDED so a wedged descendant that still
+/// holds a pipe open after a kill can't hang us. Fail-open: a missing task or a
+/// panic yields an empty buffer.
+async fn join_capped(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match task {
+        Some(t) => match tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), t).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
     }
 }
 
@@ -1876,5 +1995,77 @@ mod tests {
         drop(tx);
         let outcome = wait_for_boot(&mut rx, "http://127.0.0.1:1", 60).await;
         assert_eq!(outcome, BootOutcome::Timeout);
+    }
+
+    // -------------------------------------------------------------------
+    // teardown kills the WHOLE process group (npm/pnpm → node/vite descendants)
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_child_kills_the_whole_group() {
+        // A wrapper that prints a BACKGROUNDED grandchild's PID, then lingers. The
+        // grandchild shares the wrapper's process group (the wrapper is a group
+        // leader via the detach), standing in for the node/vite server an
+        // `npm run dev` forks. teardown_child must reap BOTH via a group kill — a
+        // plain start_kill would leave the grandchild alive, holding the port.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & echo $!; sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::spawn_util::detach_from_controlling_terminal(&mut cmd);
+        let mut child = cmd.spawn().expect("sh should spawn");
+
+        // Read the backgrounded grandchild's PID from the wrapper's stdout.
+        let gpid = {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let out = child.stdout.take().expect("piped stdout");
+            let mut lines = BufReader::new(out).lines();
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .expect("grandchild pid line");
+            line.trim().parse::<u32>().expect("a pid")
+        };
+        assert_eq!(
+            pid_is_alive(gpid),
+            Some(true),
+            "grandchild must be alive before teardown"
+        );
+
+        teardown_child(&mut child).await;
+
+        // The group kill reaps the grandchild too; poll briefly for the
+        // reparent+reap so the PID is provably gone (not just a zombie).
+        let mut gone = false;
+        for _ in 0..40 {
+            if pid_is_alive(gpid) == Some(false) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "group teardown must reap the backgrounded grandchild");
+    }
+
+    #[tokio::test]
+    async fn read_capped_tail_keeps_the_last_cap_bytes() {
+        // MORE than `cap` bytes in → only the last `cap` kept (the tail, where the
+        // e2e summary lives), bounding memory.
+        let data = vec![b'z'; 10_000];
+        let cap = 1_000;
+        let got = read_capped_tail(&data[..], cap).await;
+        assert_eq!(got.len(), cap, "keeps exactly the last cap bytes");
+        assert!(got.iter().all(|&b| b == b'z'));
+    }
+
+    #[tokio::test]
+    async fn read_capped_tail_returns_everything_when_under_cap() {
+        let got = read_capped_tail(&b"tiny"[..], 1_000).await;
+        assert_eq!(got, b"tiny");
     }
 }

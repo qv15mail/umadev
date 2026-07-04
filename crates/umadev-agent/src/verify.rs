@@ -44,6 +44,15 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// falsely time out a legitimate `cargo build --release`.
 const SLOW_STEP_TIMEOUT_SECS: u64 = 600;
 
+/// Bounded reaps after a step TIMES OUT, so a wedged descendant can never turn
+/// a step timeout into an unbounded verify hang. `KILL_REAP_SECS` bounds the
+/// wait for the killed child to be reaped; `DRAIN_REAP_SECS` bounds the join of
+/// the pipe-reader tasks — after the process-group kill they hit EOF at once, so
+/// the bound only bites in a pathological "a descendant still holds the pipe"
+/// case, where we take whatever was already buffered instead of blocking.
+const KILL_REAP_SECS: u64 = 5;
+const DRAIN_REAP_SECS: u64 = 5;
+
 /// What kind of project we detected.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -765,7 +774,6 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
             continue;
         }
 
-        let started = Instant::now();
         let timeout_secs = effective_timeout(step.timeout_secs, global_override);
 
         // If the binary isn't on PATH and the step is skippable, record
@@ -782,143 +790,182 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
             continue;
         }
 
-        // Take the pipes up-front so we can read whatever the process
-        // produced even when it times out. `wait_with_output` would own the
-        // pipes and drop partial output on timeout; instead we detach the
-        // readers, race wait() against the timer, then drain the buffers.
-        let (vprog, vlead) = spawn_parts(&step.program);
-        let mut vcmd = Command::new(vprog);
-        vcmd.args(&vlead)
-            .args(&step.args)
-            .current_dir(workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Detach into a new session (no controlling terminal): a `--runtime`
-        // step may boot a server whose console/descendant output would otherwise
-        // write straight to /dev/tty and bleed over the TUI's alt-screen. Safe:
-        // stdio is piped/null above. Fail-open (see spawn_util).
-        crate::spawn_util::detach_from_controlling_terminal(&mut vcmd);
-        let mut child = match vcmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                // A non-skippable install that can't even spawn is an install
-                // failure too — pushed as passed=false, so `install_has_failed`
-                // picks it up and arms the dependent-step short-circuit (P1-8).
-                outcomes.push(VerifyOutcome::from_spawn_error(
-                    kind,
-                    step.name,
-                    command_str,
-                    &e.to_string(),
-                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                    step.skippable,
-                ));
-                continue;
-            }
-        };
+        // Run the step as a subprocess. A GENUINE install failure recorded here
+        // (ran, exited non-zero / timed out — not a skip) is picked up by
+        // `install_has_failed` on the next iteration, arming the dependent-step
+        // short-circuit above (P1-8).
+        outcomes.push(run_step_command(workspace, kind, &step, command_str, timeout_secs).await);
+    }
 
-        // Detach the stdout/stderr handles into async read tasks so we can
-        // collect partial output regardless of whether the step completes or
-        // times out. Each task reads to EOF (which happens when the child
-        // exits OR when it's killed on drop after timeout).
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-        let stdout_task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::with_capacity(CAPTURE_CAP);
-            if let Some(mut h) = stdout_handle {
-                // Read up to CAPTURE_CAP+1 so we know to truncate.
-                let mut chunk = vec![0u8; CAPTURE_CAP + 1];
-                loop {
-                    match h.read(&mut chunk).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
-                    if buf.len() > CAPTURE_CAP {
-                        buf.truncate(CAPTURE_CAP);
-                        break;
-                    }
-                }
-            }
-            buf
-        });
-        let stderr_task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::with_capacity(CAPTURE_CAP);
-            if let Some(mut h) = stderr_handle {
-                let mut chunk = vec![0u8; CAPTURE_CAP + 1];
-                loop {
-                    match h.read(&mut chunk).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
-                    if buf.len() > CAPTURE_CAP {
-                        buf.truncate(CAPTURE_CAP);
-                        break;
-                    }
-                }
-            }
-            buf
-        });
+    outcomes
+}
 
-        // Race the child's exit against the timeout.
-        let wait_result =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+/// Run ONE verify step as a subprocess: spawn it (detached, stdio piped),
+/// capture up to [`CAPTURE_CAP`] of stdout/stderr, and race its exit against
+/// `timeout_secs`. Returns a structured [`VerifyOutcome`] — never hangs, never
+/// panics (fail-open).
+///
+/// **Timeout discipline (the anti-hang fix).** On timeout the child is KILLED
+/// *before* the pipe readers are drained. A timed-out child — or a grandchild
+/// (an `npm`/`pnpm` install/test forks `node`/`vite`) that inherited the
+/// stdout/stderr pipe — can hold the read end open indefinitely; awaiting the
+/// readers first would then hang verify forever. Because the child is spawned
+/// DETACHED (its own session/process-group via
+/// [`crate::spawn_util::detach_from_controlling_terminal`]), a process-GROUP
+/// kill ([`crate::spawn_util::kill_process_group`]) takes down the whole
+/// descendant tree, so every pipe writer dies and the readers hit EOF. The
+/// direct-child `start_kill` + `kill_on_drop(true)` are backstops, and both the
+/// child reap and the reader joins are time-bounded — so a wedged descendant can
+/// never turn a step timeout into an unbounded verify hang.
+async fn run_step_command(
+    workspace: &Path,
+    kind: ProjectKind,
+    step: &VerifyStep,
+    command_str: String,
+    timeout_secs: u64,
+) -> VerifyOutcome {
+    let started = Instant::now();
 
-        // Whether it exited or timed out, the pipe tasks eventually
-        // complete (EOF on exit, EOF after kill_on_drop). Join them.
-        let raw_stdout = stdout_task.await.unwrap_or_default();
-        let raw_stderr = stderr_task.await.unwrap_or_default();
-        let mut stdout = String::from_utf8_lossy(&raw_stdout).into_owned();
-        let mut stderr = String::from_utf8_lossy(&raw_stderr).into_owned();
-        truncate_in_place(&mut stdout, CAPTURE_CAP);
-        truncate_in_place(&mut stderr, CAPTURE_CAP);
-
-        let outcome = match wait_result {
-            Ok(Ok(status)) => VerifyOutcome {
-                project_kind: kind,
-                step: step.name.to_string(),
-                command: command_str,
-                exit_code: status.code().unwrap_or(-1),
-                duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                stdout,
-                stderr,
-                passed: status.success(),
-                skipped: false,
-            },
-            Ok(Err(e)) => VerifyOutcome::from_spawn_error(
+    // Take the pipes up-front so we can read whatever the process produced even
+    // when it times out. `wait_with_output` would own the pipes and drop partial
+    // output on timeout; instead we detach the readers, race wait() against the
+    // timer, then drain the buffers.
+    let (vprog, vlead) = spawn_parts(&step.program);
+    let mut vcmd = Command::new(vprog);
+    vcmd.args(&vlead)
+        .args(&step.args)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Detach into a new session (no controlling terminal): a `--runtime` step may
+    // boot a server whose console/descendant output would otherwise write straight
+    // to /dev/tty and bleed over the TUI's alt-screen. Detaching ALSO makes the
+    // child a group leader, so a timeout can kill its whole tree. Safe: stdio is
+    // piped/null above. Fail-open (see spawn_util).
+    crate::spawn_util::detach_from_controlling_terminal(&mut vcmd);
+    let mut child = match vcmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // A non-skippable install that can't even spawn is an install failure
+            // too — passed=false, so `install_has_failed` picks it up and arms the
+            // dependent-step short-circuit (P1-8).
+            return VerifyOutcome::from_spawn_error(
                 kind,
                 step.name,
                 command_str,
                 &e.to_string(),
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 step.skippable,
-            ),
-            // Timed out: kill_on_drop(true) kills the child when `child`
-            // drops at end of scope, which closes the pipes → the read
-            // tasks return the partial output they collected. Pass it into
-            // from_timeout so the audit row shows the build's last words.
-            Err(_) => {
-                // Best-effort explicit kill so the pipe tasks don't block.
-                let _ = child.start_kill();
-                VerifyOutcome::from_timeout(
-                    kind,
-                    step.name,
-                    command_str,
-                    timeout_secs,
-                    stdout,
-                    stderr,
-                )
+            );
+        }
+    };
+
+    // Detach the stdout/stderr handles into async read tasks so we can collect
+    // partial output regardless of whether the step completes or times out. Each
+    // task reads to EOF (child exit OR kill) and self-caps at CAPTURE_CAP.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(CAPTURE_CAP);
+        if let Some(mut h) = stdout_handle {
+            // Read up to CAPTURE_CAP+1 so we know to truncate.
+            let mut chunk = vec![0u8; CAPTURE_CAP + 1];
+            loop {
+                match h.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+                if buf.len() > CAPTURE_CAP {
+                    buf.truncate(CAPTURE_CAP);
+                    break;
+                }
             }
-        };
-        // A GENUINE install failure recorded here (ran, exited non-zero / timed
-        // out — not a skip) is picked up by `install_has_failed` on the next
-        // iteration, arming the dependent-step short-circuit above (P1-8).
-        outcomes.push(outcome);
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(CAPTURE_CAP);
+        if let Some(mut h) = stderr_handle {
+            let mut chunk = vec![0u8; CAPTURE_CAP + 1];
+            loop {
+                match h.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+                if buf.len() > CAPTURE_CAP {
+                    buf.truncate(CAPTURE_CAP);
+                    break;
+                }
+            }
+        }
+        buf
+    });
+
+    // Race the child's exit against the timeout.
+    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+
+    // On timeout, KILL BEFORE DRAINING (the anti-hang fix — see the fn doc). A
+    // process-GROUP kill reaps grandchildren that may still hold a pipe open, so
+    // the readers hit EOF instead of blocking forever. `start_kill` +
+    // `kill_on_drop` are backstops for the direct child; the reap is bounded.
+    if wait_result.is_err() {
+        let _ = crate::spawn_util::kill_process_group(&child);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
     }
 
-    outcomes
+    // Drain the pipe readers, BOUNDED. On a clean exit they already hit EOF and
+    // return their full (capped) buffer; the bound only bites if a descendant
+    // still holds a pipe open after the group kill, where we take what was
+    // buffered rather than block. Never an unbounded await → verify always returns.
+    let raw_stdout = drain_bounded(stdout_task).await;
+    let raw_stderr = drain_bounded(stderr_task).await;
+    let mut stdout = String::from_utf8_lossy(&raw_stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&raw_stderr).into_owned();
+    truncate_in_place(&mut stdout, CAPTURE_CAP);
+    truncate_in_place(&mut stderr, CAPTURE_CAP);
+
+    match wait_result {
+        Ok(Ok(status)) => VerifyOutcome {
+            project_kind: kind,
+            step: step.name.to_string(),
+            command: command_str,
+            exit_code: status.code().unwrap_or(-1),
+            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            stdout,
+            stderr,
+            passed: status.success(),
+            skipped: false,
+        },
+        Ok(Err(e)) => VerifyOutcome::from_spawn_error(
+            kind,
+            step.name,
+            command_str,
+            &e.to_string(),
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            step.skippable,
+        ),
+        // Timed out: the child (and its group) was already killed above, so the
+        // drain returned the process's last words. Record them.
+        Err(_) => {
+            VerifyOutcome::from_timeout(kind, step.name, command_str, timeout_secs, stdout, stderr)
+        }
+    }
+}
+
+/// Join a pipe-reader task, BOUNDED. A clean child close makes the reader hit
+/// EOF and return its buffer at once; the timeout only fires if a descendant
+/// still holds the pipe open after the kill, in which case we take an empty
+/// buffer rather than hang. Fail-open: a panicked reader also yields empty.
+async fn drain_bounded(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(Duration::from_secs(DRAIN_REAP_SECS), task).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    }
 }
 
 /// Append an outcome (plus timestamp + phase tag) to
@@ -1467,6 +1514,79 @@ mod tests {
             String::new(),
         );
         assert_eq!(o.stderr, "timed out after 30s");
+    }
+
+    // --- timeout does NOT hang when a descendant holds a pipe open -----------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_step_command_times_out_without_hanging_when_a_pipe_stays_open() {
+        // A step whose child forks a BACKGROUNDED grandchild that inherits the
+        // stdout pipe and outlives the timeout. Draining the pipe first (the old
+        // bug) would block until the grandchild dies (~60s) → verify hangs. The
+        // fix kills the whole PROCESS GROUP on timeout so the grandchild dies at
+        // once and the reader hits EOF. The step must return a bounded timeout
+        // outcome, fast — not a hang, not a false pass.
+        let tmp = TempDir::new().unwrap();
+        let step = VerifyStep {
+            name: "test",
+            program: "sh".to_string(),
+            // `sleep 60 &` backgrounds a pipe-holding grandchild; the foreground
+            // `sleep 60` keeps the step running past the 1s budget.
+            args: vec!["-c".to_string(), "sleep 60 & sleep 60".to_string()],
+            skippable: false,
+            timeout_secs: 0,
+        };
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_step_command(
+                tmp.path(),
+                ProjectKind::Node,
+                &step,
+                "sh -c ...".to_string(),
+                1,
+            ),
+        )
+        .await
+        .expect("run_step_command must return, not hang, when a pipe is held past timeout");
+        assert!(!outcome.passed, "a timed-out step is not a pass");
+        assert!(!outcome.skipped);
+        assert!(
+            outcome.stderr.contains("timed out"),
+            "stderr should carry the timeout marker: {}",
+            outcome.stderr
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "must return promptly after the group kill, not wait out the pipe holder"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_step_command_reports_a_clean_success() {
+        // Sanity: the happy path still returns a passing outcome (the refactor
+        // did not change success semantics).
+        let tmp = TempDir::new().unwrap();
+        let step = VerifyStep {
+            name: "test",
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo hi".to_string()],
+            skippable: false,
+            timeout_secs: 0,
+        };
+        let outcome = run_step_command(
+            tmp.path(),
+            ProjectKind::Node,
+            &step,
+            "sh -c echo".to_string(),
+            30,
+        )
+        .await;
+        assert!(outcome.passed, "a `sh -c 'echo hi'` step exits 0");
+        assert!(!outcome.skipped);
+        assert!(outcome.stdout.contains("hi"));
     }
 
     // --- detect_dev_server -------------------------------------------------
