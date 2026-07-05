@@ -723,11 +723,94 @@ fn reset_active_to_pending(plan: &mut Plan) -> usize {
 /// fully-terminal plan → `None`.
 fn load_resumable_plan(root: &Path) -> Option<Plan> {
     let mut plan = plan_state::load(root)?;
+    // Item C staleness: re-open any step whose upstream doc artifact changed since
+    // the last recorded save, BEFORE the resumability check - a changed upstream can
+    // revive an otherwise-complete plan so the director re-derives the poisoned
+    // subtree instead of trusting it.
+    invalidate_stale_steps(root, &mut plan);
     if !plan_has_incomplete_step(&plan) {
         return None; // every step Done/Blocked → nothing left to resume
     }
     reset_active_to_pending(&mut plan);
     Some(plan)
+}
+
+// ── Artifact staleness (item C) ── record output/ doc versions on each plan save,
+//    and on resume re-open steps whose upstream doc changed. All read-only /
+//    best-effort / fail-open: an unreadable dir, an empty store, or an unmapped
+//    file is simply skipped and never blocks the run.
+
+/// Canonical artifact name for an `output/<slug>-<kind>.md` file, or `None`.
+fn artifact_name_from_filename(fname: &str) -> Option<&'static str> {
+    let stem = fname.strip_suffix(".md")?;
+    if stem.ends_with("-architecture") {
+        Some("architecture")
+    } else if stem.ends_with("-prd") {
+        Some("prd")
+    } else if stem.ends_with("-uiux") {
+        Some("uiux")
+    } else {
+        None
+    }
+}
+
+/// [`crate::critics::ArtifactKind`] for a canonical doc-artifact name.
+fn artifact_kind_from_name(name: &str) -> Option<crate::critics::ArtifactKind> {
+    use crate::critics::ArtifactKind as A;
+    match name {
+        "architecture" => Some(A::Architecture),
+        "prd" => Some(A::Prd),
+        "uiux" => Some(A::Uiux),
+        _ => None,
+    }
+}
+
+/// The current content-version of each `output/` doc artifact, keyed by canonical
+/// name. Read-only + fail-open (an unreadable dir/file is skipped).
+fn current_artifact_versions(root: &Path) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root.join("output")) else {
+        return v;
+    };
+    for e in entries.flatten() {
+        let fname = e.file_name().to_string_lossy().into_owned();
+        let Some(name) = artifact_name_from_filename(&fname) else {
+            continue;
+        };
+        if let Ok(content) = std::fs::read_to_string(e.path()) {
+            v.push((name.to_string(), crate::critics::artifact_version(&content)));
+        }
+    }
+    v
+}
+
+/// Record the current `output/` doc versions into the staleness store - the "we
+/// built against these versions" checkpoint, called after each plan save.
+fn record_artifact_versions(root: &Path) {
+    let current = current_artifact_versions(root);
+    if current.is_empty() {
+        return;
+    }
+    let map = current.into_iter().collect();
+    crate::critics::write_artifact_versions(root, &map);
+}
+
+/// Re-open any plan step whose upstream doc artifact CHANGED since the last recorded
+/// save (via [`Plan::invalidate_stale`]). Fail-open: empty store / no change = no-op.
+fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
+    let current = current_artifact_versions(root);
+    if current.is_empty() {
+        return;
+    }
+    let stale = crate::critics::stale_artifacts(root, &current);
+    if stale.is_empty() {
+        return;
+    }
+    let kinds: Vec<_> = stale
+        .iter()
+        .filter_map(|n| artifact_kind_from_name(n))
+        .collect();
+    plan.invalidate_stale(&kinds);
 }
 
 /// Whether `root` holds a director-loop run that can be RESUMED on a fresh session:
@@ -2948,6 +3031,7 @@ fn route_focus_line(route: &RoutePlan) -> String {
 /// Best-effort + fail-open: a write error is ignored, never blocks the schedule.
 fn persist_plan_ref(plan: &Plan, options: &RunOptions) {
     let _ = plan_state::save(plan, &options.project_root);
+    record_artifact_versions(&options.project_root);
 }
 
 /// **BOUNDED RE-PLAN of a blocked subtree** (the coordinator's self-repair lever). A
@@ -3198,6 +3282,7 @@ fn complete_plan(plan: &mut Option<Plan>, options: &RunOptions, events: &Arc<dyn
 fn persist_plan(plan: &Option<Plan>, options: &RunOptions) {
     if let Some(p) = plan {
         let _ = plan_state::save(p, &options.project_root);
+        record_artifact_versions(&options.project_root);
     }
 }
 
@@ -9292,6 +9377,35 @@ mod tests {
         );
         let ready: Vec<String> = loaded.ready_steps().iter().map(|s| s.id.clone()).collect();
         assert_eq!(ready, vec!["b"], "the reset step is ready again");
+    }
+
+    #[test]
+    fn stale_upstream_doc_reopens_steps_on_resume() {
+        // Item C end-to-end: a plan built against prd v1 is fully Done; the PRD then
+        // changes; on resume the frontend step (reads Prd) + its downstream re-open so
+        // the director re-derives against the changed upstream instead of trusting a
+        // now-poisoned result.
+        use crate::plan_state::{Plan, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output").join("app-prd.md"), "prd v1").unwrap();
+        record_artifact_versions(root);
+        let mut plan = Plan {
+            steps: vec![
+                resume_step("fe", "frontend", &[], StepStatus::Done),
+                resume_step("qa", "qa", &["fe"], StepStatus::Done),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        invalidate_stale_steps(root, &mut plan);
+        assert!(plan.steps.iter().all(|s| s.status == StepStatus::Done));
+        std::fs::write(root.join("output").join("app-prd.md"), "prd v2 CHANGED").unwrap();
+        invalidate_stale_steps(root, &mut plan);
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("fe"), StepStatus::Pending, "frontend re-opens on a prd change");
+        assert_eq!(by("qa"), StepStatus::Pending, "its downstream re-opens too");
     }
 
     // ── BOUNDED RE-PLAN of a blocked subtree (attempt_replan_blocked_subtree) ──
