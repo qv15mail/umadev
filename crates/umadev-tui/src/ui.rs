@@ -4537,8 +4537,20 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // first frame (`prev == 0`) makes no adjustment.
     let prev_hidden = app.transcript_prev_hidden.get();
     let cur_scroll = app.transcript_scroll.get();
-    if cur_scroll > 0 && hidden_above > prev_hidden {
-        let grew_below = hidden_above - prev_hidden;
+    // Rows that appeared BELOW the viewport since the last frame. In the steady
+    // state that is the growth in `hidden_above`. BUT once the transcript exceeds
+    // `MAX_RENDER_ROWS` the front-trim pins `total` (and thus `hidden_above`): a
+    // continuing stream trims as many rows off the FRONT as it appends at the bottom,
+    // so content still shifts up under a fixed from-bottom offset exactly as new rows
+    // below would, yet `hidden_above` stops growing. Add the front-trim delta
+    // (`cut - prev_cut`) so the anchor keeps holding on a long, front-trimmed
+    // transcript instead of silently drifting (the reported drift while scrolled up).
+    // Clamped to `hidden_above`, so once the read position falls off the trimmed
+    // front it rides the top edge (the acknowledged buffer boundary).
+    let grew_below = hidden_above
+        .saturating_sub(prev_hidden)
+        .saturating_add(cut.saturating_sub(prev_cut));
+    if cur_scroll > 0 && grew_below > 0 {
         let anchored = cur_scroll.saturating_add(grew_below).min(hidden_above);
         app.transcript_scroll.set(anchored);
     }
