@@ -1663,6 +1663,66 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
         .ok()
 }
 
+fn generate_project_index_section(report: &umadev_agent::AdoptReport) -> String {
+    let mut s = String::new();
+    s.push_str("## Project (auto-analyzed by `umadev init` - re-run to refresh)\n\n");
+    let stack = if report.stack.trim().is_empty() {
+        "unknown"
+    } else {
+        report.stack.trim()
+    };
+    s.push_str(&format!("- **Stack**: {stack}\n"));
+    if !report.dev_server.trim().is_empty() {
+        s.push_str(&format!("- **Dev server**: {}\n", report.dev_server.trim()));
+    }
+    if report.indexed_files > 0 {
+        s.push_str(&format!(
+            "- **Indexed source**: {} files -> {} retrievable chunks\n",
+            report.indexed_files, report.indexed_chunks
+        ));
+    }
+    if report.api_endpoints > 0 {
+        s.push_str(&format!(
+            "- **API surface**: {} endpoints reverse-derived to the contract baseline\n",
+            report.api_endpoints
+        ));
+    }
+    if !report.commands.is_empty() {
+        s.push_str("\n### Build / test / lint\n\n");
+        for c in &report.commands {
+            s.push_str(&format!("- **{}**: `{}`\n", c.name, c.command));
+        }
+    }
+    if !report.adopted_at.trim().is_empty() {
+        s.push_str(&format!(
+            "\n_Last analyzed: {}_\n",
+            report.adopted_at.trim()
+        ));
+    }
+    s
+}
+
+fn upsert_managed_section(existing: &str, section: &str) -> String {
+    const BEGIN: &str = "<!-- umadev:project:begin -->";
+    const END: &str = "<!-- umadev:project:end -->";
+    let block = format!("{BEGIN}\n{section}{END}\n");
+    if let (Some(b), Some(e)) = (existing.find(BEGIN), existing.find(END)) {
+        if e >= b {
+            let mut out = String::with_capacity(existing.len() + block.len());
+            out.push_str(&existing[..b]);
+            out.push_str(&block);
+            out.push_str(&existing[e + END.len()..]);
+            return out;
+        }
+    }
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&block);
+    out
+}
+
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace = resolve_root(project_root)?;
     let slug = match slug {
@@ -1724,6 +1784,24 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
         );
         let _ = std::fs::write(&claude_md, claude_content);
         println!("  claude:  {}", claude_md.display());
+    }
+
+    // Project analysis (the local analogue of Claude Code's `/init`): detect the
+    // stack + build/test/lint commands and index the source, then write a MANAGED
+    // `## Project` section into CLAUDE.md. Re-running `umadev init` REFRESHES only
+    // that section (everything else — the governance preamble + any hand edits — is
+    // preserved). Fail-open: `run_adopt` never errors, so an empty / sparse project
+    // just yields a minimal section.
+    let report = umadev_agent::run_adopt(&workspace);
+    let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
+    let refreshed = upsert_managed_section(&existing, &generate_project_index_section(&report));
+    if std::fs::write(&claude_md, refreshed).is_ok() {
+        println!(
+            "  project: {} · {} source files · {} commands (CLAUDE.md ## Project refreshed)",
+            report.stack,
+            report.indexed_files,
+            report.commands.len()
+        );
     }
 
     // Generate .umadev/rules.toml template so users can discover the
@@ -5109,6 +5187,66 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upsert_managed_section_appends_then_refreshes_in_place_preserving_edits() {
+        // First run: no markers yet → the managed block is APPENDED, the preamble kept.
+        let preamble = "# CLAUDE.md — UmaDev managed project\n\nGovernance preamble.\n";
+        let v1 = upsert_managed_section(preamble, "## Project\n\n- Stack: rust\n");
+        assert!(v1.contains("Governance preamble."), "preamble preserved");
+        assert!(
+            v1.contains("<!-- umadev:project:begin -->"),
+            "managed block added"
+        );
+        assert!(v1.contains("- Stack: rust"), "section content present");
+
+        // A user hand-edits OUTSIDE the managed block.
+        let edited = v1.replace("Governance preamble.", "Governance preamble.\nMY OWN NOTE.");
+
+        // Re-run: ONLY the managed section is replaced; the user's note survives and
+        // the block is NOT duplicated.
+        let v2 = upsert_managed_section(&edited, "## Project\n\n- Stack: node\n");
+        assert!(
+            v2.contains("MY OWN NOTE."),
+            "user edits outside the block are preserved"
+        );
+        assert!(
+            v2.contains("- Stack: node"),
+            "section refreshed to the new analysis"
+        );
+        assert!(
+            !v2.contains("- Stack: rust"),
+            "stale section content is gone"
+        );
+        assert_eq!(
+            v2.matches("<!-- umadev:project:begin -->").count(),
+            1,
+            "the managed block is refreshed in place, never duplicated"
+        );
+    }
+
+    #[test]
+    fn generate_project_index_section_reflects_the_analysis() {
+        let report = umadev_agent::AdoptReport {
+            mode: "brownfield".into(),
+            adopted_at: "2026-07-06T00:00:00Z".into(),
+            stack: "rust".into(),
+            dev_server: String::new(),
+            commands: vec![umadev_agent::DetectedCommand {
+                name: "test".into(),
+                command: "cargo test --workspace".into(),
+            }],
+            api_endpoints: 0,
+            indexed_files: 12,
+            indexed_chunks: 34,
+            artifacts: vec![],
+            notes: vec![],
+        };
+        let s = generate_project_index_section(&report);
+        assert!(s.contains("Stack") && s.contains("rust"));
+        assert!(s.contains("12 files") && s.contains("34"));
+        assert!(s.contains("cargo test --workspace"));
+    }
 
     #[test]
     fn project_root_or_cwd_prefers_explicit_then_falls_back() {
